@@ -1,0 +1,20 @@
+# ESP-IDF build output
+build/
+
+# IDE specific folders
+.vscode/
+
+# Python virtual environment (from your terminal prompt)
+venv/
+env/
+.env/
+
+# ESP-IDF Configuration files
+# Note: sdkconfig.defaults and sdkconfig.ci are kept, 
+# but the generated/user-specific ones are ignored.
+sdkconfig
+sdkconfig.old
+
+# Python cache
+__pycache__/
+*.py[cod]
