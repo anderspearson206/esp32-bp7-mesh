@@ -33,23 +33,48 @@
 #define MAX_BUNDLES_IN_RAM 50
 #define BUNDLE_PAYLOAD_SIZE 1024
 
-typedef struct {
-    uint32_t bundle_id;         
-    uint32_t creation_time;     
-    uint32_t ttl;               
-    size_t payload_len;
-    uint8_t payload[BUNDLE_PAYLOAD_SIZE];
-    bool is_empty;              
-    bool forwarded;             // NEW: Prevents broadcast storms
+// Tcustom bundle structure inspired by BPv7, but simplified for our mesh use case
+typedef struct __attribute__((packed)) {
+    uint32_t creation_time;     // Milliseconds since mesh epoch
+    uint32_t sequence_number;   // Increments for absolute uniqueness
+    uint32_t lifetime;          // TTL in milliseconds
+    
+    uint16_t source_node;       // Derived from MAC
+    uint16_t dest_node;         // Target node
+    uint16_t report_to_node;    // Node to send ACKs to
+    uint16_t prev_node;         // last node that forwarded this bundle
+    
+    bool     request_delivery_report; 
+    bool     is_telemetry; 
+    uint8_t  hop_limit;         // max allowed hops
+    uint8_t  hop_count;         // current hops
+    
+    size_t   payload_len;
+    uint8_t  payload[BUNDLE_PAYLOAD_SIZE]; 
 } dtn_bundle_t;
 
-// Your RAM store
-static dtn_bundle_t bundle_store[MAX_BUNDLES_IN_RAM];
+// local ram store
+typedef struct {
+    dtn_bundle_t bundle;
+    bool is_empty;              
+    bool forwarded;             
+} ram_bundle_t;
+
+// ram store 
+static ram_bundle_t bundle_store[MAX_BUNDLES_IN_RAM];
+static uint32_t local_sequence_counter = 0;
+
+// get unique node ID from MAC address (last 2 bytes)
+uint16_t get_my_node_id() {
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    return (mac[4] << 8) | mac[5];
+}
 
 
 static const char *MESH_TAG = "mesh_main";
 static const uint8_t MESH_ID[6] = { 0x77, 0x77, 0x77, 0x77, 0x77, 0x77};
-static uint8_t tx_buf[TX_SIZE] = { 0, };
+// static uint8_t tx_buf[TX_SIZE] = { 0, };
 static uint8_t rx_buf[RX_SIZE] = { 0, };
 static bool is_running = true;
 static bool is_mesh_connected = false;
@@ -74,6 +99,8 @@ mesh_light_ctl_t light_off = {
 /*******************************************************
  *                Function Declarations
  *******************************************************/
+
+ void init_bundle_store(void);
 
 /*******************************************************
  *                Function Definitions
@@ -102,145 +129,245 @@ void esp_mesh_p2p_tx_main(void *arg)
     mesh_addr_t route_table[CONFIG_MESH_ROUTE_TABLE_SIZE];
     int route_table_size = 0;
     int bundle_generation_timer = 0;
+    uint16_t my_node_id = get_my_node_id();
+    int heartbeat_timer = 0; 
 
     is_running = true;
 
     while (is_running) {
-        // 1-second tick rate for the routing engine
         vTaskDelay(pdMS_TO_TICKS(1000)); 
-
         if (!is_mesh_connected) continue;
+
+        uint32_t current_time_ms = (uint32_t)(esp_mesh_get_tsf_time() / 1000);
+
+        // topology log every 5 seconds
+        heartbeat_timer++;
+        if (heartbeat_timer >= 5) { 
+            heartbeat_timer = 0;
+            
+            if (esp_mesh_is_root()) {
+                // root node doesn't have a parent, so RSSI is 0
+                printf("@NET:%u:0:0\n", my_node_id);
+            } else {
+                uint8_t parent_mac_5 = mesh_parent_addr.addr[5] - 1;
+                uint16_t parent_id = (mesh_parent_addr.addr[4] << 8) | parent_mac_5;
+                
+                // query the Wi-Fi driver for parent RSSI 
+                wifi_ap_record_t ap_info;
+                int rssi = 0;
+                if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+                    rssi = ap_info.rssi;
+                }
+                
+                // generate a telemetry bundle with the RSSI info and store it in RAM for forwarding to Root
+                for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
+                    if (bundle_store[i].is_empty) {
+                        dtn_bundle_t *b = &bundle_store[i].bundle;
+                        b->creation_time = current_time_ms; 
+                        b->sequence_number = local_sequence_counter++;
+                        b->lifetime = 10000; 
+                        b->source_node = my_node_id;
+                        b->dest_node = 0;    
+                        b->prev_node = my_node_id; 
+                        b->hop_limit = 5;    
+                        b->hop_count = 0;
+                        b->is_telemetry = true; 
+                        
+                        // append the RSSI to the telemetry string
+                        b->payload_len = snprintf((char*)b->payload, BUNDLE_PAYLOAD_SIZE, 
+                                                  "@NET:%u:%u:%d", my_node_id, parent_id, rssi);
+                        
+                        bundle_store[i].is_empty = false;
+                        bundle_store[i].forwarded = false;
+                        break;
+                    }
+                }
+            }
+        }
 
         if (esp_mesh_is_root()) {
             print_child_rssi();
         }
 
-        // 1. Originate a new test bundle every 10 seconds
+        // create new data bundle every 10 seconds
         bundle_generation_timer++;
         if (bundle_generation_timer >= 10) {
             bundle_generation_timer = 0;
             for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
                 if (bundle_store[i].is_empty) {
-                    bundle_store[i].bundle_id = esp_random(); // Random ID for testing
-                    bundle_store[i].creation_time = xTaskGetTickCount();
                     bundle_store[i].is_empty = false;
                     bundle_store[i].forwarded = false; 
-                    snprintf((char*)bundle_store[i].payload, BUNDLE_PAYLOAD_SIZE, "Data from layer %d", mesh_layer);
                     
-                    ESP_LOGW(MESH_TAG, "ORIGINATED new Bundle ID: %" PRIu32, bundle_store[i].bundle_id);
+                    dtn_bundle_t *b = &bundle_store[i].bundle;
+                    b->creation_time = current_time_ms;
+                    b->sequence_number = local_sequence_counter++;
+                    b->lifetime = 60000; 
+                    b->source_node = my_node_id;
+                    b->dest_node = 0;    
+                    b->prev_node = my_node_id; 
+                    b->hop_limit = 5;    
+                    b->hop_count = 0;
+                    b->is_telemetry = false; 
+                    b->request_delivery_report = false;
+                    
+                    b->payload_len = snprintf((char*)b->payload, BUNDLE_PAYLOAD_SIZE, "Data from %u", my_node_id);
+                    
+                    ESP_LOGW(MESH_TAG, "ORIGINATED Bundle Seq: %" PRIu32, b->sequence_number);
                     break;
                 }
             }
         }
 
-        // 2. Epidemic Forwarding Engine
+        // lifecycle management and forwarding
         esp_mesh_get_routing_table((mesh_addr_t *) &route_table, 
                                    CONFIG_MESH_ROUTE_TABLE_SIZE * 6, &route_table_size);
 
-        for (int b = 0; b < MAX_BUNDLES_IN_RAM; b++) {
-            // Only forward bundles that haven't been forwarded yet
-            if (!bundle_store[b].is_empty && !bundle_store[b].forwarded) {
+        for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
+            if (bundle_store[i].is_empty) continue;
+
+            dtn_bundle_t *b = &bundle_store[i].bundle;
+
+            if (current_time_ms > b->creation_time + b->lifetime) {
+                ESP_LOGW(MESH_TAG, "Bundle Expired (TTL). Deleting.");
+                bundle_store[i].is_empty = true;
+                continue;
+            }
+            if (b->hop_count >= b->hop_limit) {
+                ESP_LOGW(MESH_TAG, "Bundle Exceeded Hop Limit. Deleting.");
+                bundle_store[i].is_empty = true;
+                continue;
+            }
+
+            if (!bundle_store[i].forwarded) {
+                size_t actual_tx_size = sizeof(dtn_bundle_t) - BUNDLE_PAYLOAD_SIZE + b->payload_len;
                 
                 mesh_data_t out_data;
-                out_data.data = (uint8_t *)&bundle_store[b];
-                out_data.size = sizeof(dtn_bundle_t);
+                out_data.data = (uint8_t *)b;
+                out_data.size = actual_tx_size;
                 out_data.proto = MESH_PROTO_BIN;
                 out_data.tos = MESH_TOS_P2P;
 
+                uint16_t original_prev = b->prev_node;
+                b->prev_node = my_node_id;
+                b->hop_count++;
+
                 bool sent_to_anyone = false;
 
-                // Send down the tree to all connected children
-                for (int i = 0; i < route_table_size; i++) {
-                    err = esp_mesh_send(&route_table[i], &out_data, MESH_DATA_P2P, NULL, 0);
-                    if (err == ESP_OK) {
-                        ESP_LOGI(MESH_TAG, "Forwarded Bundle %" PRIu32 " to Child " MACSTR, 
-                                bundle_store[b].bundle_id, MAC2STR(route_table[i].addr));
-                        sent_to_anyone = true;
-                    }
+                for (int j = 0; j < route_table_size; j++) {
+                    uint16_t child_node_id = (route_table[j].addr[4] << 8) | route_table[j].addr[5];
+                    if (child_node_id == original_prev) continue;
+
+                    err = esp_mesh_send(&route_table[j], &out_data, MESH_DATA_P2P, NULL, 0);
+                    if (err == ESP_OK) sent_to_anyone = true;
                 }
 
-                // Send up the tree to parent (if this node is not the root)
                 if (!esp_mesh_is_root()) {
-                    err = esp_mesh_send(&mesh_parent_addr, &out_data, MESH_DATA_P2P, NULL, 0);
-                    if (err == ESP_OK) {
-                        ESP_LOGI(MESH_TAG, "Forwarded Bundle %" PRIu32 " to Parent " MACSTR, 
-                                bundle_store[b].bundle_id, MAC2STR(mesh_parent_addr.addr));
-                        sent_to_anyone = true;
+                    uint8_t parent_mac_5 = mesh_parent_addr.addr[5] - 1;
+                    uint16_t parent_node_id = (mesh_parent_addr.addr[4] << 8) | parent_mac_5;
+                    
+                    if (parent_node_id != original_prev) {
+                        err = esp_mesh_send(&mesh_parent_addr, &out_data, MESH_DATA_P2P, NULL, 0);
+                        if (err == ESP_OK) sent_to_anyone = true;
                     }
                 }
 
-                // Mark as forwarded so we don't cause a broadcast storm
-                if (sent_to_anyone) {
-                    bundle_store[b].forwarded = true; 
-                }
+                if (sent_to_anyone) bundle_store[i].forwarded = true; 
             }
         }
     }
     vTaskDelete(NULL);
 }
 
+
 void esp_mesh_p2p_rx_main(void *arg)
 {
-    int recv_count = 0;
     esp_err_t err;
     mesh_addr_t from;
-    int send_count = 0;
     mesh_data_t data;
     int flag = 0;
     data.data = rx_buf;
-    data.size = RX_SIZE;
     is_running = true;
 
     while (is_running) {
         data.size = RX_SIZE;
         err = esp_mesh_recv(&from, &data, portMAX_DELAY, &flag, NULL, 0);
 
-        if (data.size == sizeof(dtn_bundle_t)) {
+        if (err != ESP_OK || !data.size) continue;
+
+        // check if it's large enough to be a valid header
+        size_t header_size = sizeof(dtn_bundle_t) - BUNDLE_PAYLOAD_SIZE;
+        if (data.size >= header_size) {
             dtn_bundle_t *incoming_bundle = (dtn_bundle_t *)data.data;
             
-            // 1. Check if we already have this bundle (prevent infinite routing loops)
+            // check to see if unique
             bool already_have = false;
             for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
-                if (!bundle_store[i].is_empty && bundle_store[i].bundle_id == incoming_bundle->bundle_id) {
-                    already_have = true;
-                    break;
-                }
-            }
-
-            // 2. If new, store it in RAM
-            if (!already_have) {
-                for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
-                    if (bundle_store[i].is_empty) {
-                        memcpy(&bundle_store[i], incoming_bundle, sizeof(dtn_bundle_t));
-                        bundle_store[i].is_empty = false;
-                        bundle_store[i].forwarded = false; // FLAG FOR RE-TRANSMISSION
-                        ESP_LOGI(MESH_TAG, "Stored NEW Bundle ID: %" PRIu32, bundle_store[i].bundle_id);
+                if (!bundle_store[i].is_empty) {
+                    dtn_bundle_t *b = &bundle_store[i].bundle;
+                    if (b->source_node == incoming_bundle->source_node &&
+                        b->creation_time == incoming_bundle->creation_time &&
+                        b->sequence_number == incoming_bundle->sequence_number) {
+                        already_have = true;
                         break;
                     }
                 }
-            } else {
-                ESP_LOGI(MESH_TAG, "Received duplicate Bundle ID: %" PRIu32 ", ignoring.", incoming_bundle->bundle_id);
             }
-        }
-        if (err != ESP_OK || !data.size) {
-            ESP_LOGE(MESH_TAG, "err:0x%x, size:%d", err, data.size);
-            continue;
-        }
-        /* extract send count */
-        if (data.size >= sizeof(send_count)) {
-            send_count = (data.data[25] << 24) | (data.data[24] << 16)
-                         | (data.data[23] << 8) | data.data[22];
-        }
-        recv_count++;
-        /* process light control */
-        mesh_light_process(&from, data.data, data.size);
-        if (!(recv_count % 1)) {
-            ESP_LOGW(MESH_TAG,
-                     "[#RX:%d/%d][L:%d] parent:"MACSTR", receive from "MACSTR", size:%d, heap:%" PRId32 ", flag:%d[err:0x%x, proto:%d, tos:%d]",
-                     recv_count, send_count, mesh_layer,
-                     MAC2STR(mesh_parent_addr.addr), MAC2STR(from.addr),
-                     data.size, esp_get_minimum_free_heap_size(), flag, err, data.proto,
-                     data.tos);
+
+            // store
+            if (!already_have) {
+                for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
+                    if (bundle_store[i].is_empty) {
+                        // Store the incoming bundle
+                        memcpy(&bundle_store[i].bundle, incoming_bundle, data.size);
+                        bundle_store[i].is_empty = false;
+                        bundle_store[i].forwarded = false; 
+                        
+                        uint16_t my_id = get_my_node_id();
+
+                        // telemetry handling
+                        if (esp_mesh_is_root()) {
+                            // if root, then print the telemetry directly. If it's a normal data bundle, print the RX log.
+                            if (incoming_bundle->is_telemetry) {
+                                printf("%.*s\n", (int)incoming_bundle->payload_len, incoming_bundle->payload);
+                                bundle_store[i].forwarded = true; 
+                            } else {
+                                // root received a normal Data bundle, print the RX log
+                                printf("@DTN_RX:%u:%" PRIu32 ":%u\n", 
+                                       incoming_bundle->source_node, 
+                                       incoming_bundle->sequence_number, my_id);
+                            }
+                        } else {
+                            // If I am a Child, and I received a normal data bundle, 
+                            // I must generate a new telemetry Bundle to tell the Root I got it.
+                            if (!incoming_bundle->is_telemetry) {
+                                for (int j = 0; j < MAX_BUNDLES_IN_RAM; j++) {
+                                    if (bundle_store[j].is_empty) {
+                                        dtn_bundle_t *ack = &bundle_store[j].bundle;
+                                        ack->creation_time = (uint32_t)(esp_mesh_get_tsf_time() / 1000);
+                                        ack->sequence_number = local_sequence_counter++;
+                                        ack->lifetime = 10000;
+                                        ack->source_node = my_id;
+                                        ack->dest_node = 0; 
+                                        ack->prev_node = my_id;
+                                        ack->hop_limit = 5;
+                                        ack->hop_count = 0;
+                                        ack->is_telemetry = true; 
+                                        
+                                        ack->payload_len = snprintf((char*)ack->payload, BUNDLE_PAYLOAD_SIZE, 
+                                                  "@DTN_RX:%u:%" PRIu32 ":%u", 
+                                                  incoming_bundle->source_node, incoming_bundle->sequence_number, my_id);
+                                        
+                                        bundle_store[j].is_empty = false;
+                                        bundle_store[j].forwarded = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
         }
     }
     vTaskDelete(NULL);
@@ -310,9 +437,13 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base,
         ESP_LOGI(MESH_TAG, "<MESH_EVENT_NO_PARENT_FOUND>scan times:%d",
                  no_parent->scan_times);
     }
-    /* TODO handler for the failure */
+
     break;
     case MESH_EVENT_PARENT_CONNECTED: {
+        uint16_t my_id = get_my_node_id();
+        uint16_t parent_id = (mesh_parent_addr.addr[4] << 8) | mesh_parent_addr.addr[5];
+        // emit strict topology log
+        printf("@NET:%u:%u\n", my_id, parent_id);
         mesh_event_connected_t *connected = (mesh_event_connected_t *)event_data;
         esp_mesh_get_id(&id);
         mesh_layer = connected->self_layer;
@@ -470,7 +601,9 @@ void init_bundle_store(void) {
     for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
         bundle_store[i].is_empty = true;
         bundle_store[i].forwarded = false;
-        bundle_store[i].bundle_id = 0;
+        
+        // Zero out the entire inner BPv7 bundle struct securely
+        memset(&bundle_store[i].bundle, 0, sizeof(dtn_bundle_t));
     }
     ESP_LOGI(MESH_TAG, "Bundle RAM Store Initialized.");
 }
