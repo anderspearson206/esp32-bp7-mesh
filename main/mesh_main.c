@@ -131,6 +131,7 @@ void esp_mesh_p2p_tx_main(void *arg)
     int bundle_generation_timer = 0;
     uint16_t my_node_id = get_my_node_id();
     int heartbeat_timer = 0; 
+    int flatten_timer = 0;
 
     is_running = true;
 
@@ -139,6 +140,21 @@ void esp_mesh_p2p_tx_main(void *arg)
         if (!is_mesh_connected) continue;
 
         uint32_t current_time_ms = (uint32_t)(esp_mesh_get_tsf_time() / 1000);
+        
+        if (!esp_mesh_is_root()) {
+            flatten_timer++;
+            // every 30 seconds check to see if we can directly connect to root.
+            if (flatten_timer >= 30) {
+                flatten_timer = 0;
+                // Layer 1 is Root. Layer 2 is directly connected to Root. 
+                // Layer 3+ means we are daisy-chained.
+                if (mesh_layer > 2) {
+                    ESP_LOGW(MESH_TAG, "I am on Layer %d. Attempting to flatten topology...", mesh_layer);
+                    // force the mesh to briefly scan to see if a better parent (like the Root) is nearby
+                    esp_mesh_set_self_organized(true, true);
+                }
+            }
+        }
 
         // topology log every 5 seconds
         heartbeat_timer++;
@@ -157,6 +173,14 @@ void esp_mesh_p2p_tx_main(void *arg)
                 int rssi = 0;
                 if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
                     rssi = ap_info.rssi;
+                    
+                    // try to force the mesh to reconfigure if RSSI is low, the current mesh settings don't disconnect until
+                    // rssi hits -90
+                    if (rssi < -82 && !esp_mesh_is_root()) {
+                        ESP_LOGW(MESH_TAG, "Parent RSSI (%d dBm) hit critical threshold! Forcing proactive disconnect.", rssi);
+                        esp_mesh_disconnect();
+                        // The MESH_EVENT_PARENT_DISCONNECTED will handle the rest
+                    }
                 }
                 
                 // generate a telemetry bundle with the RSSI info and store it in RAM for forwarding to Root
@@ -472,6 +496,12 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base,
         is_mesh_connected = false;
         mesh_disconnected_indicator();
         mesh_layer = esp_mesh_get_layer();
+
+        if (!esp_mesh_is_root()) {
+            ESP_LOGW(MESH_TAG, "Link lost! Forcing aggressive re-election of a new parent...");
+            // true, true = Enable self-organization AND force an immediate re-scan for the best parent
+            esp_mesh_set_self_organized(true, true);
+        }
     }
     break;
     case MESH_EVENT_LAYER_CHANGE: {
@@ -621,6 +651,15 @@ void app_main(void)
     /*  wifi initialization */
     wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&config));
+    
+    wifi_country_t country = {
+        .cc = "US",
+        .schan = 1,
+        .nchan = 11,
+        .policy = WIFI_COUNTRY_POLICY_AUTO
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_country(&country));
+
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -641,9 +680,15 @@ void app_main(void)
     /* better to increase the announce interval to avoid too much management traffic, if a small duty cycle is set. */
     ESP_ERROR_CHECK(esp_mesh_set_announce_interval(600, 3300));
 #else
-    /* Disable mesh PS function */
+    // Disable mesh PS function 
     ESP_ERROR_CHECK(esp_mesh_disable_ps());
+    
+    // drop a dead parent after 10 seconds instead of 60s
     ESP_ERROR_CHECK(esp_mesh_set_ap_assoc_expire(10));
+    
+    // fast Discovery: Broadcast presence every 200-500ms so approaching rovers link faster
+    // ESP_ERROR_CHECK(esp_mesh_set_announce_interval(500,1000));
+    
 #endif
     mesh_cfg_t cfg = MESH_INIT_CONFIG_DEFAULT();
     /* mesh ID */
@@ -661,6 +706,52 @@ void app_main(void)
     memcpy((uint8_t *) &cfg.mesh_ap.password, CONFIG_MESH_AP_PASSWD,
            strlen(CONFIG_MESH_AP_PASSWD));
     ESP_ERROR_CHECK(esp_mesh_set_config(&cfg));
+
+    // /* --- PROACTIVE ROVER HANDOFF CONFIGURATION --- */
+    
+    // // 1. Shift the global RSSI tier definitions
+    // mesh_rssi_threshold_t rssi_thresh;
+    // esp_mesh_get_rssi_threshold(&rssi_thresh);
+    // // Make the mesh highly sensitive to signal degradation by shifting thresholds up
+    // rssi_thresh.high = -70;
+    // rssi_thresh.medium = -75;
+    // rssi_thresh.low = -80; 
+    // ESP_ERROR_CHECK(esp_mesh_set_rssi_threshold(&rssi_thresh));
+
+    // // 2. Configure the aggressive parent-switching logic
+    // mesh_switch_parent_t switch_paras;
+    // esp_mesh_get_switch_parent_paras(&switch_paras);
+    
+    // // Default duration is 60000ms. Lower to 3 seconds for fast-moving rovers
+    // switch_paras.duration_ms = 3000;   
+    
+    // // If the current parent drops below -80 dBm, start the 3-second timer
+    // switch_paras.cnx_rssi = -80;       
+    
+    // // The new candidate parent must have at least a -70 dBm signal to be selected
+    // switch_paras.select_rssi = -70;    
+    
+    // // Disassociate with the current parent and switch when the new candidate is > -70 dBm
+    // switch_paras.switch_rssi = -70;    
+    
+    // // Minimum RSSI required to fall back and connect directly to the Root node
+    // switch_paras.backoff_rssi = -75;   
+    
+    // ESP_ERROR_CHECK(esp_mesh_set_switch_parent_paras(&switch_paras));
+    // /* --------------------------------------------- */
+
+    uint16_t my_id = get_my_node_id();
+    
+    // Replace 23768 with the actual ID of your Base Station (COM5)
+    if (my_id == 23768) {
+        ESP_LOGI(MESH_TAG, "I am the Base Station. Forcing ROOT role.");
+        ESP_ERROR_CHECK(esp_mesh_set_type(MESH_ROOT));
+        ESP_ERROR_CHECK(esp_mesh_fix_root(true)); // Prevent any voting
+    } else {
+        ESP_LOGI(MESH_TAG, "I am a Rover. Starting as IDLE role.");
+        ESP_ERROR_CHECK(esp_mesh_set_type(MESH_IDLE));
+    }
+
     /* mesh start */
     ESP_ERROR_CHECK(esp_mesh_start());
 #ifdef CONFIG_MESH_ENABLE_PS
