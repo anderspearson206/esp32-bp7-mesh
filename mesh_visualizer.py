@@ -4,6 +4,7 @@ import time
 import networkx as nx
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+from collections import deque, defaultdict
 
 SERIAL_PORT = 'COM5'  # Change to /dev/ttyUSB0 for Linux/Mac
 BAUD_RATE = 115200
@@ -13,6 +14,7 @@ TIMEOUT_SECONDS = 15
 G = nx.DiGraph()
 recent_transfers = [] #
 lock = threading.Lock()
+node_latencies = defaultdict(lambda: deque(maxlen=20))
 
 def serial_reader_thread(port):
     """Reads serial data from a specific port and updates the network graph state."""
@@ -70,6 +72,22 @@ def serial_reader_thread(port):
                                 'dst': receiver,
                                 'time': current_time
                             })
+                
+                # parse latency metrics
+                elif line.startswith("@METRIC:"):
+                    parts = line.split(':')
+                    # Format: @METRIC:<source_node>:<seq_num>:<hop_count>:<latency>
+                    if len(parts) >= 5:
+                        source_node = parts[1]
+                        try:
+                            latency_ms = int(parts[4])
+                            
+                            # filter out unrealistic latencies (e.g., negative or excessively high values)
+                            if 0 <= latency_ms < 300000: 
+                                with lock:
+                                    node_latencies[source_node].append(latency_ms)
+                        except ValueError:
+                            pass
 
         except (serial.SerialException, serial.PortNotOpenError) as e:
             print(f"Connection lost on {port}: {e}. Retrying in 2 seconds...")
@@ -118,8 +136,26 @@ def update_graph(frame):
             if src in G and dst in G:
                 nx.draw_networkx_edges(G, pos, edgelist=[(src, dst)], 
                                        edge_color='red', width=3.0, arrows=True)
+                
+        # Calculate per-node averages
+        latency_strings = []
+        for node, latencies in node_latencies.items():
+            # Only display if we have data and the node is currently active in the graph
+            if len(latencies) > 0 and node in G.nodes:
+                avg_lat = sum(latencies) / len(latencies)
+                latency_strings.append(f"Rover {node}: {avg_lat:.1f} ms")
 
-        plt.title("Live DTN Rover Mesh")
+        # Build the display string
+        if latency_strings:
+            # Join the stats together, wrapping to a new line every 3 rovers to keep it clean
+            formatted_stats = "\n".join(
+                [" | ".join(latency_strings[i:i+3]) for i in range(0, len(latency_strings), 3)]
+            )
+            title_str = f"Live DTN Rover Mesh\nAverage Latencies:\n{formatted_stats}"
+        else:
+            title_str = "Live DTN Rover Mesh\nWaiting for metric data..."
+
+        plt.title(title_str, fontsize=12, fontweight='bold', pad=15)
         plt.axis('off')
 
 if __name__ == '__main__':

@@ -176,7 +176,7 @@ void esp_mesh_p2p_tx_main(void *arg)
                     
                     // try to force the mesh to reconfigure if RSSI is low, the current mesh settings don't disconnect until
                     // rssi hits -90
-                    if (rssi < -82 && !esp_mesh_is_root()) {
+                    if (rssi < 90 && !esp_mesh_is_root()) {
                         ESP_LOGW(MESH_TAG, "Parent RSSI (%d dBm) hit critical threshold! Forcing proactive disconnect.", rssi);
                         esp_mesh_disconnect();
                         // The MESH_EVENT_PARENT_DISCONNECTED will handle the rest
@@ -211,7 +211,7 @@ void esp_mesh_p2p_tx_main(void *arg)
 
         if (esp_mesh_is_root()) {
             print_child_rssi();
-        }
+            }
 
         // create new data bundle every 10 seconds
         bundle_generation_timer++;
@@ -225,7 +225,7 @@ void esp_mesh_p2p_tx_main(void *arg)
                     dtn_bundle_t *b = &bundle_store[i].bundle;
                     b->creation_time = current_time_ms;
                     b->sequence_number = local_sequence_counter++;
-                    b->lifetime = 60000; 
+                    b->lifetime = 300000; 
                     b->source_node = my_node_id;
                     b->dest_node = 0;    
                     b->prev_node = my_node_id; 
@@ -350,6 +350,17 @@ void esp_mesh_p2p_rx_main(void *arg)
 
                         // telemetry handling
                         if (esp_mesh_is_root()) {
+                            
+                            // print metric info
+                            uint32_t current_time_ms = (uint32_t)(esp_mesh_get_tsf_time() / 1000);
+                            uint32_t latency = current_time_ms - incoming_bundle->creation_time;
+
+                            printf("@METRIC:%u:%" PRIu32 ":%d:%" PRIu32 "\n", 
+                                incoming_bundle->source_node, 
+                                incoming_bundle->sequence_number, 
+                                incoming_bundle->hop_count, 
+                                latency);
+
                             // if root, then print the telemetry directly. If it's a normal data bundle, print the RX log.
                             if (incoming_bundle->is_telemetry) {
                                 printf("%.*s\n", (int)incoming_bundle->payload_len, incoming_bundle->payload);
