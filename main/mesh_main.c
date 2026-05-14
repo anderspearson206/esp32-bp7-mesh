@@ -30,8 +30,9 @@
 /*******************************************************
  *                Variable Definitions
  *******************************************************/
-#define MAX_BUNDLES_IN_RAM 50
+#define MAX_BUNDLES_IN_RAM 100
 #define BUNDLE_PAYLOAD_SIZE 1024
+#define BASE_STATION_NODE_ID 23768
 
 // Tcustom bundle structure inspired by BPv7, but simplified for our mesh use case
 typedef struct __attribute__((packed)) {
@@ -130,14 +131,24 @@ void esp_mesh_p2p_tx_main(void *arg)
     int route_table_size = 0;
     int bundle_generation_timer = 0;
     uint16_t my_node_id = get_my_node_id();
-    int heartbeat_timer = 0; 
+    int heartbeat_timer = 0;
     int flatten_timer = 0;
+    int store_dump_timer = 0;
 
     is_running = true;
 
     while (is_running) {
-        vTaskDelay(pdMS_TO_TICKS(1000)); 
-        if (!is_mesh_connected) continue;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        // NOTE: We intentionally do NOT gate on is_mesh_connected here.
+        // For DTN ferrying we want isolated rovers AND sub-mesh roots
+        // (which never receive MESH_EVENT_PARENT_CONNECTED in a rootless
+        // sub-mesh) to keep generating bundles, aging TTLs, and attempting
+        // forwards. esp_mesh_send() silently fails when there is no peer,
+        // and that failure is handled below by reverting hop_count/prev_node.
+        // The TX task itself is only spawned after the first PARENT_CONNECTED
+        // (see esp_mesh_comm_p2p_start), so the mesh stack is guaranteed to
+        // be initialized by the time we reach this loop.
 
         uint32_t current_time_ms = (uint32_t)(esp_mesh_get_tsf_time() / 1000);
         
@@ -176,7 +187,7 @@ void esp_mesh_p2p_tx_main(void *arg)
                     
                     // try to force the mesh to reconfigure if RSSI is low, the current mesh settings don't disconnect until
                     // rssi hits -90
-                    if (rssi < 90 && !esp_mesh_is_root()) {
+                    if (rssi < -87 && !esp_mesh_is_root()) {
                         ESP_LOGW(MESH_TAG, "Parent RSSI (%d dBm) hit critical threshold! Forcing proactive disconnect.", rssi);
                         esp_mesh_disconnect();
                         // The MESH_EVENT_PARENT_DISCONNECTED will handle the rest
@@ -242,8 +253,39 @@ void esp_mesh_p2p_tx_main(void *arg)
             }
         }
 
+        // periodic bundle store summary
+        store_dump_timer++;
+        if (store_dump_timer >= 10) {
+            store_dump_timer = 0;
+            int total = 0;
+            uint16_t seen_src[10] = {0};
+            int seen_cnt[10] = {0};
+            int unique = 0;
+            for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
+                if (bundle_store[i].is_empty) continue;
+                total++;
+                uint16_t src = bundle_store[i].bundle.source_node;
+                bool found = false;
+                for (int j = 0; j < unique; j++) {
+                    if (seen_src[j] == src) { seen_cnt[j]++; found = true; break; }
+                }
+                if (!found && unique < 10) { seen_src[unique] = src; seen_cnt[unique] = 1; unique++; }
+            }
+            if (total == 0) {
+                ESP_LOGI(MESH_TAG, "@STORE: empty");
+            } else {
+                char dump_buf[128] = {0};
+                int pos = 0;
+                for (int j = 0; j < unique; j++) {
+                    pos += snprintf(dump_buf + pos, sizeof(dump_buf) - pos,
+                                    "%u(%d) ", seen_src[j], seen_cnt[j]);
+                }
+                ESP_LOGI(MESH_TAG, "@STORE: %d bundles | %s", total, dump_buf);
+            }
+        }
+
         // lifecycle management and forwarding
-        esp_mesh_get_routing_table((mesh_addr_t *) &route_table, 
+        esp_mesh_get_routing_table((mesh_addr_t *) &route_table,
                                    CONFIG_MESH_ROUTE_TABLE_SIZE * 6, &route_table_size);
 
         for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
@@ -251,11 +293,14 @@ void esp_mesh_p2p_tx_main(void *arg)
 
             dtn_bundle_t *b = &bundle_store[i].bundle;
 
-            if (current_time_ms > b->creation_time + b->lifetime) {
+            if (b->lifetime <= 1000) {
                 ESP_LOGW(MESH_TAG, "Bundle Expired (TTL). Deleting.");
                 bundle_store[i].is_empty = true;
                 continue;
+            } else {
+                b->lifetime -= 1000; // Decrement remaining life by 1 second
             }
+
             if (b->hop_count >= b->hop_limit) {
                 ESP_LOGW(MESH_TAG, "Bundle Exceeded Hop Limit. Deleting.");
                 bundle_store[i].is_empty = true;
@@ -264,16 +309,23 @@ void esp_mesh_p2p_tx_main(void *arg)
 
             if (!bundle_store[i].forwarded) {
                 size_t actual_tx_size = sizeof(dtn_bundle_t) - BUNDLE_PAYLOAD_SIZE + b->payload_len;
-                
+
+                // Make a local stack copy and mutate the copy, NOT the stored bundle.
+                // Mutating the stored bundle caused hop_count to be incremented every
+                // time PARENT_CONNECTED reset forwarded=false, eventually killing the
+                // bundle on hop_limit even though it might never have actually reached
+                // root. The store stays unchanged and each tx represents a single hop
+                dtn_bundle_t tx_copy = *b;
+                uint16_t original_prev = b->prev_node;
+
+                tx_copy.prev_node = my_node_id;
+                tx_copy.hop_count++;
+
                 mesh_data_t out_data;
-                out_data.data = (uint8_t *)b;
+                out_data.data = (uint8_t *)&tx_copy;
                 out_data.size = actual_tx_size;
                 out_data.proto = MESH_PROTO_BIN;
                 out_data.tos = MESH_TOS_P2P;
-
-                uint16_t original_prev = b->prev_node;
-                b->prev_node = my_node_id;
-                b->hop_count++;
 
                 bool sent_to_anyone = false;
 
@@ -282,20 +334,29 @@ void esp_mesh_p2p_tx_main(void *arg)
                     if (child_node_id == original_prev) continue;
 
                     err = esp_mesh_send(&route_table[j], &out_data, MESH_DATA_P2P, NULL, 0);
+                    ESP_LOGI(MESH_TAG, "TX src:%u seq:%" PRIu32 " -> peer:%u %s",
+                             b->source_node, b->sequence_number, child_node_id,
+                             err == ESP_OK ? "OK" : "FAIL");
                     if (err == ESP_OK) sent_to_anyone = true;
                 }
 
                 if (!esp_mesh_is_root()) {
                     uint8_t parent_mac_5 = mesh_parent_addr.addr[5] - 1;
                     uint16_t parent_node_id = (mesh_parent_addr.addr[4] << 8) | parent_mac_5;
-                    
+
                     if (parent_node_id != original_prev) {
                         err = esp_mesh_send(&mesh_parent_addr, &out_data, MESH_DATA_P2P, NULL, 0);
+                        ESP_LOGI(MESH_TAG, "TX src:%u seq:%" PRIu32 " -> parent:%u %s",
+                                 b->source_node, b->sequence_number, parent_node_id,
+                                 err == ESP_OK ? "OK" : "FAIL");
                         if (err == ESP_OK) sent_to_anyone = true;
                     }
                 }
 
-                if (sent_to_anyone) bundle_store[i].forwarded = true; 
+                if (sent_to_anyone) {
+                    bundle_store[i].forwarded = true;
+                }
+                // No revert needed - the stored bundle was never mutated.
             }
         }
     }
@@ -337,6 +398,10 @@ void esp_mesh_p2p_rx_main(void *arg)
                 }
             }
 
+            if (already_have) {
+                ESP_LOGI(MESH_TAG, "@DEDUP src:%u seq:%" PRIu32,
+                         incoming_bundle->source_node, incoming_bundle->sequence_number);
+            }
             // store
             if (!already_have) {
                 for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
@@ -348,8 +413,9 @@ void esp_mesh_p2p_rx_main(void *arg)
                         
                         uint16_t my_id = get_my_node_id();
 
-                        // telemetry handling
-                        if (esp_mesh_is_root()) {
+                        // telemetry handling — check against the fixed BS node ID, not mesh role,
+                        // so a ferry node that wins a sub-mesh root election still stores bundles
+                        if (my_id == BASE_STATION_NODE_ID) {
                             
                             // print metric info
                             uint32_t current_time_ms = (uint32_t)(esp_mesh_get_tsf_time() / 1000);
@@ -365,14 +431,33 @@ void esp_mesh_p2p_rx_main(void *arg)
                             if (incoming_bundle->is_telemetry) {
                                 printf("%.*s\n", (int)incoming_bundle->payload_len, incoming_bundle->payload);
                                 bundle_store[i].forwarded = true; 
+                                bundle_store[i].is_empty = true;
                             } else {
                                 // root received a normal Data bundle, print the RX log
-                                printf("@DTN_RX:%u:%" PRIu32 ":%u\n", 
-                                       incoming_bundle->source_node, 
-                                       incoming_bundle->sequence_number, my_id);
+                                // Format: @DTN_RX:<source>:<prev_node>:<seq>:<receiver>:<hop_count>
+                                // hop_count >= 2 indicates the bundle was relayed/ferried
+                                printf("@DTN_RX:%u:%u:%" PRIu32 ":%u:%u\n",
+                                        incoming_bundle->source_node,
+                                        incoming_bundle->prev_node,
+                                        incoming_bundle->sequence_number, my_id,
+                                        incoming_bundle->hop_count);
+
+                                // Root is the destination so drop the bundle after
+                                // logging so it doesn't get re-broadcast back down
+                                // the tree, which caused spurious ACK telemetry
+                                // and inflated hop counts mesh-wide.
+                                bundle_store[i].forwarded = true;
+                                bundle_store[i].is_empty = true;
                             }
                         } else {
-                            // If I am a Child, and I received a normal data bundle, 
+                            int stored_count = 0;
+                            for (int k = 0; k < MAX_BUNDLES_IN_RAM; k++) {
+                                if (!bundle_store[k].is_empty) stored_count++;
+                            }
+                            ESP_LOGI(MESH_TAG, "STORED src:%u seq:%" PRIu32 " hops:%u | store:%d/%d",
+                                     incoming_bundle->source_node, incoming_bundle->sequence_number,
+                                     incoming_bundle->hop_count, stored_count, MAX_BUNDLES_IN_RAM);
+                            // If I am a child, and I received a normal data bundle,
                             // I must generate a new telemetry Bundle to tell the Root I got it.
                             if (!incoming_bundle->is_telemetry) {
                                 for (int j = 0; j < MAX_BUNDLES_IN_RAM; j++) {
@@ -388,9 +473,11 @@ void esp_mesh_p2p_rx_main(void *arg)
                                         ack->hop_count = 0;
                                         ack->is_telemetry = true; 
                                         
-                                        ack->payload_len = snprintf((char*)ack->payload, BUNDLE_PAYLOAD_SIZE, 
-                                                  "@DTN_RX:%u:%" PRIu32 ":%u", 
-                                                  incoming_bundle->source_node, incoming_bundle->sequence_number, my_id);
+                                        // Format: @DTN_RX:<source>:<prev_node>:<seq>:<receiver>:<hop_count>
+                                        ack->payload_len = snprintf((char*)ack->payload, BUNDLE_PAYLOAD_SIZE,
+                                                "@DTN_RX:%u:%u:%" PRIu32 ":%u:%u",
+                                                incoming_bundle->source_node, incoming_bundle->prev_node, incoming_bundle->sequence_number, my_id,
+                                                incoming_bundle->hop_count);
                                         
                                         bundle_store[j].is_empty = false;
                                         bundle_store[j].forwarded = false;
@@ -491,7 +578,12 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base,
         last_layer = mesh_layer;
         mesh_connected_indicator(mesh_layer);
         is_mesh_connected = true;
-        init_bundle_store();
+        // init_bundle_store();
+        for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
+            if (!bundle_store[i].is_empty) {
+                bundle_store[i].forwarded = false;
+            }
+        }
         if (esp_mesh_is_root()) {
             esp_netif_dhcpc_stop(netif_sta);
             esp_netif_dhcpc_start(netif_sta);
@@ -611,6 +703,10 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base,
         mesh_event_router_switch_t *router_switch = (mesh_event_router_switch_t *)event_data;
         ESP_LOGI(MESH_TAG, "<MESH_EVENT_ROUTER_SWITCH>new router:%s, channel:%d, "MACSTR"",
                  router_switch->ssid, router_switch->channel, MAC2STR(router_switch->bssid));
+        if (esp_mesh_is_root()) {
+            is_mesh_connected = true;
+            esp_mesh_comm_p2p_start();
+        }
     }
     break;
     case MESH_EVENT_PS_PARENT_DUTY: {
@@ -704,12 +800,17 @@ void app_main(void)
     mesh_cfg_t cfg = MESH_INIT_CONFIG_DEFAULT();
     /* mesh ID */
     memcpy((uint8_t *) &cfg.mesh_id, MESH_ID, 6);
-    /* router */
-    cfg.channel = CONFIG_MESH_CHANNEL;
-    cfg.router.ssid_len = strlen(CONFIG_MESH_ROUTER_SSID);
-    memcpy((uint8_t *) &cfg.router.ssid, CONFIG_MESH_ROUTER_SSID, cfg.router.ssid_len);
-    memcpy((uint8_t *) &cfg.router.password, CONFIG_MESH_ROUTER_PASSWD,
-           strlen(CONFIG_MESH_ROUTER_PASSWD));
+    /* router — use a fake BSSID with ssid_len=0 so the mesh operates standalone.
+     * ssid_len=0 alone causes esp_mesh_set_config to fail (requires non-zero BSSID).
+     * With BSSID-only config the STA only passively scans for that specific MAC
+     * and never initiates probe/auth — so no auth-timeout disconnects (reason:201).
+     * With a fake SSID the STA actively probes, times out every ~11s, resets, and
+     * causes all children to briefly disconnect in a loop.
+     * The BS wins root via MESH_ROOT type. Fixed channel required. */
+    cfg.channel = 6;
+    cfg.router.ssid_len = 0;
+    uint8_t fake_bssid[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+    memcpy(cfg.router.bssid, fake_bssid, sizeof(fake_bssid));
     /* mesh softAP */
     ESP_ERROR_CHECK(esp_mesh_set_ap_authmode(CONFIG_MESH_AP_AUTHMODE));
     cfg.mesh_ap.max_connection = CONFIG_MESH_AP_CONNECTIONS;
@@ -754,15 +855,17 @@ void app_main(void)
     uint16_t my_id = get_my_node_id();
     
     // Replace 23768 with the actual ID of your Base Station (COM5)
-    if (my_id == 23768) {
+    // Clear any stale fix_root=true persisted in NVS from previous firmware.
+    // Must be called on all nodes before esp_mesh_start().
+    ESP_ERROR_CHECK(esp_mesh_fix_root(false));
+    if (my_id == BASE_STATION_NODE_ID) {
         ESP_LOGI(MESH_TAG, "I am the Base Station. Forcing ROOT role.");
         ESP_ERROR_CHECK(esp_mesh_set_type(MESH_ROOT));
-        ESP_ERROR_CHECK(esp_mesh_fix_root(true)); // Prevent any voting
     } else {
         ESP_LOGI(MESH_TAG, "I am a Rover. Starting as IDLE role.");
         ESP_ERROR_CHECK(esp_mesh_set_type(MESH_IDLE));
     }
-
+    init_bundle_store();
     /* mesh start */
     ESP_ERROR_CHECK(esp_mesh_start());
 #ifdef CONFIG_MESH_ENABLE_PS
