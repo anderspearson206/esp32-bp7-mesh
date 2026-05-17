@@ -18,3 +18,5 @@ sdkconfig.old
 # Python cache
 __pycache__/
 *.py[cod]
+
+CLAUDE.md
