@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "driver/uart.h"
 
 /*******************************************************
  *                Constants / Configuration
@@ -31,6 +32,30 @@
 // ESP-NOW v2.0 max payload is 1470 bytes.
 // Our largest possible bundle packet: 1 (type) + bundle_header + 1024 (payload) ≈ 1053 bytes.
 // All ESP32-C5 nodes on IDF 6 negotiate v2.0 automatically.
+
+// Host interface (Jetson ↔ ESP32 UART1)
+// Frame: [SOF:0xAA][CMD:1][LEN_LO][LEN_HI][PAYLOAD:LEN][CRC16_LO][CRC16_HI]
+// CRC-16/CCITT over [CMD, LEN_LO, LEN_HI, PAYLOAD...]
+#define HOST_UART_PORT        UART_NUM_0  // bench: reuse flash/monitor USB; swap to UART_NUM_1 + GPIO6/7 for Jetson
+#define HOST_UART_TX_PIN      UART_PIN_NO_CHANGE  // UART0 pins fixed by bootloader
+#define HOST_UART_RX_PIN      UART_PIN_NO_CHANGE
+#define HOST_UART_BAUD        115200
+#define HOST_UART_RX_BUF      2048
+#define HOST_SOF              0xAA
+#define HOST_MAX_PAYLOAD      1060      // headroom above sizeof(dtn_bundle_t)
+#define HOST_PULL_INTERVAL_MS 10000     // pull from Jetson store every 10s when peers active
+// Jetson → ESP32
+#define HOST_CMD_TX_BUNDLE    0x01      // payload: raw dtn_bundle_t bytes
+#define HOST_CMD_QUERY_STATUS 0x02      // payload: none
+#define HOST_CMD_QUERY_PEERS  0x03      // payload: none
+// ESP32 → Jetson
+#define HOST_CMD_PULL_REQ     0x10      // payload: none; reply = BUNDLE_DATA or NO_BUNDLES
+#define HOST_CMD_ACK          0x20      // payload: 1 byte (0=ok, 1=error/full)
+#define HOST_CMD_STATUS_RESP  0x21      // payload: host_status_t
+#define HOST_CMD_PEERS_RESP   0x22      // payload: n × host_peer_entry_t
+// Both directions
+#define HOST_CMD_BUNDLE_DATA  0x11      // payload: raw dtn_bundle_t bytes
+#define HOST_CMD_NO_BUNDLES   0x12      // payload: none
 
 /*******************************************************
  *                Structs
@@ -71,7 +96,22 @@ typedef struct {
     uint32_t last_seen_ms;
     bool     active;
     int32_t  clock_offset_ms; // peer_clock - bs_clock at last beacon; valid when active
+    int8_t   rssi_last;
 } peer_entry_t;
+
+typedef struct __attribute__((packed)) {
+    uint16_t node_id;
+    uint8_t  active_peers;
+    uint8_t  store_used;
+    uint8_t  store_max;
+    uint8_t  channel;
+} host_status_t;
+
+typedef struct __attribute__((packed)) {
+    uint16_t node_id;
+    int8_t   rssi_last;
+    uint8_t  active;
+} host_peer_entry_t;
 
 // Queue item for recv_cb → rx_process_task
 #define RX_BUF_MAX 1472
@@ -146,6 +186,7 @@ static bool add_or_refresh_peer(const uint8_t *mac, uint16_t node_id, int8_t rss
         if (memcmp(peer_list[i].mac, mac, 6) == 0) {
             bool was_inactive = !peer_list[i].active;
             peer_list[i].last_seen_ms = ts;
+            peer_list[i].rssi_last    = rssi;
             peer_list[i].active = true;
             if (was_inactive) {
                 // Peer returned after timeout — reset forwarded so it gets everything stored
@@ -169,6 +210,7 @@ static bool add_or_refresh_peer(const uint8_t *mac, uint16_t node_id, int8_t rss
         peer_list[peer_count].node_id      = node_id;
         peer_list[peer_count].last_seen_ms = ts;
         peer_list[peer_count].active       = true;
+        peer_list[peer_count].rssi_last    = rssi;
         peer_count++;
         is_new = true;
         // New peer: reset forwarded so they receive all stored bundles
@@ -565,6 +607,205 @@ static void bundle_tx_task(void *arg) {
 }
 
 /*******************************************************
+ *                Host UART Interface
+ *******************************************************/
+
+// Static buffers — only accessed from host_uart_task (single writer, no race)
+static uint8_t host_tx_buf[6 + HOST_MAX_PAYLOAD];
+static uint8_t host_rx_payload[HOST_MAX_PAYLOAD];
+
+static uint16_t crc16_update(uint16_t crc, uint8_t byte) {
+    crc ^= (uint16_t)byte << 8;
+    for (int j = 0; j < 8; j++)
+        crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021u) : (uint16_t)(crc << 1);
+    return crc;
+}
+
+static void host_send_frame(uint8_t cmd, const uint8_t *payload, uint16_t plen) {
+    if (plen > HOST_MAX_PAYLOAD) return;
+    host_tx_buf[0] = HOST_SOF;
+    host_tx_buf[1] = cmd;
+    host_tx_buf[2] = (uint8_t)(plen & 0xFF);
+    host_tx_buf[3] = (uint8_t)(plen >> 8);
+    if (plen > 0 && payload) memcpy(host_tx_buf + 4, payload, plen);
+    uint16_t crc = 0xFFFF;
+    for (int i = 1; i < 4 + (int)plen; i++) crc = crc16_update(crc, host_tx_buf[i]);
+    host_tx_buf[4 + plen]     = (uint8_t)(crc & 0xFF);
+    host_tx_buf[4 + plen + 1] = (uint8_t)(crc >> 8);
+    uart_write_bytes(HOST_UART_PORT, host_tx_buf, 6 + plen);
+}
+
+// Returns true if a valid frame was received within timeout_ms.
+// Payload is in host_rx_payload; cmd and plen are output params.
+static bool host_recv_frame(uint8_t *cmd_out, uint16_t *plen_out, uint32_t timeout_ms) {
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000LL;
+    uint8_t b;
+
+    // Scan for SOF
+    do {
+        if (esp_timer_get_time() > deadline) return false;
+        if (uart_read_bytes(HOST_UART_PORT, &b, 1, pdMS_TO_TICKS(10)) != 1) continue;
+    } while (b != HOST_SOF);
+
+    if (uart_read_bytes(HOST_UART_PORT, cmd_out, 1, pdMS_TO_TICKS(100)) != 1) return false;
+
+    uint8_t lb[2];
+    if (uart_read_bytes(HOST_UART_PORT, lb, 2, pdMS_TO_TICKS(100)) != 2) return false;
+    uint16_t plen = (uint16_t)(lb[0] | ((uint16_t)lb[1] << 8));
+    if (plen > HOST_MAX_PAYLOAD) return false;
+    *plen_out = plen;
+
+    if (plen > 0 && uart_read_bytes(HOST_UART_PORT, host_rx_payload, plen, pdMS_TO_TICKS(1000)) != (int)plen)
+        return false;
+
+    uint8_t cb[2];
+    if (uart_read_bytes(HOST_UART_PORT, cb, 2, pdMS_TO_TICKS(100)) != 2) return false;
+    uint16_t recv_crc = (uint16_t)(cb[0] | ((uint16_t)cb[1] << 8));
+
+    uint16_t calc_crc = 0xFFFF;
+    calc_crc = crc16_update(calc_crc, *cmd_out);
+    calc_crc = crc16_update(calc_crc, lb[0]);
+    calc_crc = crc16_update(calc_crc, lb[1]);
+    for (uint16_t i = 0; i < plen; i++) calc_crc = crc16_update(calc_crc, host_rx_payload[i]);
+    return recv_crc == calc_crc;
+}
+
+// Inject a raw dtn_bundle_t (plen bytes) from host into the bundle store.
+// Returns true on success, false if store is full or duplicate.
+static bool host_inject_bundle(const uint8_t *data, uint16_t plen) {
+    size_t min_hdr = sizeof(dtn_bundle_t) - BUNDLE_PAYLOAD_SIZE;
+    if (plen < (uint16_t)min_hdr) return false;
+    dtn_bundle_t *b = (dtn_bundle_t *)data;
+
+    xSemaphoreTake(data_mutex, portMAX_DELAY);
+
+    // Dedup
+    for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
+        if (!bundle_store[i].is_empty) {
+            dtn_bundle_t *s = &bundle_store[i].bundle;
+            if (s->source_node    == b->source_node &&
+                s->creation_time  == b->creation_time &&
+                s->sequence_number == b->sequence_number) {
+                xSemaphoreGive(data_mutex);
+                return false; // already have it
+            }
+        }
+    }
+
+    for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
+        if (bundle_store[i].is_empty) {
+            memcpy(&bundle_store[i].bundle, b, plen);
+            bundle_store[i].is_empty  = false;
+            bundle_store[i].forwarded = false;
+            xSemaphoreGive(data_mutex);
+            ESP_LOGI(TAG, "Host: injected src=%u seq=%" PRIu32, b->source_node, b->sequence_number);
+            return true;
+        }
+    }
+
+    xSemaphoreGive(data_mutex);
+    ESP_LOGW(TAG, "Host: store full, dropping src=%u seq=%" PRIu32, b->source_node, b->sequence_number);
+    return false;
+}
+
+static void host_uart_task(void *arg) {
+    uint16_t my_id = get_my_node_id();
+    uint32_t last_pull_ms = 0;
+
+    while (1) {
+        uint8_t  cmd;
+        uint16_t plen;
+        bool got = host_recv_frame(&cmd, &plen, 100);
+
+        if (got) {
+            switch (cmd) {
+            case HOST_CMD_TX_BUNDLE: {
+                bool ok = host_inject_bundle(host_rx_payload, plen);
+                uint8_t status = ok ? 0 : 1;
+                host_send_frame(HOST_CMD_ACK, &status, 1);
+                break;
+            }
+            case HOST_CMD_QUERY_STATUS: {
+                int used = 0, active_count = 0;
+                xSemaphoreTake(data_mutex, portMAX_DELAY);
+                for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) if (!bundle_store[i].is_empty) used++;
+                for (int i = 0; i < peer_count; i++) if (peer_list[i].active) active_count++;
+                xSemaphoreGive(data_mutex);
+                host_status_t s = {
+                    .node_id      = my_id,
+                    .active_peers = (uint8_t)active_count,
+                    .store_used   = (uint8_t)(used > 255 ? 255 : used),
+                    .store_max    = MAX_BUNDLES_IN_RAM,
+                    .channel      = ESPNOW_CHANNEL,
+                };
+                host_send_frame(HOST_CMD_STATUS_RESP, (uint8_t *)&s, sizeof(s));
+                break;
+            }
+            case HOST_CMD_QUERY_PEERS: {
+                host_peer_entry_t entries[MAX_PEERS];
+                int n = 0;
+                xSemaphoreTake(data_mutex, portMAX_DELAY);
+                for (int i = 0; i < peer_count && n < MAX_PEERS; i++) {
+                    entries[n].node_id   = peer_list[i].node_id;
+                    entries[n].rssi_last = peer_list[i].rssi_last;
+                    entries[n].active    = peer_list[i].active ? 1 : 0;
+                    n++;
+                }
+                xSemaphoreGive(data_mutex);
+                host_send_frame(HOST_CMD_PEERS_RESP, (uint8_t *)entries,
+                                (uint16_t)(n * sizeof(host_peer_entry_t)));
+                break;
+            }
+            default:
+                ESP_LOGW(TAG, "Host: unknown cmd 0x%02x len=%u", cmd, plen);
+                break;
+            }
+        }
+
+        // Periodic bundle pull from Jetson when we have peers to forward to
+        uint32_t ts = now_ms();
+        if (ts - last_pull_ms >= HOST_PULL_INTERVAL_MS) {
+            last_pull_ms = ts;
+            bool has_peers = false;
+            xSemaphoreTake(data_mutex, portMAX_DELAY);
+            for (int i = 0; i < peer_count; i++) { if (peer_list[i].active) { has_peers = true; break; } }
+            xSemaphoreGive(data_mutex);
+
+            if (has_peers) {
+                // Drain Jetson store: pull until NO_BUNDLES or store-full/timeout
+                for (int attempt = 0; attempt < MAX_BUNDLES_IN_RAM; attempt++) {
+                    host_send_frame(HOST_CMD_PULL_REQ, NULL, 0);
+                    uint8_t r_cmd;
+                    uint16_t r_plen;
+                    if (!host_recv_frame(&r_cmd, &r_plen, 500)) break;
+                    if (r_cmd == HOST_CMD_NO_BUNDLES) break;
+                    if (r_cmd == HOST_CMD_BUNDLE_DATA) {
+                        if (!host_inject_bundle(host_rx_payload, r_plen)) break; // store full
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void init_host_uart(void) {
+    uart_config_t cfg = {
+        .baud_rate  = HOST_UART_BAUD,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+    };
+    ESP_ERROR_CHECK(uart_param_config(HOST_UART_PORT, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(HOST_UART_PORT,
+                                  HOST_UART_TX_PIN, HOST_UART_RX_PIN,
+                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(HOST_UART_PORT, HOST_UART_RX_BUF, 0, 0, NULL, 0));
+    ESP_LOGI(TAG, "Host UART: port=%d tx=%d rx=%d baud=%d",
+             HOST_UART_PORT, HOST_UART_TX_PIN, HOST_UART_RX_PIN, HOST_UART_BAUD);
+}
+
+/*******************************************************
  *                app_main
  *******************************************************/
 void app_main(void) {
@@ -604,11 +845,13 @@ void app_main(void) {
         ESP_LOGI(TAG, "I am a Rover (ID=%u) on channel %d (5GHz)", my_id, ESPNOW_CHANNEL);
     }
 
+    init_host_uart();
     init_bundle_store();
     data_mutex = xSemaphoreCreateMutex();
     rx_queue   = xQueueCreate(4, sizeof(rx_item_t));
 
-    xTaskCreate(rx_process_task, "rx_proc",  4096, NULL, 6, NULL);
-    xTaskCreate(beacon_task,     "beacon",   2048, NULL, 5, NULL);
-    xTaskCreate(bundle_tx_task,  "tx_loop",  4096, NULL, 4, NULL);
+    xTaskCreate(rx_process_task, "rx_proc",    4096, NULL, 6, NULL);
+    xTaskCreate(beacon_task,     "beacon",     2048, NULL, 5, NULL);
+    xTaskCreate(bundle_tx_task,  "tx_loop",    4096, NULL, 4, NULL);
+    xTaskCreate(host_uart_task,  "host_uart",  4096, NULL, 3, NULL);
 }
