@@ -1,3 +1,4 @@
+import os
 import serial
 import threading
 import time
@@ -5,16 +6,40 @@ import networkx as nx
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from collections import deque, defaultdict
+from datetime import datetime
 
-SERIAL_PORT = 'COM5'  # Change to /dev/ttyUSB0 for Linux/Mac
+SERIAL_PORT = os.environ.get('SERIAL_PORT', 'COM5')  # override: SERIAL_PORT=/dev/ttyUSB0 python mesh_visualizer.py
 BAUD_RATE = 115200
-TIMEOUT_SECONDS = 15 
+TIMEOUT_SECONDS = 15
 
 G = nx.DiGraph()
-recent_transfers = [] 
+recent_transfers = []
 lock = threading.Lock()
 node_latencies = defaultdict(lambda: deque(maxlen=20))
 event_log = deque(maxlen=20)
+delivered_bundles = {}  # (source_node_str, seq_int) -> {latency_ms, hops, time}
+dedup_counts = defaultdict(int)  # source_node_str -> count of duplicate arrivals at BS
+
+def read_line_or_frame(ser):
+    """Return one stripped ASCII line, skipping binary ESP32 UART frames (SOF=0xAA).
+    Returns None on timeout or empty input."""
+    buf = bytearray()
+    while True:
+        b = ser.read(1)
+        if not b:
+            return None
+        byte = b[0]
+        if not buf and byte == 0xAA:
+            # binary frame, read cmd + len (3 bytes), then skip payload + CRC
+            header = ser.read(3)
+            if len(header) == 3:
+                plen = header[1] | (header[2] << 8)
+                if plen <= 1060:
+                    ser.read(plen + 2)
+            continue
+        buf.append(byte)
+        if byte == ord('\n'):
+            return buf.decode('utf-8', errors='ignore').strip() or None
 
 def serial_reader_thread(port):
     """Reads serial data from a specific port and updates the network graph state."""
@@ -24,22 +49,13 @@ def serial_reader_thread(port):
             print(f"Connected to {port}. Listening for DTN telemetry...")
             
             while True:
-                # Read raw bytes first to avoid immediate decode crashes
-                raw_line = ser.readline()
-                if not raw_line:
-                    continue
-                
-                try:
-                    line = raw_line.decode('utf-8', errors='ignore').strip()
-                except Exception:
-                    continue
-
+                line = read_line_or_frame(ser)
                 if not line:
                     continue
-                    
+
                 # parse topology updates
                 if line.startswith("@"):
-                    print(f"Received: {line}")
+                    print(f"Received: {line} : {datetime.now().strftime('%H:%M:%S')}")
                 if line.startswith("@NET:"):
                     parts = line.split(':')
                     if len(parts) >= 4:
@@ -106,14 +122,28 @@ def serial_reader_thread(port):
                     if len(parts) >= 5:
                         source_node = parts[1]
                         try:
+                            seq_num = int(parts[2])
+                            hops_val = int(parts[3])
                             latency_ms = int(parts[4])
-                            
-                            # filter out unrealistic latencies (e.g., negative or excessively high values)
-                            if 0 <= latency_ms < 300000: 
+                            if 0 <= latency_ms < 300000:
                                 with lock:
                                     node_latencies[source_node].append(latency_ms)
+                                    delivered_bundles[(source_node, seq_num)] = {
+                                        'latency_ms': latency_ms,
+                                        'hops': hops_val,
+                                        'time': time.time(),
+                                    }
                         except ValueError:
                             pass
+
+                # duplicate bundle arrivals at BS
+                elif line.startswith("@DEDUP:"):
+                    # Format: @DEDUP:<source_node>:<seq_num>:<receiver_node>
+                    parts = line.split(':')
+                    if len(parts) >= 3:
+                        source_node = parts[1]
+                        with lock:
+                            dedup_counts[source_node] += 1
 
         except (serial.SerialException, serial.PortNotOpenError) as e:
             print(f"Connection lost on {port}: {e}. Retrying in 2 seconds...")
@@ -139,24 +169,62 @@ def update_graph(frame):
         ax_graph = plt.subplot(1, 2, 1)
         ax_log = plt.subplot(1, 2, 2)
 
-        # --- event log panel ---
+        # --- event log panel (top 55%) ---
         ax_log.axis('off')
-        ax_log.set_title("Bundle Events (BS received)", fontsize=10, fontweight='bold')
+        ax_log.set_title("Bundle Events / Delivery Metrics", fontsize=10, fontweight='bold')
         y = 0.97
-        for entry in reversed(event_log):
+        ax_log.text(0.02, y, "— Recent Deliveries —", transform=ax_log.transAxes,
+                    fontsize=8, color='black', verticalalignment='top', fontweight='bold')
+        y -= 0.05
+        for entry in list(reversed(event_log))[:10]:
             age = int(current_time - entry['time'])
             mins, secs = divmod(age, 60)
             age_str = f"{mins}m{secs:02d}s ago" if mins else f"{secs}s ago"
             if entry['is_ferry']:
-                line = f"[FERRY]  src:{entry['src']} via:{entry['ferry']} hops:{entry['hops']} seq:{entry['seq']} ({age_str})"
+                ln = f"[FERRY]  src:{entry['src']} via:{entry['ferry']} hops:{entry['hops']} seq:{entry['seq']} ({age_str})"
                 color = 'darkorange'
             else:
-                line = f"[DIRECT] src:{entry['src']} hops:{entry['hops']} seq:{entry['seq']} ({age_str})"
+                ln = f"[DIRECT] src:{entry['src']} hops:{entry['hops']} seq:{entry['seq']} ({age_str})"
                 color = 'green'
-            ax_log.text(0.02, y, line, transform=ax_log.transAxes,
+            ax_log.text(0.02, y, ln, transform=ax_log.transAxes,
                         fontsize=7.5, color=color, verticalalignment='top',
                         fontfamily='monospace')
             y -= 0.048
+
+        # --- delivery metrics panel (bottom 40%) ---
+        y_stats = 0.42
+        ax_log.text(0.02, y_stats, "— Delivery Metrics —", transform=ax_log.transAxes,
+                    fontsize=8, color='black', verticalalignment='top', fontweight='bold')
+        y_stats -= 0.05
+
+        total = len(delivered_bundles)
+        ax_log.text(0.02, y_stats, f"Total delivered: {total} bundles",
+                    transform=ax_log.transAxes, fontsize=8, color='navy',
+                    verticalalignment='top', fontfamily='monospace')
+        y_stats -= 0.045
+
+        # Per-source delivery summary with dedup column
+        per_source = defaultdict(list)
+        for (src, _seq), info in delivered_bundles.items():
+            per_source[src].append(info['latency_ms'])
+        for src, lats in sorted(per_source.items()):
+            avg = sum(lats) / len(lats)
+            dups = dedup_counts.get(src, 0)
+            dup_str = f"  dups:{dups}" if dups else ""
+            ax_log.text(0.02, y_stats,
+                        f"  Node {src}: {len(lats)} pkts  avg {avg:.0f} ms{dup_str}",
+                        transform=ax_log.transAxes, fontsize=8, color='darkgreen',
+                        verticalalignment='top', fontfamily='monospace')
+            y_stats -= 0.045
+
+        # Dedup totals for sources not yet in delivered_bundles
+        for src, count in sorted(dedup_counts.items()):
+            if src not in per_source:
+                ax_log.text(0.02, y_stats,
+                            f"  Node {src}: 0 pkts  dups:{count}",
+                            transform=ax_log.transAxes, fontsize=8, color='sienna',
+                            verticalalignment='top', fontfamily='monospace')
+                y_stats -= 0.045
 
         # --- graph panel ---
         if len(G.nodes) == 0:

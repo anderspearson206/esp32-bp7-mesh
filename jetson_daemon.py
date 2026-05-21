@@ -1,0 +1,359 @@
+"""
+Jetson node daemon — runs on a rover Jetson Orin Nano.
+Manages the local bundle store and bridges it to the attached ESP32 modem via UART.
+
+Usage:
+    python jetson_daemon.py [--serial PORT] [--baud BAUD] [--interval SECS] [--node-id ID]
+
+    --serial   Serial port connected to ESP32 (default: /dev/ttyTHS1 for Jetson UART1)
+    --baud     Baud rate (default: 115200)
+    --interval Seconds between generated sensor bundles (default: 10, 0 = disable)
+    --node-id  Override node ID (default: auto-detected from ESP32 STATUS_RESP on startup)
+"""
+
+import argparse
+import itertools
+import json
+import struct
+import threading
+import time
+import serial
+
+# ── Protocol constants (must match mesh_main.c) ──────────────────────────────
+HOST_SOF              = 0xAA
+HOST_MAX_PAYLOAD      = 1060
+BASE_STATION_NODE_ID  = 23768
+
+HOST_CMD_TX_BUNDLE      = 0x01
+HOST_CMD_QUERY_STATUS   = 0x02
+HOST_CMD_PULL_REQ       = 0x10
+HOST_CMD_ACK            = 0x20
+HOST_CMD_STATUS_RESP    = 0x21
+HOST_CMD_BUNDLE_DATA    = 0x11
+HOST_CMD_NO_BUNDLES     = 0x12
+HOST_CMD_ANTIPKT_NOTIFY = 0x13
+
+# dtn_bundle_t layout (packed, little-endian, matches ESP32 C struct)
+# Fields: creation_time, sequence_number, lifetime, source_node, dest_node,
+#         report_to_node, prev_node, request_delivery_report, is_telemetry,
+#         hop_limit, hop_count, payload_len, payload[1024]
+BUNDLE_FMT  = '<IIIHHHHBBBBI1024s'
+BUNDLE_SIZE = struct.calcsize(BUNDLE_FMT)   # must be 1052
+
+# antipkt_id_t layout: source_node (u16), creation_time (u32), sequence_number (u32)
+ANTIPKT_ID_FMT  = '<HII'
+ANTIPKT_ID_SIZE = struct.calcsize(ANTIPKT_ID_FMT)  # 10 bytes
+
+# host_status_t layout: node_id (u16), active_peers, store_used, store_max, channel (all u8)
+STATUS_FMT  = '<HBBBB'
+STATUS_SIZE = struct.calcsize(STATUS_FMT)  # 6 bytes
+
+BUNDLE_DEFAULT_LIFETIME  = 300_000  # ms (5 minutes)
+BUNDLE_DEFAULT_HOP_LIMIT = 5
+
+# ── CRC-16/CCITT (poly 0x1021, init 0xFFFF) ──────────────────────────────────
+def _crc16(data: bytes) -> int:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if (crc & 0x8000) else (crc << 1)
+            crc &= 0xFFFF
+    return crc
+
+# ── Frame encode / decode ─────────────────────────────────────────────────────
+def encode_frame(cmd: int, payload: bytes = b'') -> bytes:
+    plen = len(payload)
+    header = bytes([HOST_SOF, cmd, plen & 0xFF, (plen >> 8) & 0xFF])
+    crc_data = bytes([cmd, plen & 0xFF, (plen >> 8) & 0xFF]) + payload
+    crc = _crc16(crc_data)
+    return header + payload + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+
+
+def _read_exact(ser: serial.Serial, n: int, timeout_s: float = 1.0) -> bytes:
+    deadline = time.monotonic() + timeout_s
+    buf = b''
+    while len(buf) < n:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return buf
+        chunk = ser.read(n - len(buf))
+        buf += chunk
+    return buf
+
+
+def recv_frame(ser: serial.Serial, timeout_s: float = 1.0) -> tuple[int, bytes] | None:
+    """Block until a valid frame arrives or timeout. Returns (cmd, payload) or None."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        b = ser.read(1)
+        if not b:
+            continue
+        if b[0] != HOST_SOF:
+            continue
+        header = _read_exact(ser, 3, timeout_s=0.2)
+        if len(header) < 3:
+            return None
+        cmd = header[0]
+        plen = header[1] | (header[2] << 8)
+        if plen > HOST_MAX_PAYLOAD:
+            continue
+        payload = _read_exact(ser, plen, timeout_s=1.0) if plen else b''
+        crc_bytes = _read_exact(ser, 2, timeout_s=0.2)
+        if len(crc_bytes) < 2:
+            return None
+        recv_crc = crc_bytes[0] | (crc_bytes[1] << 8)
+        calc_crc = _crc16(bytes([cmd, header[1], header[2]]) + payload)
+        if recv_crc != calc_crc:
+            print(f"[WARN] CRC mismatch cmd=0x{cmd:02x} expected=0x{calc_crc:04x} got=0x{recv_crc:04x}")
+            continue
+        return cmd, payload
+    return None
+
+# ── Bundle serialization ──────────────────────────────────────────────────────
+def pack_bundle(b: dict) -> bytes:
+    payload_bytes = b['payload']
+    if isinstance(payload_bytes, str):
+        payload_bytes = payload_bytes.encode()
+    payload_padded = payload_bytes[:1024].ljust(1024, b'\x00')
+    return struct.pack(
+        BUNDLE_FMT,
+        b['creation_time'],
+        b['sequence_number'],
+        b.get('lifetime', BUNDLE_DEFAULT_LIFETIME),
+        b['source_node'],
+        b.get('dest_node', BASE_STATION_NODE_ID),
+        b.get('report_to_node', 0),
+        b.get('prev_node', b['source_node']),
+        int(b.get('request_delivery_report', False)),
+        int(b.get('is_telemetry', False)),
+        b.get('hop_limit', BUNDLE_DEFAULT_HOP_LIMIT),
+        b.get('hop_count', 0),
+        len(payload_bytes),
+        payload_padded,
+    )
+
+
+def unpack_bundle(data: bytes) -> dict | None:
+    if len(data) < BUNDLE_SIZE:
+        return None
+    fields = struct.unpack_from(BUNDLE_FMT, data)
+    (creation_time, seq, lifetime, source_node, dest_node, report_to, prev_node,
+     req_report, is_telem, hop_limit, hop_count, payload_len, payload_raw) = fields
+    return {
+        'creation_time':           creation_time,
+        'sequence_number':         seq,
+        'lifetime':                lifetime,
+        'source_node':             source_node,
+        'dest_node':               dest_node,
+        'report_to_node':          report_to,
+        'prev_node':               prev_node,
+        'request_delivery_report': bool(req_report),
+        'is_telemetry':            bool(is_telem),
+        'hop_limit':               hop_limit,
+        'hop_count':               hop_count,
+        'payload':                 payload_raw[:payload_len],
+    }
+
+# ── Daemon ────────────────────────────────────────────────────────────────────
+class JetsonDaemon:
+    def __init__(self, serial_port: str, baud: int, gen_interval: float, node_id_override: int | None):
+        assert BUNDLE_SIZE == 1052, f"Bundle struct size mismatch: got {BUNDLE_SIZE}, expected 1052"
+
+        self._port      = serial_port
+        self._baud      = baud
+        self._interval  = gen_interval
+        self._node_id   = node_id_override  # None = auto-detect on startup
+
+        self._store: list[dict] = []
+        self._lock = threading.Lock()
+        self._seq  = itertools.count(start=1)
+
+        self._delivered: set[tuple] = set()  # (source_node, creation_time, seq) tuples
+
+        self._ser: serial.Serial | None = None
+        self._uart_lock = threading.Lock()  # serialises UART writes
+
+    # ── Serial helpers ──────────────────────────────────────────────────────
+    def _send(self, cmd: int, payload: bytes = b'') -> None:
+        frame = encode_frame(cmd, payload)
+        with self._uart_lock:
+            self._ser.write(frame)
+
+    def _recv(self, timeout_s: float = 1.0):
+        with self._uart_lock:
+            return recv_frame(self._ser, timeout_s)
+
+    # ── Bundle store ────────────────────────────────────────────────────────
+    def _add_bundle(self, b: dict) -> bool:
+        key = (b['source_node'], b['creation_time'], b['sequence_number'])
+        with self._lock:
+            if key in self._delivered:
+                return False
+            for stored in self._store:
+                if (stored['source_node'] == b['source_node'] and
+                        stored['creation_time'] == b['creation_time'] and
+                        stored['sequence_number'] == b['sequence_number']):
+                    return False
+            self._store.append(b)
+        print(f"[STORE] Added src:{b['source_node']} seq:{b['sequence_number']} "
+              f"| store size: {len(self._store)}")
+        return True
+
+    def _expire_bundles(self) -> None:
+        now = int(time.monotonic() * 1000)
+        with self._lock:
+            before = len(self._store)
+            self._store = [
+                b for b in self._store
+                if (now - b.get('added_at_ms', now)) < b.get('lifetime', BUNDLE_DEFAULT_LIFETIME)
+            ]
+            expired = before - len(self._store)
+        if expired:
+            print(f"[STORE] Expired {expired} bundles by TTL")
+
+    def _apply_antipkt(self, source_node: int, creation_time: int, seq: int) -> None:
+        key = (source_node, creation_time, seq)
+        self._delivered.add(key)
+        with self._lock:
+            before = len(self._store)
+            self._store = [
+                b for b in self._store
+                if not (b['source_node'] == source_node and
+                        b['creation_time'] == creation_time and
+                        b['sequence_number'] == seq)
+            ]
+            removed = before - len(self._store)
+        if removed:
+            print(f"[ANTIPKT] Cleared src:{source_node} seq:{seq} from store")
+        else:
+            print(f"[ANTIPKT] src:{source_node} seq:{seq} (not in store, already clear)")
+
+    # ── Startup: detect node ID from ESP32 STATUS_RESP ─────────────────────
+    def _detect_node_id(self) -> int:
+        for attempt in range(5):
+            self._send(HOST_CMD_QUERY_STATUS)
+            result = recv_frame(self._ser, timeout_s=2.0)
+            if result and result[0] == HOST_CMD_STATUS_RESP and len(result[1]) >= STATUS_SIZE:
+                node_id = struct.unpack_from('<H', result[1])[0]
+                print(f"[INIT] Auto-detected node_id={node_id}")
+                return node_id
+            print(f"[INIT] STATUS_RESP attempt {attempt+1}/5 failed, retrying...")
+            time.sleep(1)
+        raise RuntimeError("Could not auto-detect node_id from ESP32. Use --node-id to override.")
+
+    # ── PULL_REQ handler: drain local store to ESP32 ─────────────────────
+    def _handle_pull_req(self) -> None:
+        self._expire_bundles()
+        with self._lock:
+            pending = list(self._store)
+        if not pending:
+            self._send(HOST_CMD_NO_BUNDLES)
+            return
+        sent = 0
+        for b in pending:
+            data = pack_bundle(b)
+            self._send(HOST_CMD_BUNDLE_DATA, data)
+            # Wait for ACK
+            result = recv_frame(self._ser, timeout_s=0.5)
+            if result and result[0] == HOST_CMD_ACK:
+                status = result[1][0] if result[1] else 1
+                if status != 0:
+                    print(f"[PULL] ESP32 store full, stopping drain")
+                    break
+                sent += 1
+            else:
+                break
+        self._send(HOST_CMD_NO_BUNDLES)
+        print(f"[PULL] Sent {sent}/{len(pending)} bundles to ESP32")
+
+    # ── Frame dispatcher ────────────────────────────────────────────────────
+    def _dispatch(self, cmd: int, payload: bytes) -> None:
+        if cmd == HOST_CMD_PULL_REQ:
+            self._handle_pull_req()
+
+        elif cmd == HOST_CMD_ANTIPKT_NOTIFY:
+            if len(payload) >= ANTIPKT_ID_SIZE:
+                source_node, creation_time, seq = struct.unpack_from(ANTIPKT_ID_FMT, payload)
+                self._apply_antipkt(source_node, creation_time, seq)
+
+        elif cmd == HOST_CMD_ACK:
+            status = payload[0] if payload else 1
+            print(f"[ACK] status={'ok' if status == 0 else 'error/full'}")
+
+        else:
+            print(f"[WARN] Unknown cmd 0x{cmd:02x} len={len(payload)}")
+
+    # ── Bundle generator ────────────────────────────────────────────────────
+    def _generate_bundle(self) -> None:
+        now_ms = int(time.monotonic() * 1000)
+        payload = json.dumps({
+            'ts': int(time.time()),
+            'node': self._node_id,
+            'sensor': round(20.0 + (now_ms % 1000) / 100.0, 1),  # synthetic sensor value
+        }).encode()
+        b = {
+            'creation_time':   now_ms,
+            'sequence_number': next(self._seq),
+            'lifetime':        BUNDLE_DEFAULT_LIFETIME,
+            'source_node':     self._node_id,
+            'dest_node':       BASE_STATION_NODE_ID,
+            'prev_node':       self._node_id,
+            'hop_limit':       BUNDLE_DEFAULT_HOP_LIMIT,
+            'hop_count':       0,
+            'is_telemetry':    False,
+            'payload':         payload,
+            'added_at_ms':     now_ms,
+        }
+        if self._add_bundle(b):
+            print(f"[GEN] Generated bundle seq:{b['sequence_number']}")
+
+    # ── Main loop ───────────────────────────────────────────────────────────
+    def run(self) -> None:
+        print(f"[INIT] Opening {self._port} at {self._baud} baud")
+        self._ser = serial.Serial(self._port, self._baud, timeout=0.1)
+        time.sleep(0.5)  # let ESP32 boot log settle
+
+        if self._node_id is None:
+            self._node_id = self._detect_node_id()
+        print(f"[INIT] Running as node {self._node_id}")
+
+        last_gen = time.monotonic()
+
+        while True:
+            # Receive one frame (non-blocking style via short timeout)
+            result = recv_frame(self._ser, timeout_s=0.1)
+            if result is not None:
+                cmd, payload = result
+                self._dispatch(cmd, payload)
+
+            # Periodic bundle generation
+            if self._interval > 0 and (time.monotonic() - last_gen) >= self._interval:
+                last_gen = time.monotonic()
+                self._generate_bundle()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Jetson rover node daemon')
+    parser.add_argument('--serial',   default='/dev/ttyTHS1', help='Serial port to ESP32')
+    parser.add_argument('--baud',     type=int, default=115200, help='Baud rate')
+    parser.add_argument('--interval', type=float, default=10.0,
+                        help='Bundle generation interval in seconds (0 = disable)')
+    parser.add_argument('--node-id',  type=int, default=None,
+                        help='Override node ID (default: auto-detect from ESP32)')
+    args = parser.parse_args()
+
+    daemon = JetsonDaemon(
+        serial_port=args.serial,
+        baud=args.baud,
+        gen_interval=args.interval,
+        node_id_override=args.node_id,
+    )
+    try:
+        daemon.run()
+    except KeyboardInterrupt:
+        print('\n[INIT] Shutting down.')
+
+
+if __name__ == '__main__':
+    main()

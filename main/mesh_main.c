@@ -1,4 +1,5 @@
 #include <string.h>
+#include <stdlib.h>
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -28,6 +29,11 @@
 
 #define PKT_TYPE_BEACON  0x01
 #define PKT_TYPE_BUNDLE  0x02
+#define PKT_TYPE_ANTIPKT 0x03
+
+#define MAX_ANTIPKTS          50
+#define ANTIPKT_LIFETIME_MS   (120 * 1000)
+#define MAX_BS_DELIVERED      200
 
 // ESP-NOW v2.0 max payload is 1470 bytes.
 // Our largest possible bundle packet: 1 (type) + bundle_header + 1024 (payload) ≈ 1053 bytes.
@@ -44,11 +50,11 @@
 #define HOST_SOF              0xAA
 #define HOST_MAX_PAYLOAD      1060      // headroom above sizeof(dtn_bundle_t)
 #define HOST_PULL_INTERVAL_MS 10000     // pull from Jetson store every 10s when peers active
-// Jetson → ESP32
+// Jetson -> ESP32
 #define HOST_CMD_TX_BUNDLE    0x01      // payload: raw dtn_bundle_t bytes
 #define HOST_CMD_QUERY_STATUS 0x02      // payload: none
 #define HOST_CMD_QUERY_PEERS  0x03      // payload: none
-// ESP32 → Jetson
+// ESP32 -> Jetson
 #define HOST_CMD_PULL_REQ     0x10      // payload: none; reply = BUNDLE_DATA or NO_BUNDLES
 #define HOST_CMD_ACK          0x20      // payload: 1 byte (0=ok, 1=error/full)
 #define HOST_CMD_STATUS_RESP  0x21      // payload: host_status_t
@@ -56,12 +62,13 @@
 // Both directions
 #define HOST_CMD_BUNDLE_DATA  0x11      // payload: raw dtn_bundle_t bytes
 #define HOST_CMD_NO_BUNDLES   0x12      // payload: none
+#define HOST_CMD_ANTIPKT_NOTIFY 0x13   // ESP32 -> Jetson: drop bundle; payload: antipkt_id_t (10 bytes)
 
 /*******************************************************
  *                Structs
  *******************************************************/
 
-// BPv7-inspired bundle (unchanged from ESP-WIFI-MESH version)
+// bp7 inspired bundle format 
 typedef struct __attribute__((packed)) {
     uint32_t creation_time;
     uint32_t sequence_number;
@@ -99,6 +106,34 @@ typedef struct {
     int8_t   rssi_last;
 } peer_entry_t;
 
+// 10-byte bundle identifier used in both ESP-NOW antipackets and UART notify frames
+typedef struct __attribute__((packed)) {
+    uint16_t source_node;
+    uint32_t creation_time;
+    uint32_t sequence_number;
+} antipkt_id_t;
+
+// ESP-NOW antipacket wire format (11 bytes)
+typedef struct __attribute__((packed)) {
+    uint8_t      pkt_type;   // PKT_TYPE_ANTIPKT
+    antipkt_id_t id;
+} antipkt_pkt_t;
+
+// Antipacket store entry
+typedef struct {
+    antipkt_id_t id;
+    bool         is_empty;
+    bool         forwarded;
+    uint32_t     received_at_ms;
+} stored_antipkt_t;
+
+// BS-side delivered-bundle ring buffer — NOT packed so comparisons are always correct
+typedef struct {
+    uint16_t source_node;
+    uint32_t creation_time;
+    uint32_t sequence_number;
+} bs_delivered_id_t;
+
 typedef struct __attribute__((packed)) {
     uint16_t node_id;
     uint8_t  active_peers;
@@ -113,13 +148,13 @@ typedef struct __attribute__((packed)) {
     uint8_t  active;
 } host_peer_entry_t;
 
-// Queue item for recv_cb → rx_process_task
+// Queue item for recv_cb -> rx_process_task (heap-allocated, pointer passed through queue)
 #define RX_BUF_MAX 1472
 typedef struct {
     uint8_t  src_mac[6];
     int8_t   rssi;
     uint16_t len;
-    uint8_t  data[RX_BUF_MAX];
+    uint8_t  data[];   // flexible array — only actual packet bytes allocated
 } rx_item_t;
 
 /*******************************************************
@@ -128,13 +163,18 @@ typedef struct {
 static const char *TAG = "dtn_now";
 
 static ram_bundle_t      bundle_store[MAX_BUNDLES_IN_RAM];
+static stored_antipkt_t  antipkt_store[MAX_ANTIPKTS];
+static bs_delivered_id_t bs_delivered[MAX_BS_DELIVERED];
+static int               bs_delivered_head  = 0;
+static int               bs_delivered_count = 0;
 static uint32_t          local_sequence_counter = 0;
 static peer_entry_t      peer_list[MAX_PEERS];
 static int               peer_count = 0;
 static SemaphoreHandle_t data_mutex;
 static QueueHandle_t     rx_queue;
+static QueueHandle_t     antipkt_notify_q;  // rx_process_task -> host_uart_task notifications
 
-// Static TX buffer — written only from bundle_tx_task (single writer, no race)
+// static TX buffer — written only from bundle_tx_task (single writer, no race)
 static uint8_t tx_pkt_buf[1 + sizeof(dtn_bundle_t)];
 
 static const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -158,6 +198,9 @@ static void init_bundle_store(void) {
         bundle_store[i].forwarded = false;
         memset(&bundle_store[i].bundle, 0, sizeof(dtn_bundle_t));
     }
+    for (int i = 0; i < MAX_ANTIPKTS; i++) {
+        antipkt_store[i].is_empty = true;
+    }
     ESP_LOGI(TAG, "Bundle store initialized");
 }
 
@@ -171,6 +214,30 @@ static bool register_espnow_peer(const uint8_t *mac) {
     };
     memcpy(peer.peer_addr, mac, 6);
     return esp_now_add_peer(&peer) == ESP_OK;
+}
+
+// dedup-check and store an antipacket. returns true if newly stored, false if duplicate or full.
+// caller hold data_mutex.
+static bool store_antipkt_locked(const antipkt_id_t *id, uint32_t ts) {
+    for (int i = 0; i < MAX_ANTIPKTS; i++) {
+        if (!antipkt_store[i].is_empty &&
+            antipkt_store[i].id.source_node     == id->source_node &&
+            antipkt_store[i].id.creation_time   == id->creation_time &&
+            antipkt_store[i].id.sequence_number == id->sequence_number) {
+            return false;
+        }
+    }
+    for (int i = 0; i < MAX_ANTIPKTS; i++) {
+        if (antipkt_store[i].is_empty) {
+            antipkt_store[i].id             = *id;
+            antipkt_store[i].is_empty       = false;
+            antipkt_store[i].forwarded      = false;
+            antipkt_store[i].received_at_ms = ts;
+            return true;
+        }
+    }
+    ESP_LOGW(TAG, "Antipkt store full");
+    return false;
 }
 
 // Add new peer or refresh last_seen on existing one.
@@ -189,15 +256,18 @@ static bool add_or_refresh_peer(const uint8_t *mac, uint16_t node_id, int8_t rss
             peer_list[i].rssi_last    = rssi;
             peer_list[i].active = true;
             if (was_inactive) {
-                // Peer returned after timeout — reset forwarded so it gets everything stored
+                // peer returned after timeout, reset forwarded so it gets everything stored
                 for (int j = 0; j < MAX_BUNDLES_IN_RAM; j++) {
                     if (!bundle_store[j].is_empty) bundle_store[j].forwarded = false;
+                }
+                for (int j = 0; j < MAX_ANTIPKTS; j++) {
+                    if (!antipkt_store[j].is_empty) antipkt_store[j].forwarded = false;
                 }
                 is_new = true;
             }
             xSemaphoreGive(data_mutex);
             if (is_new) {
-                register_espnow_peer(mac);  // re-add: was deleted on timeout
+                register_espnow_peer(mac);  // re add - was deleted on timeout
                 ESP_LOGI(TAG, "Peer returned: node=%u mac=%02x:%02x:%02x:%02x:%02x:%02x rssi=%d",
                          node_id, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi);
             }
@@ -213,9 +283,12 @@ static bool add_or_refresh_peer(const uint8_t *mac, uint16_t node_id, int8_t rss
         peer_list[peer_count].rssi_last    = rssi;
         peer_count++;
         is_new = true;
-        // New peer: reset forwarded so they receive all stored bundles
+        // new peer, so reset forwarded so they receive all stored bundles and antipackets
         for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
             if (!bundle_store[i].is_empty) bundle_store[i].forwarded = false;
+        }
+        for (int i = 0; i < MAX_ANTIPKTS; i++) {
+            if (!antipkt_store[i].is_empty) antipkt_store[i].forwarded = false;
         }
     } else {
         ESP_LOGW(TAG, "Peer list full, ignoring node %u", node_id);
@@ -235,15 +308,20 @@ static bool add_or_refresh_peer(const uint8_t *mac, uint16_t node_id, int8_t rss
  *                ESP-NOW Callbacks
  *******************************************************/
 
-// Recv callback: runs in WiFi task context. Copy to queue and return fast.
+// recv callback, runs in WiFi task context — alloc exact-size item and enqueue pointer
 static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int data_len) {
     if (data_len <= 0 || data_len > RX_BUF_MAX) return;
-    rx_item_t item;
-    memcpy(item.src_mac, info->src_addr, 6);
-    item.rssi = (int8_t)info->rx_ctrl->rssi;
-    item.len  = (uint16_t)data_len;
-    memcpy(item.data, data, data_len);
+    rx_item_t *item = malloc(sizeof(rx_item_t) + data_len);
+    if (!item) {
+        ESP_LOGW(TAG, "RX alloc failed, packet dropped");
+        return;
+    }
+    memcpy(item->src_mac, info->src_addr, 6);
+    item->rssi = (int8_t)info->rx_ctrl->rssi;
+    item->len  = (uint16_t)data_len;
+    memcpy(item->data, data, data_len);
     if (xQueueSend(rx_queue, &item, 0) != pdTRUE) {
+        free(item);
         ESP_LOGW(TAG, "RX queue full, packet dropped");
     }
 }
@@ -253,20 +331,23 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data,
  *******************************************************/
 static void rx_process_task(void *arg) {
     uint16_t my_id = get_my_node_id();
-    rx_item_t item;
+    rx_item_t *item = NULL;
 
     while (1) {
+        // free previous item (free(NULL) is a no-op, so all continue paths are safe)
+        free(item);
+        item = NULL;
         if (xQueueReceive(rx_queue, &item, portMAX_DELAY) != pdTRUE) continue;
-        if (item.len < 1) continue;
+        if (item->len < 1) continue;
 
-        uint8_t pkt_type = item.data[0];
+        uint8_t pkt_type = item->data[0];
 
-        // --- Beacon ---
-        if (pkt_type == PKT_TYPE_BEACON && item.len >= (uint16_t)sizeof(beacon_pkt_t)) {
-            beacon_pkt_t *beacon = (beacon_pkt_t *)item.data;
-            add_or_refresh_peer(item.src_mac, beacon->node_id, item.rssi);
+        // beacon packet
+        if (pkt_type == PKT_TYPE_BEACON && item->len >= (uint16_t)sizeof(beacon_pkt_t)) {
+            beacon_pkt_t *beacon = (beacon_pkt_t *)item->data;
+            add_or_refresh_peer(item->src_mac, beacon->node_id, item->rssi);
 
-            // BS: update per-peer clock offset and emit @NET:
+            // update peer to peer clock and
             if (my_id == BASE_STATION_NODE_ID) {
                 int32_t offset = (int32_t)beacon->timestamp_ms - (int32_t)now_ms();
                 xSemaphoreTake(data_mutex, portMAX_DELAY);
@@ -277,19 +358,19 @@ static void rx_process_task(void *arg) {
                     }
                 }
                 xSemaphoreGive(data_mutex);
-                printf("@NET:%u:%u:%d\n", beacon->node_id, my_id, (int)item.rssi);
+                printf("@NET:%u:%u:%d\n", beacon->node_id, my_id, (int)item->rssi);
             }
 
-        // --- Bundle ---
+        // data bundle
         } else if (pkt_type == PKT_TYPE_BUNDLE) {
             size_t hdr_size = sizeof(dtn_bundle_t) - BUNDLE_PAYLOAD_SIZE;
-            if ((size_t)item.len < 1 + hdr_size) continue;
+            if ((size_t)item->len < 1 + hdr_size) continue;
 
-            dtn_bundle_t *incoming = (dtn_bundle_t *)(item.data + 1);
+            dtn_bundle_t *incoming = (dtn_bundle_t *)(item->data + 1);
 
             xSemaphoreTake(data_mutex, portMAX_DELAY);
 
-            // Dedup by (source_node, creation_time, sequence_number)
+            // dedup by (source_node, creation_time, sequence_number)
             bool already_have = false;
             for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
                 if (!bundle_store[i].is_empty) {
@@ -302,15 +383,39 @@ static void rx_process_task(void *arg) {
                     }
                 }
             }
+            // BS: also check bs_delivered ring buffer — catches duplicates that arrive
+            // after the bundle slot was freed (common when antipackets haven't propagated yet).
+            if (!already_have && my_id == BASE_STATION_NODE_ID) {
+                int n = bs_delivered_count;
+                for (int i = 0; i < n; i++) {
+                    int idx = (bs_delivered_head - 1 - i + MAX_BS_DELIVERED) % MAX_BS_DELIVERED;
+                    if (bs_delivered[idx].source_node     == incoming->source_node &&
+                        bs_delivered[idx].creation_time   == incoming->creation_time &&
+                        bs_delivered[idx].sequence_number == incoming->sequence_number) {
+                        already_have = true;
+                        break;
+                    }
+                }
+            }
 
             if (already_have) {
                 xSemaphoreGive(data_mutex);
-                ESP_LOGI(TAG, "@DEDUP src:%u seq:%" PRIu32,
-                         incoming->source_node, incoming->sequence_number);
+                printf("@DEDUP:%u:%" PRIu32 ":%u\n",
+                       incoming->source_node, incoming->sequence_number, my_id);
                 continue;
             }
 
-            // Find empty slot
+            // Record this delivery in the BS ring buffer so future duplicates (same source+seq)
+            // are caught even after the bundle slot is freed.
+            if (my_id == BASE_STATION_NODE_ID) {
+                bs_delivered[bs_delivered_head].source_node     = incoming->source_node;
+                bs_delivered[bs_delivered_head].creation_time   = incoming->creation_time;
+                bs_delivered[bs_delivered_head].sequence_number = incoming->sequence_number;
+                bs_delivered_head = (bs_delivered_head + 1) % MAX_BS_DELIVERED;
+                if (bs_delivered_count < MAX_BS_DELIVERED) bs_delivered_count++;
+            }
+
+            // find empty slot
             int slot = -1;
             for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
                 if (bundle_store[i].is_empty) { slot = i; break; }
@@ -323,14 +428,14 @@ static void rx_process_task(void *arg) {
                 continue;
             }
 
-            // Store bundle
-            size_t copy_size = (size_t)item.len - 1;
+            // store bundle
+            size_t copy_size = (size_t)item->len - 1;
             memcpy(&bundle_store[slot].bundle, incoming, copy_size);
             bundle_store[slot].is_empty  = false;
-            // BS marks forwarded=true immediately so the TX task won't re-broadcast
+            // BS marks forwarded=true immediately so the TX task won't rebroadcast
             bundle_store[slot].forwarded = (my_id == BASE_STATION_NODE_ID);
 
-            // Snapshot fields needed outside mutex
+            // snapshot fields needed outside mutex
             uint32_t btime      = incoming->creation_time;
             bool     btelemetry = incoming->is_telemetry;
             uint16_t bsrc       = incoming->source_node;
@@ -352,7 +457,7 @@ static void rx_process_task(void *arg) {
                 if (!bundle_store[k].is_empty) stored_count++;
             }
 
-            // Rover: generate DTN_RX ack telemetry bundle (inside mutex while we have space)
+            // rover generates DTN_RX ack telemetry bundle (inside mutex while we have space)
             if (my_id != BASE_STATION_NODE_ID && !btelemetry) {
                 for (int j = 0; j < MAX_BUNDLES_IN_RAM; j++) {
                     if (bundle_store[j].is_empty) {
@@ -377,7 +482,7 @@ static void rx_process_task(void *arg) {
                 }
             }
 
-            // Save payload text for BS printing (short copy, avoids using bundle_store after release)
+            // save payload text for BS printing (short copy, avoids using bundle_store after release)
             char payload_text[BUNDLE_PAYLOAD_SIZE];
             size_t plen = 0;
             if (my_id == BASE_STATION_NODE_ID && btelemetry) {
@@ -389,10 +494,10 @@ static void rx_process_task(void *arg) {
 
             xSemaphoreGive(data_mutex);
 
-            // Logging / serial output (no mutex needed)
+            // logging / serial output (no mutex needed)
             if (my_id == BASE_STATION_NODE_ID) {
-                // Adjust for clock skew: rover clocks start independently at boot.
-                // src_clock_offset = rover_ms - bs_ms at last beacon; corrects creation_time.
+                // adjust for clock skew: rover clocks start independently at boot.
+                // src_clock_offset = rover_ms - bs_ms at last beacon, corrects creation_time
                 int32_t latency = (int32_t)(now_ms() - btime) + src_clock_offset;
                 if (latency < 0) latency = 0;
                 printf("@METRIC:%u:%" PRIu32 ":%d:%d\n",
@@ -403,13 +508,60 @@ static void rx_process_task(void *arg) {
                     printf("@DTN_RX:%u:%u:%" PRIu32 ":%u:%u\n",
                            bsrc, bprev, bseq, my_id, bhops);
                 }
-                // Free the slot (BS doesn't store bundles)
+                //free the slot (BS doesnt store bundles)
                 xSemaphoreTake(data_mutex, portMAX_DELAY);
                 bundle_store[slot].is_empty = true;
                 xSemaphoreGive(data_mutex);
+
+                // broadcast antipacket so rovers clear their stores
+                antipkt_pkt_t ap = {
+                    .pkt_type = PKT_TYPE_ANTIPKT,
+                    .id = { .source_node = bsrc, .creation_time = btime, .sequence_number = bseq },
+                };
+                xSemaphoreTake(data_mutex, portMAX_DELAY);
+                store_antipkt_locked(&ap.id, now_ms());
+                xSemaphoreGive(data_mutex);
+                esp_now_send(BROADCAST_MAC, (uint8_t *)&ap, sizeof(ap));
+                ESP_LOGI(TAG, "ANTIPKT sent for src:%u seq:%" PRIu32, bsrc, bseq);
             } else {
                 ESP_LOGI(TAG, "STORED src:%u seq:%" PRIu32 " hops:%u | store:%d/%d",
                          bsrc, bseq, bhops, stored_count, MAX_BUNDLES_IN_RAM);
+            }
+
+        // handle antipacket
+        } else if (pkt_type == PKT_TYPE_ANTIPKT) {
+            if (item->len < (uint16_t)sizeof(antipkt_pkt_t)) continue;
+            antipkt_pkt_t *ap = (antipkt_pkt_t *)item->data;
+
+            bool is_new = false;
+            xSemaphoreTake(data_mutex, portMAX_DELAY);
+            is_new = store_antipkt_locked(&ap->id, now_ms());
+            if (is_new) {
+                // free any matching bundle from local store
+                for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
+                    if (!bundle_store[i].is_empty) {
+                        dtn_bundle_t *b = &bundle_store[i].bundle;
+                        if (b->source_node     == ap->id.source_node &&
+                            b->creation_time   == ap->id.creation_time &&
+                            b->sequence_number == ap->id.sequence_number) {
+                            bundle_store[i].is_empty = true;
+                            ESP_LOGI(TAG, "ANTIPKT applied: freed src:%u seq:%" PRIu32,
+                                     ap->id.source_node, ap->id.sequence_number);
+                            break;
+                        }
+                    }
+                }
+            }
+            xSemaphoreGive(data_mutex);
+
+            if (is_new) {
+                ESP_LOGI(TAG, "ANTIPKT received: src:%u seq:%" PRIu32,
+                         ap->id.source_node, ap->id.sequence_number);
+                // notify Jetson to drop this bundle from its store (rovers only)
+                if (my_id != BASE_STATION_NODE_ID) {
+                    antipkt_id_t notif = ap->id;
+                    xQueueSend(antipkt_notify_q, &notif, 0);
+                }
             }
         }
     }
@@ -445,7 +597,7 @@ static void bundle_tx_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(TX_INTERVAL_MS));
         uint32_t ts = now_ms();
 
-        // --- Expire timed-out peers ---
+        // handle timed out peers
         xSemaphoreTake(data_mutex, portMAX_DELAY);
         for (int i = 0; i < peer_count; i++) {
             if (peer_list[i].active && (ts - peer_list[i].last_seen_ms) > PEER_TIMEOUT_MS) {
@@ -456,7 +608,7 @@ static void bundle_tx_task(void *arg) {
         }
         xSemaphoreGive(data_mutex);
 
-        // --- BS self-heartbeat for visualizer (every 5s) ---
+        // BS heartbeat for visualizer
         if (my_id == BASE_STATION_NODE_ID) {
             bs_heartbeat_timer++;
             if (bs_heartbeat_timer >= 5) {
@@ -465,36 +617,38 @@ static void bundle_tx_task(void *arg) {
             }
         }
 
-        // --- Generate data bundle every 10s ---
+        //generate a data bundle every 10s
         bundle_gen_timer++;
         if (bundle_gen_timer >= 10) {
             bundle_gen_timer = 0;
-            xSemaphoreTake(data_mutex, portMAX_DELAY);
-            for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
-                if (bundle_store[i].is_empty) {
-                    dtn_bundle_t *b = &bundle_store[i].bundle;
-                    b->creation_time         = ts;
-                    b->sequence_number       = local_sequence_counter++;
-                    b->lifetime              = 300000;
-                    b->source_node           = my_id;
-                    b->dest_node             = 0;
-                    b->prev_node             = my_id;
-                    b->hop_limit             = 5;
-                    b->hop_count             = 0;
-                    b->is_telemetry          = false;
-                    b->request_delivery_report = false;
-                    b->payload_len           = snprintf((char *)b->payload, BUNDLE_PAYLOAD_SIZE,
-                                                        "Data from %u", my_id);
-                    bundle_store[i].is_empty  = false;
-                    bundle_store[i].forwarded = false;
-                    ESP_LOGW(TAG, "ORIGINATED Bundle seq:%" PRIu32, b->sequence_number);
-                    break;
+            if (my_id != BASE_STATION_NODE_ID) {
+                xSemaphoreTake(data_mutex, portMAX_DELAY);
+                for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
+                    if (bundle_store[i].is_empty) {
+                        dtn_bundle_t *b = &bundle_store[i].bundle;
+                        b->creation_time           = ts;
+                        b->sequence_number         = local_sequence_counter++;
+                        b->lifetime                = 300000;
+                        b->source_node             = my_id;
+                        b->dest_node               = BASE_STATION_NODE_ID;
+                        b->prev_node               = my_id;
+                        b->hop_limit               = 5;
+                        b->hop_count               = 0;
+                        b->is_telemetry            = false;
+                        b->request_delivery_report = false;
+                        b->payload_len             = snprintf((char *)b->payload, BUNDLE_PAYLOAD_SIZE,
+                                                              "Data from %u", my_id);
+                        bundle_store[i].is_empty  = false;
+                        bundle_store[i].forwarded = false;
+                        ESP_LOGW(TAG, "ORIGINATED Bundle seq:%" PRIu32, b->sequence_number);
+                        break;
+                    }
                 }
+                xSemaphoreGive(data_mutex);
             }
-            xSemaphoreGive(data_mutex);
         }
 
-        // --- Periodic store dump (every 10s) ---
+        // store dump for debugging ervy 10s
         store_dump_timer++;
         if (store_dump_timer >= 10) {
             store_dump_timer = 0;
@@ -527,8 +681,8 @@ static void bundle_tx_task(void *arg) {
             }
         }
 
-        // --- Epidemic forwarding ---
-        // Snapshot active peer MACs (brief mutex hold), then send without holding mutex.
+        // epidemic forwarding of bundles (and antipackets below) to active peers
+        // snapshot active peer MACs (brief mutex hold), then send without holding mutex
         uint8_t  peer_macs[MAX_PEERS][6];
         uint16_t peer_ids[MAX_PEERS];
         int n_active = 0;
@@ -559,7 +713,7 @@ static void bundle_tx_task(void *arg) {
             }
             b->lifetime -= TX_INTERVAL_MS;
 
-            // Hop limit
+            // hop limit
             if (b->hop_count >= b->hop_limit) {
                 ESP_LOGW(TAG, "Bundle hop limit exceeded src:%u seq:%" PRIu32,
                          b->source_node, b->sequence_number);
@@ -573,7 +727,7 @@ static void bundle_tx_task(void *arg) {
                 continue;
             }
 
-            // Build TX packet (mutated copy — stored bundle is never modified)
+            // build TX packet (mutated copy, stored bundle is never modified)
             uint16_t orig_prev = b->prev_node;
             size_t bundle_actual = sizeof(dtn_bundle_t) - BUNDLE_PAYLOAD_SIZE + b->payload_len;
             size_t pkt_size = 1 + bundle_actual;
@@ -588,7 +742,7 @@ static void bundle_tx_task(void *arg) {
             // Send to all active peers (no mutex held during send)
             bool sent_to_anyone = false;
             for (int j = 0; j < n_active; j++) {
-                if (peer_ids[j] == orig_prev) continue; // don't echo back to prev hop
+                if (peer_ids[j] == orig_prev) continue; // dont echo back to prev hop
 
                 esp_err_t err = esp_now_send(peer_macs[j], tx_pkt_buf, pkt_size);
                 ESP_LOGI(TAG, "TX src:%u seq:%" PRIu32 " -> node:%u %s",
@@ -603,6 +757,41 @@ static void bundle_tx_task(void *arg) {
                 xSemaphoreGive(data_mutex);
             }
         }
+
+        //epidemic antipacket forwading
+        // expire old antipackets first
+        xSemaphoreTake(data_mutex, portMAX_DELAY);
+        for (int i = 0; i < MAX_ANTIPKTS; i++) {
+            if (!antipkt_store[i].is_empty &&
+                (ts - antipkt_store[i].received_at_ms) > ANTIPKT_LIFETIME_MS) {
+                antipkt_store[i].is_empty = true;
+            }
+        }
+        xSemaphoreGive(data_mutex);
+
+        for (int i = 0; i < MAX_ANTIPKTS; i++) {
+            xSemaphoreTake(data_mutex, portMAX_DELAY);
+            if (antipkt_store[i].is_empty || antipkt_store[i].forwarded || n_active == 0) {
+                xSemaphoreGive(data_mutex);
+                continue;
+            }
+            antipkt_pkt_t ap = {
+                .pkt_type = PKT_TYPE_ANTIPKT,
+                .id = antipkt_store[i].id,
+            };
+            xSemaphoreGive(data_mutex);
+
+            bool sent_ap = false;
+            for (int j = 0; j < n_active; j++) {
+                esp_err_t err = esp_now_send(peer_macs[j], (uint8_t *)&ap, sizeof(ap));
+                if (err == ESP_OK) sent_ap = true;
+            }
+            if (sent_ap) {
+                xSemaphoreTake(data_mutex, portMAX_DELAY);
+                if (!antipkt_store[i].is_empty) antipkt_store[i].forwarded = true;
+                xSemaphoreGive(data_mutex);
+            }
+        }
     }
 }
 
@@ -610,7 +799,7 @@ static void bundle_tx_task(void *arg) {
  *                Host UART Interface
  *******************************************************/
 
-// Static buffers — only accessed from host_uart_task (single writer, no race)
+// static buffers, only accessed from host_uart_task , single writer, no race
 static uint8_t host_tx_buf[6 + HOST_MAX_PAYLOAD];
 static uint8_t host_rx_payload[HOST_MAX_PAYLOAD];
 
@@ -635,13 +824,13 @@ static void host_send_frame(uint8_t cmd, const uint8_t *payload, uint16_t plen) 
     uart_write_bytes(HOST_UART_PORT, host_tx_buf, 6 + plen);
 }
 
-// Returns true if a valid frame was received within timeout_ms.
-// Payload is in host_rx_payload; cmd and plen are output params.
+// returns true if a valid frame was received within timeout_ms
+// payload is in host_rx_payload; cmd and plen are output params.
 static bool host_recv_frame(uint8_t *cmd_out, uint16_t *plen_out, uint32_t timeout_ms) {
     int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000LL;
     uint8_t b;
 
-    // Scan for SOF
+    // scan for SOF
     do {
         if (esp_timer_get_time() > deadline) return false;
         if (uart_read_bytes(HOST_UART_PORT, &b, 1, pdMS_TO_TICKS(10)) != 1) continue;
@@ -670,8 +859,8 @@ static bool host_recv_frame(uint8_t *cmd_out, uint16_t *plen_out, uint32_t timeo
     return recv_crc == calc_crc;
 }
 
-// Inject a raw dtn_bundle_t (plen bytes) from host into the bundle store.
-// Returns true on success, false if store is full or duplicate.
+// inject a raw dtn_bundle_t (plen bytes) from host into the bundle store.
+// returns true on success, false if store is full or duplicate.
 static bool host_inject_bundle(const uint8_t *data, uint16_t plen) {
     size_t min_hdr = sizeof(dtn_bundle_t) - BUNDLE_PAYLOAD_SIZE;
     if (plen < (uint16_t)min_hdr) return false;
@@ -679,7 +868,7 @@ static bool host_inject_bundle(const uint8_t *data, uint16_t plen) {
 
     xSemaphoreTake(data_mutex, portMAX_DELAY);
 
-    // Dedup
+    // dedup
     for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
         if (!bundle_store[i].is_empty) {
             dtn_bundle_t *s = &bundle_store[i].bundle;
@@ -716,6 +905,14 @@ static void host_uart_task(void *arg) {
         uint8_t  cmd;
         uint16_t plen;
         bool got = host_recv_frame(&cmd, &plen, 100);
+
+        // drain antipacket notifications queued by rx_process_task
+        {
+            antipkt_id_t notif;
+            while (xQueueReceive(antipkt_notify_q, &notif, 0) == pdTRUE) {
+                host_send_frame(HOST_CMD_ANTIPKT_NOTIFY, (uint8_t *)&notif, sizeof(notif));
+            }
+        }
 
         if (got) {
             switch (cmd) {
@@ -762,7 +959,7 @@ static void host_uart_task(void *arg) {
             }
         }
 
-        // Periodic bundle pull from Jetson when we have peers to forward to
+        // periodic bundle pull from Jetson when we have peers to forward to
         uint32_t ts = now_ms();
         if (ts - last_pull_ms >= HOST_PULL_INTERVAL_MS) {
             last_pull_ms = ts;
@@ -772,7 +969,7 @@ static void host_uart_task(void *arg) {
             xSemaphoreGive(data_mutex);
 
             if (has_peers) {
-                // Drain Jetson store: pull until NO_BUNDLES or store-full/timeout
+                // drain Jetson store: pull until NO_BUNDLES or store-full/timeout
                 for (int attempt = 0; attempt < MAX_BUNDLES_IN_RAM; attempt++) {
                     host_send_frame(HOST_CMD_PULL_REQ, NULL, 0);
                     uint8_t r_cmd;
@@ -847,8 +1044,9 @@ void app_main(void) {
 
     init_host_uart();
     init_bundle_store();
-    data_mutex = xSemaphoreCreateMutex();
-    rx_queue   = xQueueCreate(4, sizeof(rx_item_t));
+    data_mutex       = xSemaphoreCreateMutex();
+    rx_queue         = xQueueCreate(64, sizeof(rx_item_t *));
+    antipkt_notify_q = xQueueCreate(30, sizeof(antipkt_id_t));
 
     xTaskCreate(rx_process_task, "rx_proc",    4096, NULL, 6, NULL);
     xTaskCreate(beacon_task,     "beacon",     2048, NULL, 5, NULL);
