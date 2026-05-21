@@ -18,8 +18,9 @@ import struct
 import threading
 import time
 import serial
+from typing import Optional, Tuple
 
-# ── Protocol constants (must match mesh_main.c) ──────────────────────────────
+# protocol constants (must match mesh_main.c)
 HOST_SOF              = 0xAA
 HOST_MAX_PAYLOAD      = 1060
 BASE_STATION_NODE_ID  = 23768
@@ -51,7 +52,7 @@ STATUS_SIZE = struct.calcsize(STATUS_FMT)  # 6 bytes
 BUNDLE_DEFAULT_LIFETIME  = 300_000  # ms (5 minutes)
 BUNDLE_DEFAULT_HOP_LIMIT = 5
 
-# ── CRC-16/CCITT (poly 0x1021, init 0xFFFF) ──────────────────────────────────
+# CRC-16/CCITT (poly 0x1021, init 0xFFFF)
 def _crc16(data: bytes) -> int:
     crc = 0xFFFF
     for byte in data:
@@ -61,7 +62,7 @@ def _crc16(data: bytes) -> int:
             crc &= 0xFFFF
     return crc
 
-# ── Frame encode / decode ─────────────────────────────────────────────────────
+# frame encode / decode
 def encode_frame(cmd: int, payload: bytes = b'') -> bytes:
     plen = len(payload)
     header = bytes([HOST_SOF, cmd, plen & 0xFF, (plen >> 8) & 0xFF])
@@ -82,7 +83,7 @@ def _read_exact(ser: serial.Serial, n: int, timeout_s: float = 1.0) -> bytes:
     return buf
 
 
-def recv_frame(ser: serial.Serial, timeout_s: float = 1.0) -> tuple[int, bytes] | None:
+def recv_frame(ser: serial.Serial, timeout_s: float = 1.0) -> Optional[Tuple[int, bytes]]:
     """Block until a valid frame arrives or timeout. Returns (cmd, payload) or None."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -110,7 +111,7 @@ def recv_frame(ser: serial.Serial, timeout_s: float = 1.0) -> tuple[int, bytes] 
         return cmd, payload
     return None
 
-# ── Bundle serialization ──────────────────────────────────────────────────────
+# Bundle serialization 
 def pack_bundle(b: dict) -> bytes:
     payload_bytes = b['payload']
     if isinstance(payload_bytes, str):
@@ -134,7 +135,7 @@ def pack_bundle(b: dict) -> bytes:
     )
 
 
-def unpack_bundle(data: bytes) -> dict | None:
+def unpack_bundle(data: bytes) -> Optional[dict]:
     if len(data) < BUNDLE_SIZE:
         return None
     fields = struct.unpack_from(BUNDLE_FMT, data)
@@ -155,9 +156,9 @@ def unpack_bundle(data: bytes) -> dict | None:
         'payload':                 payload_raw[:payload_len],
     }
 
-# ── Daemon ────────────────────────────────────────────────────────────────────
+# daemon 
 class JetsonDaemon:
-    def __init__(self, serial_port: str, baud: int, gen_interval: float, node_id_override: int | None):
+    def __init__(self, serial_port: str, baud: int, gen_interval: float, node_id_override: Optional[int]):
         assert BUNDLE_SIZE == 1052, f"Bundle struct size mismatch: got {BUNDLE_SIZE}, expected 1052"
 
         self._port      = serial_port
@@ -174,7 +175,7 @@ class JetsonDaemon:
         self._ser: serial.Serial | None = None
         self._uart_lock = threading.Lock()  # serialises UART writes
 
-    # ── Serial helpers ──────────────────────────────────────────────────────
+    # serial helpers
     def _send(self, cmd: int, payload: bytes = b'') -> None:
         frame = encode_frame(cmd, payload)
         with self._uart_lock:
@@ -184,7 +185,7 @@ class JetsonDaemon:
         with self._uart_lock:
             return recv_frame(self._ser, timeout_s)
 
-    # ── Bundle store ────────────────────────────────────────────────────────
+    #  bundle store
     def _add_bundle(self, b: dict) -> bool:
         key = (b['source_node'], b['creation_time'], b['sequence_number'])
         with self._lock:
@@ -229,7 +230,7 @@ class JetsonDaemon:
         else:
             print(f"[ANTIPKT] src:{source_node} seq:{seq} (not in store, already clear)")
 
-    # ── Startup: detect node ID from ESP32 STATUS_RESP ─────────────────────
+    # startup: detect node ID from ESP32 STATUS_RESP
     def _detect_node_id(self) -> int:
         for attempt in range(5):
             self._send(HOST_CMD_QUERY_STATUS)
@@ -242,7 +243,7 @@ class JetsonDaemon:
             time.sleep(1)
         raise RuntimeError("Could not auto-detect node_id from ESP32. Use --node-id to override.")
 
-    # ── PULL_REQ handler: drain local store to ESP32 ─────────────────────
+    #  PULL_REQ handler: drain local store to ESP32
     def _handle_pull_req(self) -> None:
         self._expire_bundles()
         with self._lock:
@@ -254,20 +255,18 @@ class JetsonDaemon:
         for b in pending:
             data = pack_bundle(b)
             self._send(HOST_CMD_BUNDLE_DATA, data)
-            # Wait for ACK
-            result = recv_frame(self._ser, timeout_s=0.5)
-            if result and result[0] == HOST_CMD_ACK:
-                status = result[1][0] if result[1] else 1
-                if status != 0:
-                    print(f"[PULL] ESP32 store full, stopping drain")
-                    break
-                sent += 1
-            else:
+            sent += 1
+            # ESP32 sends another PULL_REQ as implicit ACK; wait for it
+            nxt = recv_frame(self._ser, timeout_s=1.0)
+            if nxt is None or nxt[0] != HOST_CMD_PULL_REQ:
+                # timeout (ESP32 store full) or unexpected frame
+                if nxt is not None:
+                    self._dispatch(nxt[0], nxt[1])
                 break
         self._send(HOST_CMD_NO_BUNDLES)
         print(f"[PULL] Sent {sent}/{len(pending)} bundles to ESP32")
 
-    # ── Frame dispatcher ────────────────────────────────────────────────────
+    # frame dispatcher 
     def _dispatch(self, cmd: int, payload: bytes) -> None:
         if cmd == HOST_CMD_PULL_REQ:
             self._handle_pull_req()
@@ -281,10 +280,13 @@ class JetsonDaemon:
             status = payload[0] if payload else 1
             print(f"[ACK] status={'ok' if status == 0 else 'error/full'}")
 
+        elif cmd == HOST_CMD_STATUS_RESP:
+            pass  # stale response from init retries, ignore
+
         else:
             print(f"[WARN] Unknown cmd 0x{cmd:02x} len={len(payload)}")
 
-    # ── Bundle generator ────────────────────────────────────────────────────
+    # bundle generator 
     def _generate_bundle(self) -> None:
         now_ms = int(time.monotonic() * 1000)
         payload = json.dumps({
@@ -308,11 +310,13 @@ class JetsonDaemon:
         if self._add_bundle(b):
             print(f"[GEN] Generated bundle seq:{b['sequence_number']}")
 
-    # ── Main loop ───────────────────────────────────────────────────────────
+    # main loop
     def run(self) -> None:
         print(f"[INIT] Opening {self._port} at {self._baud} baud")
-        self._ser = serial.Serial(self._port, self._baud, timeout=0.1)
-        time.sleep(0.5)  # let ESP32 boot log settle
+        self._ser = serial.Serial(self._port, self._baud, timeout=0.1,
+                                  dsrdtr=False, rtscts=False)
+        self._ser.dtr = False  # prevent DTR from resetting the ESP32 on connect
+        time.sleep(3.0)  # let any ongoing boot log drain before querying status
 
         if self._node_id is None:
             self._node_id = self._detect_node_id()
