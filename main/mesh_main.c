@@ -63,6 +63,7 @@
 #define HOST_CMD_BUNDLE_DATA  0x11      // payload: raw dtn_bundle_t bytes
 #define HOST_CMD_NO_BUNDLES   0x12      // payload: none
 #define HOST_CMD_ANTIPKT_NOTIFY 0x13   // ESP32 -> Jetson: drop bundle; payload: antipkt_id_t (10 bytes)
+#define HOST_CMD_BUNDLE_PUSH    0x14   // ESP32 -> Jetson: store received bundle; payload: raw dtn_bundle_t bytes
 
 /*******************************************************
  *                Structs
@@ -326,6 +327,9 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data,
     }
 }
 
+// forward declaration — defined in host_uart_task section below
+static void host_send_frame(uint8_t cmd, const uint8_t *payload, uint16_t plen);
+
 /*******************************************************
  *                RX Processing Task
  *******************************************************/
@@ -434,6 +438,8 @@ static void rx_process_task(void *arg) {
             bundle_store[slot].is_empty  = false;
             // BS marks forwarded=true immediately so the TX task won't rebroadcast
             bundle_store[slot].forwarded = (my_id == BASE_STATION_NODE_ID);
+            // take a local copy for BUNDLE_PUSH to Jetson (used after mutex release)
+            dtn_bundle_t push_copy = bundle_store[slot].bundle;
 
             // snapshot fields needed outside mutex
             uint32_t btime      = incoming->creation_time;
@@ -526,6 +532,8 @@ static void rx_process_task(void *arg) {
             } else {
                 ESP_LOGI(TAG, "STORED src:%u seq:%" PRIu32 " hops:%u | store:%d/%d",
                          bsrc, bseq, bhops, stored_count, MAX_BUNDLES_IN_RAM);
+                // push to Jetson so its large store can buffer this bundle across disconnections
+                host_send_frame(HOST_CMD_BUNDLE_PUSH, (const uint8_t *)&push_copy, sizeof(dtn_bundle_t));
             }
 
         // handle antipacket
@@ -617,9 +625,9 @@ static void bundle_tx_task(void *arg) {
             }
         }
 
-        //generate a data bundle every 10s
+        //generate a data bundle every 1s
         bundle_gen_timer++;
-        if (bundle_gen_timer >= 10) {
+        if (bundle_gen_timer >= 1) {
             bundle_gen_timer = 0;
             if (my_id != BASE_STATION_NODE_ID) {
                 xSemaphoreTake(data_mutex, portMAX_DELAY);
@@ -628,7 +636,7 @@ static void bundle_tx_task(void *arg) {
                         dtn_bundle_t *b = &bundle_store[i].bundle;
                         b->creation_time           = ts;
                         b->sequence_number         = local_sequence_counter++;
-                        b->lifetime                = 300000;
+                        b->lifetime                = 3000000;
                         b->source_node             = my_id;
                         b->dest_node               = BASE_STATION_NODE_ID;
                         b->prev_node               = my_id;

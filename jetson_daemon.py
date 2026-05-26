@@ -34,6 +34,7 @@ HOST_CMD_STATUS_RESP    = 0x21
 HOST_CMD_BUNDLE_DATA    = 0x11
 HOST_CMD_NO_BUNDLES     = 0x12
 HOST_CMD_ANTIPKT_NOTIFY = 0x13
+HOST_CMD_BUNDLE_PUSH    = 0x14  # ESP32 -> Jetson: store received neighbor bundle
 
 # dtn_bundle_t layout (packed, little-endian, matches ESP32 C struct)
 # Fields: creation_time, sequence_number, lifetime, source_node, dest_node,
@@ -50,7 +51,7 @@ ANTIPKT_ID_SIZE = struct.calcsize(ANTIPKT_ID_FMT)  # 10 bytes
 STATUS_FMT  = '<HBBBB'
 STATUS_SIZE = struct.calcsize(STATUS_FMT)  # 6 bytes
 
-BUNDLE_DEFAULT_LIFETIME  = 300_000  # ms (5 minutes)
+BUNDLE_DEFAULT_LIFETIME  = 3_000_000  # ms (50 minutes)
 BUNDLE_DEFAULT_HOP_LIMIT = 5
 
 # CRC-16/CCITT (poly 0x1021, init 0xFFFF)
@@ -96,7 +97,8 @@ def recv_frame(ser: serial.Serial, timeout_s: float = 1.0, verbose: bool = False
             skipped.append(b[0])
             continue
         if skipped:
-            print(f"[RECV] Skipped {len(skipped)} non-SOF bytes: {skipped.hex()}")
+            # print(f"[RECV] Skipped {len(skipped)} non-SOF bytes: {skipped.hex()}")
+            print(f"[RECV] Skipped {len(skipped)} non-SOF bytes")
             skipped = bytearray()
         header = _read_exact(ser, 3, timeout_s=0.2)
         if len(header) < 3:
@@ -121,7 +123,8 @@ def recv_frame(ser: serial.Serial, timeout_s: float = 1.0, verbose: bool = False
             print(f"[RECV] Frame cmd=0x{cmd:02x} len={plen}")
         return cmd, payload
     if skipped:
-        print(f"[RECV] Timeout with {len(skipped)} trailing non-SOF bytes: {skipped.hex()}")
+        # print(f"[RECV] Timeout with {len(skipped)} trailing non-SOF bytes: {skipped.hex()}")
+        print(f"[RECV] Timeout with {len(skipped)} trailing non-SOF bytes")
     return None
 
 # Bundle serialization 
@@ -251,15 +254,24 @@ class JetsonDaemon:
             print(f"[INIT] Attempt {attempt+1}/5: sending QUERY_STATUS {frame.hex()}")
             with self._uart_lock:
                 self._ser.write(frame)
-            result = recv_frame(self._ser, timeout_s=2.0, verbose=True)
-            if result is None:
-                print(f"[INIT] No response within 2s")
-            elif result[0] == HOST_CMD_STATUS_RESP and len(result[1]) >= STATUS_SIZE:
-                node_id = struct.unpack_from('<H', result[1])[0]
-                print(f"[INIT] Auto-detected node_id={node_id}")
-                return node_id
-            else:
-                print(f"[INIT] Unexpected response: cmd=0x{result[0]:02x} payload={result[1].hex()}")
+            # Loop within the 2s window: dispatch BUNDLE_PUSH/ANTIPKT/etc. that
+            # arrive before STATUS_RESP (common now that the ESP32 pushes bundles).
+            deadline = time.monotonic() + 2.0
+            found = False
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                result = recv_frame(self._ser, timeout_s=max(0.05, remaining), verbose=True)
+                if result is None:
+                    break
+                cmd, payload = result
+                if cmd == HOST_CMD_STATUS_RESP and len(payload) >= STATUS_SIZE:
+                    node_id = struct.unpack_from('<H', payload)[0]
+                    print(f"[INIT] Auto-detected node_id={node_id}")
+                    return node_id
+                # dispatch other frames (bundle pushes, antipackets) so they aren't lost
+                print(f"[INIT] Got cmd=0x{cmd:02x} while waiting for STATUS_RESP, dispatching")
+                self._dispatch(cmd, payload)
+            print(f"[INIT] No STATUS_RESP in 2s window, retrying...")
             time.sleep(1)
         raise RuntimeError("Could not auto-detect node_id from ESP32. Use --node-id to override.")
 
@@ -276,15 +288,28 @@ class JetsonDaemon:
             data = pack_bundle(b)
             self._send(HOST_CMD_BUNDLE_DATA, data)
             sent += 1
-            # ESP32 sends another PULL_REQ as implicit ACK; wait for it
-            nxt = recv_frame(self._ser, timeout_s=1.0)
-            if nxt is None or nxt[0] != HOST_CMD_PULL_REQ:
-                # timeout (ESP32 store full) or unexpected frame
-                if nxt is not None:
-                    self._dispatch(nxt[0], nxt[1])
+            # Wait for the ESP32's implicit ACK (another PULL_REQ).
+            # ANTIPKT_NOTIFY frames may arrive interleaved on the same UART;
+            # handle them and keep waiting rather than aborting the drain.
+            deadline = time.monotonic() + 1.0
+            got_pull = False
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                nxt = recv_frame(self._ser, timeout_s=max(0.05, remaining))
+                if nxt is None:
+                    break  # timeout — ESP32 store full, stop draining
+                if nxt[0] == HOST_CMD_PULL_REQ:
+                    got_pull = True
+                    break
+                self._dispatch(nxt[0], nxt[1])  # antipkt etc., keep waiting
+            if not got_pull:
                 break
         self._send(HOST_CMD_NO_BUNDLES)
-        print(f"[PULL] Sent {sent}/{len(pending)} bundles to ESP32")
+        by_src: dict[int, int] = {}
+        for b in pending[:sent]:
+            by_src[b['source_node']] = by_src.get(b['source_node'], 0) + 1
+        src_summary = ' '.join(f"src{n}×{c}" for n, c in sorted(by_src.items()))
+        print(f"[PULL] Sent {sent}/{len(pending)} bundles to ESP32  [{src_summary}]")
 
     # frame dispatcher 
     def _dispatch(self, cmd: int, payload: bytes) -> None:
@@ -296,17 +321,38 @@ class JetsonDaemon:
                 source_node, creation_time, seq = struct.unpack_from(ANTIPKT_ID_FMT, payload)
                 self._apply_antipkt(source_node, creation_time, seq)
 
+        elif cmd == HOST_CMD_BUNDLE_PUSH:
+            b = unpack_bundle(payload)
+            if b:
+                b['added_at_ms'] = int(time.monotonic() * 1000)
+                added = self._add_bundle(b)
+                if added:
+                    print(f"[PUSH] Neighbor bundle stored: src:{b['source_node']} seq:{b['sequence_number']}")
+
         elif cmd == HOST_CMD_ACK:
             status = payload[0] if payload else 1
             print(f"[ACK] status={'ok' if status == 0 else 'error/full'}")
 
         elif cmd == HOST_CMD_STATUS_RESP:
-            pass  # stale response from init retries, ignore
+            self._print_status(payload)
 
         else:
             print(f"[WARN] Unknown cmd 0x{cmd:02x} len={len(payload)}")
 
-    # bundle generator 
+    def _print_status(self, payload: bytes) -> None:
+        if len(payload) < STATUS_SIZE:
+            return
+        node_id, active_peers, store_used, store_max, channel = struct.unpack_from(STATUS_FMT, payload)
+        jetson_store = len(self._store)
+        print(f"[STATUS] ESP32 store={store_used}/{store_max}  "
+              f"peers={active_peers}  ch={channel}  "
+              f"jetson_store={jetson_store}")
+
+    def _poll_status(self) -> None:
+        self._send(HOST_CMD_QUERY_STATUS)
+        # response arrives asynchronously via _dispatch → _print_status
+
+    # bundle generator
     def _generate_bundle(self) -> None:
         now_ms = int(time.monotonic() * 1000)
         payload = json.dumps({
@@ -360,7 +406,9 @@ class JetsonDaemon:
             self._node_id = self._detect_node_id()
         print(f"[INIT] Running as node {self._node_id}")
 
-        last_gen = time.monotonic()
+        last_gen    = time.monotonic()
+        last_status = time.monotonic()
+        STATUS_INTERVAL_S = 30.0
 
         while True:
             # Receive one frame (non-blocking style via short timeout)
@@ -375,12 +423,17 @@ class JetsonDaemon:
                 last_gen = time.monotonic()
                 self._generate_bundle()
 
+            # Periodic ESP32 store status poll
+            if (time.monotonic() - last_status) >= STATUS_INTERVAL_S:
+                last_status = time.monotonic()
+                self._poll_status()
+
 
 def main():
     parser = argparse.ArgumentParser(description='Jetson rover node daemon')
     parser.add_argument('--serial',   default='/dev/ttyTHS1', help='Serial port to ESP32')
     parser.add_argument('--baud',     type=int, default=115200, help='Baud rate')
-    parser.add_argument('--interval', type=float, default=10.0,
+    parser.add_argument('--interval', type=float, default=1.0,
                         help='Bundle generation interval in seconds (0 = disable)')
     parser.add_argument('--node-id',  type=int, default=None,
                         help='Override node ID (default: auto-detect from ESP32)')
