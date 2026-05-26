@@ -14,6 +14,7 @@ Usage:
 import argparse
 import itertools
 import json
+import platform
 import struct
 import threading
 import time
@@ -83,32 +84,44 @@ def _read_exact(ser: serial.Serial, n: int, timeout_s: float = 1.0) -> bytes:
     return buf
 
 
-def recv_frame(ser: serial.Serial, timeout_s: float = 1.0) -> Optional[Tuple[int, bytes]]:
+def recv_frame(ser: serial.Serial, timeout_s: float = 1.0, verbose: bool = False) -> Optional[Tuple[int, bytes]]:
     """Block until a valid frame arrives or timeout. Returns (cmd, payload) or None."""
     deadline = time.monotonic() + timeout_s
+    skipped = bytearray()
     while time.monotonic() < deadline:
         b = ser.read(1)
         if not b:
             continue
         if b[0] != HOST_SOF:
+            skipped.append(b[0])
             continue
+        if skipped:
+            print(f"[RECV] Skipped {len(skipped)} non-SOF bytes: {skipped.hex()}")
+            skipped = bytearray()
         header = _read_exact(ser, 3, timeout_s=0.2)
         if len(header) < 3:
+            print(f"[RECV] Incomplete header after SOF (got {len(header)}/3 bytes)")
             return None
         cmd = header[0]
         plen = header[1] | (header[2] << 8)
         if plen > HOST_MAX_PAYLOAD:
+            print(f"[RECV] Oversized payload claim {plen} > {HOST_MAX_PAYLOAD}, discarding")
             continue
         payload = _read_exact(ser, plen, timeout_s=1.0) if plen else b''
         crc_bytes = _read_exact(ser, 2, timeout_s=0.2)
         if len(crc_bytes) < 2:
+            print(f"[RECV] Truncated CRC (got {len(crc_bytes)}/2 bytes)")
             return None
         recv_crc = crc_bytes[0] | (crc_bytes[1] << 8)
         calc_crc = _crc16(bytes([cmd, header[1], header[2]]) + payload)
         if recv_crc != calc_crc:
             print(f"[WARN] CRC mismatch cmd=0x{cmd:02x} expected=0x{calc_crc:04x} got=0x{recv_crc:04x}")
             continue
+        if verbose:
+            print(f"[RECV] Frame cmd=0x{cmd:02x} len={plen}")
         return cmd, payload
+    if skipped:
+        print(f"[RECV] Timeout with {len(skipped)} trailing non-SOF bytes: {skipped.hex()}")
     return None
 
 # Bundle serialization 
@@ -178,12 +191,13 @@ class JetsonDaemon:
     # serial helpers
     def _send(self, cmd: int, payload: bytes = b'') -> None:
         frame = encode_frame(cmd, payload)
+        print(f"[TX] cmd=0x{cmd:02x} len={len(payload)}")
         with self._uart_lock:
             self._ser.write(frame)
 
     def _recv(self, timeout_s: float = 1.0):
         with self._uart_lock:
-            return recv_frame(self._ser, timeout_s)
+            return recv_frame(self._ser, timeout_s, verbose=True)
 
     #  bundle store
     def _add_bundle(self, b: dict) -> bool:
@@ -233,13 +247,19 @@ class JetsonDaemon:
     # startup: detect node ID from ESP32 STATUS_RESP
     def _detect_node_id(self) -> int:
         for attempt in range(5):
-            self._send(HOST_CMD_QUERY_STATUS)
-            result = recv_frame(self._ser, timeout_s=2.0)
-            if result and result[0] == HOST_CMD_STATUS_RESP and len(result[1]) >= STATUS_SIZE:
+            frame = encode_frame(HOST_CMD_QUERY_STATUS)
+            print(f"[INIT] Attempt {attempt+1}/5: sending QUERY_STATUS {frame.hex()}")
+            with self._uart_lock:
+                self._ser.write(frame)
+            result = recv_frame(self._ser, timeout_s=2.0, verbose=True)
+            if result is None:
+                print(f"[INIT] No response within 2s")
+            elif result[0] == HOST_CMD_STATUS_RESP and len(result[1]) >= STATUS_SIZE:
                 node_id = struct.unpack_from('<H', result[1])[0]
                 print(f"[INIT] Auto-detected node_id={node_id}")
                 return node_id
-            print(f"[INIT] STATUS_RESP attempt {attempt+1}/5 failed, retrying...")
+            else:
+                print(f"[INIT] Unexpected response: cmd=0x{result[0]:02x} payload={result[1].hex()}")
             time.sleep(1)
         raise RuntimeError("Could not auto-detect node_id from ESP32. Use --node-id to override.")
 
@@ -313,10 +333,28 @@ class JetsonDaemon:
     # main loop
     def run(self) -> None:
         print(f"[INIT] Opening {self._port} at {self._baud} baud")
-        self._ser = serial.Serial(self._port, self._baud, timeout=0.1,
-                                  dsrdtr=False, rtscts=False)
-        self._ser.dtr = False  # prevent DTR from resetting the ESP32 on connect
-        time.sleep(3.0)  # let any ongoing boot log drain before querying status
+        self._ser = serial.Serial()
+        self._ser.port     = self._port
+        self._ser.baudrate = self._baud
+        self._ser.timeout  = 0.1
+        self._ser.xonxoff  = False
+        self._ser.dsrdtr   = False
+        self._ser.rtscts   = False
+        self._ser.dtr      = False
+        self._ser.rts      = False
+        self._ser.open()
+
+        # On Linux, disable HUPCL so the kernel never toggles DTR on open/close,
+        # then force DTR low and flush any boot garbage. No-op on Windows.
+        if platform.system() != 'Windows':
+            import termios
+            attrs = termios.tcgetattr(self._ser.fd)
+            attrs[2] &= ~termios.HUPCL
+            termios.tcsetattr(self._ser.fd, termios.TCSANOW, attrs)
+        self._ser.dtr = False
+        self._ser.rts = False
+        self._ser.reset_input_buffer()
+        time.sleep(1.0)
 
         if self._node_id is None:
             self._node_id = self._detect_node_id()
@@ -326,9 +364,10 @@ class JetsonDaemon:
 
         while True:
             # Receive one frame (non-blocking style via short timeout)
-            result = recv_frame(self._ser, timeout_s=0.1)
+            result = recv_frame(self._ser, timeout_s=0.1, verbose=True)
             if result is not None:
                 cmd, payload = result
+                print(f"[RX] cmd=0x{cmd:02x} len={len(payload)}")
                 self._dispatch(cmd, payload)
 
             # Periodic bundle generation

@@ -42,8 +42,8 @@
 // Host interface (Jetson ↔ ESP32 UART1)
 // Frame: [SOF:0xAA][CMD:1][LEN_LO][LEN_HI][PAYLOAD:LEN][CRC16_LO][CRC16_HI]
 // CRC-16/CCITT over [CMD, LEN_LO, LEN_HI, PAYLOAD...]
-#define HOST_UART_PORT        UART_NUM_0  // bench: reuse flash/monitor USB; swap to UART_NUM_1 + GPIO6/7 for Jetson
-#define HOST_UART_TX_PIN      UART_PIN_NO_CHANGE  // UART0 pins fixed by bootloader
+#define HOST_UART_PORT        UART_NUM_0  // bench/USB; swap to UART_NUM_1 + GPIO6/7 for Jetson
+#define HOST_UART_TX_PIN      UART_PIN_NO_CHANGE
 #define HOST_UART_RX_PIN      UART_PIN_NO_CHANGE
 #define HOST_UART_BAUD        115200
 #define HOST_UART_RX_BUF      2048
