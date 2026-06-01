@@ -1152,8 +1152,34 @@ static void lcd_write_line(uint8_t row, const char *s)
     while (n < LCD_COLS)       { lcd_char(' ');            n++; }
 }
 
+// After an ESP32 reset, GPIO7 (SDA) can briefly go LOW while SCL is still HIGH,
+// generating a spurious START. The PCF8574 enters receive mode and latches garbage
+// onto EN, which clocks bad data into the HD44780. Sending 9 SCL pulses forces any
+// stuck peripheral to finish its byte and release SDA, then a STOP resets the
+// PCF8574's I2C state machine before we do the normal probe+init.
+static void i2c_bus_recover(void)
+{
+    gpio_set_level(LCD_SDA_PIN, 1);
+    for (int i = 0; i < 9; i++) {
+        if (gpio_get_level(LCD_SDA_PIN)) break;  // SDA released, done
+        gpio_set_level(LCD_SCL_PIN, 0);
+        esp_rom_delay_us(BB_HALF_US * 2);
+        gpio_set_level(LCD_SCL_PIN, 1);
+        esp_rom_delay_us(BB_HALF_US * 2);
+    }
+    // STOP condition: SDA rises while SCL is high
+    gpio_set_level(LCD_SDA_PIN, 0);
+    esp_rom_delay_us(BB_HALF_US);
+    gpio_set_level(LCD_SCL_PIN, 1);
+    esp_rom_delay_us(BB_HALF_US);
+    gpio_set_level(LCD_SDA_PIN, 1);
+    esp_rom_delay_us(BB_HALF_US);
+}
+
 static void lcd_init(void)
 {
+    i2c_bus_recover();
+
     // Probe: send address and check ACK before touching HD44780 init
     bb_start();
     bool acked = bb_write_byte((LCD_I2C_ADDR << 1) | 0x00);
@@ -1198,7 +1224,7 @@ static void lcd_init(void)
     lcd_i2c_write(&bl_on,  1);
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    lcd_write_line(0, "DTN Base Station");
+    lcd_write_line(0, "DTN Mesh Node   ");
     lcd_write_line(1, "Initializing... ");
 }
 
@@ -1262,9 +1288,7 @@ static void ui_update_task(void *arg)
         }
         gpio_set_level(UI_LED_PIN, led_state);
 
-        if (!is_bs) continue;   // rovers have no LCD or button
-
-        // button debounce
+        // button debounce (all nodes)
         // GPIO is active-low (pull-up, button connects to GND)
         if (gpio_get_level(UI_BTN_PIN) == 0) {
             if (++btn_count >= UI_BTN_DEBOUNCE && btn_armed) {
@@ -1277,7 +1301,7 @@ static void ui_update_task(void *arg)
             btn_armed = true;
         }
 
-        // LCD refresh 
+        // LCD refresh
         if (++lcd_cycle < UI_LCD_EVERY) continue;
         lcd_cycle = 0;
 
@@ -1288,11 +1312,11 @@ static void ui_update_task(void *arg)
 
         if (alt_countdown > 0) {
             alt_countdown--;
-            // Alt mode, node identity + bundle store fill
+            // Alt mode: node identity + bundle store fill (same on BS and rovers)
             snprintf(line1, sizeof(line1), "Node:%-5u Ch:%-2d", my_id, ESPNOW_CHANNEL);
             snprintf(line2, sizeof(line2), "Bndls:%-3d/%-3d", n_bundles, MAX_BUNDLES_IN_RAM);
-        } else {
-            // Normal mode, network health
+        } else if (is_bs) {
+            // BS normal mode: last received bundle latency + hops
             if (n_active > 0) {
                 snprintf(line1, sizeof(line1), "Pr:%-2d  RSSI:%-4d", n_active, (int)best_rssi);
             } else {
@@ -1304,6 +1328,14 @@ static void ui_update_task(void *arg)
                 snprintf(line2, sizeof(line2), "Lat:%5ums H:%u", (unsigned)(lat > 99999 ? 99999 : lat), hops);
             } else {
                 snprintf(line2, sizeof(line2), "Waiting for data");
+            }
+        } else {
+            // Rover normal mode: bundle store fill + peer connectivity
+            snprintf(line2, sizeof(line2), "Bndls:%-3d/%-3d", n_bundles, MAX_BUNDLES_IN_RAM);
+            if (n_active > 0) {
+                snprintf(line1, sizeof(line1), "Pr:%-2d  RSSI:%-4d", n_active, (int)best_rssi);
+            } else {
+                snprintf(line1, sizeof(line1), "Pr:0 -- ISOLATED");
             }
         }
 
@@ -1379,8 +1411,8 @@ void app_main(void) {
     };
     ESP_ERROR_CHECK(gpio_config(&btn_cfg));
 
-    // i2c and lcd setup 
-    if (my_id == BASE_STATION_NODE_ID) {
+    // i2c and lcd setup (all nodes)
+    {
         gpio_config_t i2c_cfg = {
             .pin_bit_mask = (1ULL << LCD_SDA_PIN) | (1ULL << LCD_SCL_PIN),
             .mode         = GPIO_MODE_INPUT_OUTPUT_OD,
