@@ -152,8 +152,13 @@ def pack_bundle(b: dict) -> bytes:
 
 
 def unpack_bundle(data: bytes) -> Optional[dict]:
-    if len(data) < BUNDLE_SIZE:
+    # BUNDLE_PUSH frames may be shorter than BUNDLE_SIZE (only header + actual payload).
+    # The minimum valid size is the header without any payload bytes.
+    BUNDLE_HEADER_SIZE = BUNDLE_SIZE - 1024
+    if len(data) < BUNDLE_HEADER_SIZE:
         return None
+    if len(data) < BUNDLE_SIZE:
+        data = data + b'\x00' * (BUNDLE_SIZE - len(data))
     fields = struct.unpack_from(BUNDLE_FMT, data)
     (creation_time, seq, lifetime, source_node, dest_node, report_to, prev_node,
      req_report, is_telem, hop_limit, hop_count, payload_len, payload_raw) = fields
@@ -180,7 +185,7 @@ class JetsonDaemon:
         self._port      = serial_port
         self._baud      = baud
         self._interval  = gen_interval
-        self._node_id   = node_id_override  # None = auto-detect on startup
+        self._node_id   = node_id_override  # None = auto detect on startup
 
         self._store: list[dict] = []
         self._lock = threading.Lock()
@@ -350,7 +355,7 @@ class JetsonDaemon:
 
     def _poll_status(self) -> None:
         self._send(HOST_CMD_QUERY_STATUS)
-        # response arrives asynchronously via _dispatch → _print_status
+        # response arrives asynchronously via _dispatch -> _print_status
 
     # bundle generator
     def _generate_bundle(self) -> None:

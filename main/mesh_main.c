@@ -14,6 +14,9 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
+// i2c_master.h removed , LCD uses bit-bang I2C via GPIO to bypass driver pin checks
+#include "esp_rom_sys.h"
 
 /*******************************************************
  *                Constants / Configuration
@@ -49,7 +52,7 @@
 #define HOST_UART_RX_BUF      2048
 #define HOST_SOF              0xAA
 #define HOST_MAX_PAYLOAD      1060      // headroom above sizeof(dtn_bundle_t)
-#define HOST_PULL_INTERVAL_MS 10000     // pull from Jetson store every 10s when peers active
+#define HOST_PULL_INTERVAL_MS 1000      // pull from Jetson store every 1s when peers active
 // Jetson -> ESP32
 #define HOST_CMD_TX_BUNDLE    0x01      // payload: raw dtn_bundle_t bytes
 #define HOST_CMD_QUERY_STATUS 0x02      // payload: none
@@ -64,6 +67,18 @@
 #define HOST_CMD_NO_BUNDLES   0x12      // payload: none
 #define HOST_CMD_ANTIPKT_NOTIFY 0x13   // ESP32 -> Jetson: drop bundle; payload: antipkt_id_t (10 bytes)
 #define HOST_CMD_BUNDLE_PUSH    0x14   // ESP32 -> Jetson: store received bundle; payload: raw dtn_bundle_t bytes
+
+// UI hardware , adjust GPIO numbers to match your board
+#define UI_LED_PIN          GPIO_NUM_10  // status LED, all nodes          (J1 pin 11)
+#define UI_BTN_PIN          GPIO_NUM_9   // pushbutton, BS only             (J1 pin 10) 
+#define LCD_SDA_PIN         GPIO_NUM_7    // I2C SDA, BS only               (J1 pin 8)
+#define LCD_SCL_PIN         GPIO_NUM_8    // I2C SCL, BS only               (J1 pin 9)
+
+#define LCD_I2C_ADDR        0x27         // PCF8574 backpack address
+#define LCD_COLS            16
+#define UI_TASK_HZ          50           // ui_update_task rate
+#define UI_LCD_EVERY        25           // refresh LCD every N task cycles (25 × 20ms = 500ms)
+#define UI_BTN_DEBOUNCE     3            // consistent reads required (3 × 20ms = 60ms)
 
 /*******************************************************
  *                Structs
@@ -128,7 +143,7 @@ typedef struct {
     uint32_t     received_at_ms;
 } stored_antipkt_t;
 
-// BS-side delivered-bundle ring buffer — NOT packed so comparisons are always correct
+// BS-side delivered-bundle ring buffer , NOT packed so comparisons are always correct
 typedef struct {
     uint16_t source_node;
     uint32_t creation_time;
@@ -155,7 +170,7 @@ typedef struct {
     uint8_t  src_mac[6];
     int8_t   rssi;
     uint16_t len;
-    uint8_t  data[];   // flexible array — only actual packet bytes allocated
+    uint8_t  data[];   // flexible array , only actual packet bytes allocated
 } rx_item_t;
 
 /*******************************************************
@@ -175,8 +190,15 @@ static SemaphoreHandle_t data_mutex;
 static QueueHandle_t     rx_queue;
 static QueueHandle_t     antipkt_notify_q;  // rx_process_task -> host_uart_task notifications
 
-// static TX buffer — written only from bundle_tx_task (single writer, no race)
+// static TX buffer , written only from bundle_tx_task (single writer, no race)
 static uint8_t tx_pkt_buf[1 + sizeof(dtn_bundle_t)];
+
+// UI state, written by rx_process_task, read by ui_update_task.
+static volatile uint32_t ui_last_latency_ms = 0;
+static volatile uint8_t  ui_last_hops       = 0;
+static volatile int8_t   ui_last_rssi       = 0;
+
+static bool lcd_initialized = false;   // set by lcd_init() after successful probe + init
 
 static const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -309,7 +331,7 @@ static bool add_or_refresh_peer(const uint8_t *mac, uint16_t node_id, int8_t rss
  *                ESP-NOW Callbacks
  *******************************************************/
 
-// recv callback, runs in WiFi task context — alloc exact-size item and enqueue pointer
+// recv callback, runs in WiFi task context , alloc exact-size item and enqueue pointer
 static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int data_len) {
     if (data_len <= 0 || data_len > RX_BUF_MAX) return;
     rx_item_t *item = malloc(sizeof(rx_item_t) + data_len);
@@ -327,7 +349,7 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data,
     }
 }
 
-// forward declaration — defined in host_uart_task section below
+// forward declaration , defined in host_uart_task section below
 static void host_send_frame(uint8_t cmd, const uint8_t *payload, uint16_t plen);
 
 /*******************************************************
@@ -387,7 +409,7 @@ static void rx_process_task(void *arg) {
                     }
                 }
             }
-            // BS: also check bs_delivered ring buffer — catches duplicates that arrive
+            // BS: also check bs_delivered ring buffer , catches duplicates that arrive
             // after the bundle slot was freed (common when antipackets haven't propagated yet).
             if (!already_have && my_id == BASE_STATION_NODE_ID) {
                 int n = bs_delivered_count;
@@ -508,6 +530,9 @@ static void rx_process_task(void *arg) {
                 if (latency < 0) latency = 0;
                 printf("@METRIC:%u:%" PRIu32 ":%d:%d\n",
                        bsrc, bseq, bhops, (int)latency);
+                ui_last_latency_ms = (uint32_t)latency;
+                ui_last_hops       = bhops;
+                ui_last_rssi       = item->rssi;
                 if (btelemetry) {
                     printf("%s\n", payload_text);
                 } else {
@@ -532,8 +557,10 @@ static void rx_process_task(void *arg) {
             } else {
                 ESP_LOGI(TAG, "STORED src:%u seq:%" PRIu32 " hops:%u | store:%d/%d",
                          bsrc, bseq, bhops, stored_count, MAX_BUNDLES_IN_RAM);
-                // push to Jetson so its large store can buffer this bundle across disconnections
-                host_send_frame(HOST_CMD_BUNDLE_PUSH, (const uint8_t *)&push_copy, sizeof(dtn_bundle_t));
+                // push to Jetson, send only header + actual payload (not full padded struct)
+                // to reduce frame size and minimise UART corruption from interleaved log output
+                size_t push_size = sizeof(dtn_bundle_t) - BUNDLE_PAYLOAD_SIZE + push_copy.payload_len;
+                host_send_frame(HOST_CMD_BUNDLE_PUSH, (const uint8_t *)&push_copy, (uint16_t)push_size);
             }
 
         // handle antipacket
@@ -1011,6 +1038,283 @@ static void init_host_uart(void) {
 }
 
 /*******************************************************
+ *                LCD driver, software I2C
+ *
+ * PCF8574 pin mapping: P0=RS P1=RW P2=EN P3=BL P4-P7=D4-D7
+ *
+ * The new ESP-IDF I2C master driver rejects all GPIOs on ESP32-C5
+ * with "not usable" warnings and then NACKs data bytes.  Bit-bang
+ * bypasses the driver entirely: gpio_set_level(pin,1) releases the
+ * open-drain line (pull-up takes it high); gpio_set_level(pin,0)
+ * drives it low.  Both SDA and SCL are configured INPUT_OUTPUT_OD.
+ *******************************************************/
+#define LCD_RS  0x01
+#define LCD_EN  0x04
+#define LCD_BL  0x08
+
+#define BB_HALF_US  25   // ~20 kHz, conservative margin for PCF8574T
+
+// All transitions obey I2C standard-mode timing minimums:
+//   tHD_STA (START hold) >= 4.0 micro s
+//   tSU_DAT (data setup before SCL high) ≥ 250 ns
+//   tLOW / tHIGH >= 4.7 / 4.0 micro s
+
+static void bb_start(void)
+{
+    // Ensure SDA and SCL are both high before issuing START
+    gpio_set_level(LCD_SDA_PIN, 1);
+    gpio_set_level(LCD_SCL_PIN, 1);
+    esp_rom_delay_us(BB_HALF_US);          // bus-free / setup time
+    gpio_set_level(LCD_SDA_PIN, 0);        // SDA falls while SCL high -> START
+    esp_rom_delay_us(BB_HALF_US);          // tHD_STA hold (4.0 micro s min)
+    gpio_set_level(LCD_SCL_PIN, 0);
+    esp_rom_delay_us(BB_HALF_US);
+}
+
+static void bb_stop(void)
+{
+    gpio_set_level(LCD_SDA_PIN, 0);
+    gpio_set_level(LCD_SCL_PIN, 1);
+    esp_rom_delay_us(BB_HALF_US);          // tSU_STO setup (4.0 micro s min)
+    gpio_set_level(LCD_SDA_PIN, 1);        // SDA rises while SCL high -> STOP
+    esp_rom_delay_us(BB_HALF_US);          // bus-free time
+}
+
+// Returns true if worker pulled SDA low (ACK) during 9th clock
+static bool bb_write_byte(uint8_t data)
+{
+    for (int i = 7; i >= 0; i--) {
+        gpio_set_level(LCD_SDA_PIN, (data >> i) & 1);
+        esp_rom_delay_us(BB_HALF_US);      // tSU_DAT data-setup before SCL↑ (250 ns min)
+        gpio_set_level(LCD_SCL_PIN, 1);
+        esp_rom_delay_us(BB_HALF_US);      // SCL high time (4.0 micro s min)
+        gpio_set_level(LCD_SCL_PIN, 0);
+        esp_rom_delay_us(BB_HALF_US);      // SCL low time (4.7 micro s min)
+    }
+    gpio_set_level(LCD_SDA_PIN, 1);        // release SDA for ACK bit
+    esp_rom_delay_us(BB_HALF_US);
+    gpio_set_level(LCD_SCL_PIN, 1);
+    esp_rom_delay_us(BB_HALF_US);
+    bool acked = (gpio_get_level(LCD_SDA_PIN) == 0);
+    gpio_set_level(LCD_SCL_PIN, 0);
+    esp_rom_delay_us(BB_HALF_US);
+    return acked;
+}
+
+static esp_err_t lcd_i2c_write(const uint8_t *data, size_t len)
+{
+    bb_start();
+    if (!bb_write_byte((LCD_I2C_ADDR << 1) | 0x00)) {
+        bb_stop(); return ESP_FAIL;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (!bb_write_byte(data[i])) { bb_stop(); return ESP_FAIL; }
+    }
+    bb_stop();
+    return ESP_OK;
+}
+
+static void lcd_pulse_nibble(uint8_t nibble, uint8_t flags)
+{
+    uint8_t base = (nibble << 4) | LCD_BL | flags;
+    uint8_t buf[2] = { base | LCD_EN, base };
+    esp_err_t err = lcd_i2c_write(buf, 2);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "LCD NACK nibble=0x%X flags=0x%X", nibble, flags);
+    }
+    esp_rom_delay_us(50);
+}
+
+static void lcd_cmd(uint8_t cmd)
+{
+    lcd_pulse_nibble(cmd >> 4, 0);
+    lcd_pulse_nibble(cmd & 0x0F, 0);
+    if (cmd < 0x04) vTaskDelay(pdMS_TO_TICKS(5));
+}
+
+static void lcd_char(uint8_t c)
+{
+    lcd_pulse_nibble(c >> 4, LCD_RS);
+    lcd_pulse_nibble(c & 0x0F, LCD_RS);
+}
+
+static void lcd_set_cursor(uint8_t col, uint8_t row)
+{
+    static const uint8_t row_offset[] = { 0x00, 0x40 };
+    lcd_cmd(0x80 | (row_offset[row & 1] + col));
+}
+
+static void lcd_write_line(uint8_t row, const char *s)
+{
+    lcd_set_cursor(0, row);
+    int n = 0;
+    while (*s && n < LCD_COLS) { lcd_char((uint8_t)*s++); n++; }
+    while (n < LCD_COLS)       { lcd_char(' ');            n++; }
+}
+
+static void lcd_init(void)
+{
+    // Probe: send address and check ACK before touching HD44780 init
+    bb_start();
+    bool acked = bb_write_byte((LCD_I2C_ADDR << 1) | 0x00);
+    bb_stop();
+    if (!acked) {
+        ESP_LOGE(TAG, "LCD not found at 0x%02x (SDA=GPIO%d SCL=GPIO%d) , check wiring",
+                 LCD_I2C_ADDR, (int)LCD_SDA_PIN, (int)LCD_SCL_PIN);
+        return;
+    }
+    ESP_LOGI(TAG, "LCD found at 0x%02x , initializing", LCD_I2C_ADDR);
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // HD44780 4-bit init sequence
+    uint8_t buf[2];
+    for (int i = 0; i < 3; i++) {
+        buf[0] = 0x30 | LCD_BL | LCD_EN;
+        buf[1] = 0x30 | LCD_BL;
+        lcd_i2c_write(buf, 2);
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    buf[0] = 0x20 | LCD_BL | LCD_EN;
+    buf[1] = 0x20 | LCD_BL;
+    lcd_i2c_write(buf, 2);
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    lcd_cmd(0x28);
+    lcd_cmd(0x0C);
+    lcd_cmd(0x01);
+    vTaskDelay(pdMS_TO_TICKS(2));
+    lcd_cmd(0x06);
+    lcd_initialized = true;
+    ESP_LOGI(TAG, "LCD init complete");
+
+    // Flash backlight once , confirms I2C is reaching PCF8574.
+    // If you see the backlight (blue glow) briefly go off, I2C works,
+    // adjust the contrast trim-pot until characters appear.
+    uint8_t bl_off = 0x00;
+    uint8_t bl_on  = LCD_BL;
+    lcd_i2c_write(&bl_off, 1);
+    vTaskDelay(pdMS_TO_TICKS(400));
+    lcd_i2c_write(&bl_on,  1);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    lcd_write_line(0, "DTN Base Station");
+    lcd_write_line(1, "Initializing... ");
+}
+
+/*******************************************************
+ *                ui_update_task  (50 Hz)
+ *
+ * Runs on all nodes:
+ *   - LED: reflects peer connectivity + forwarding state
+ * Runs on BS only (lcd_dev != NULL):
+ *   - 1602 LCD: network stats, refreshed every 500 ms
+ *   - Button: debounced; press switches to node-info mode for 5 s
+ *******************************************************/
+static void ui_update_task(void *arg)
+{
+    uint16_t my_id = get_my_node_id();
+    bool is_bs     = (my_id == BASE_STATION_NODE_ID);
+
+    uint32_t led_tick      = 0;
+    int      btn_count     = 0;
+    bool     btn_armed     = true;   // true = waiting for press, false = waiting for release
+    int      lcd_cycle     = 0;
+    int      alt_countdown = 0;      // LCD refresh cycles remaining in alt mode
+
+    TickType_t wake = xTaskGetTickCount();
+
+    while (1) {
+        vTaskDelayUntil(&wake, pdMS_TO_TICKS(1000 / UI_TASK_HZ));
+        led_tick++;
+
+        int   n_active  = 0;
+        int   n_bundles = 0;
+        int8_t best_rssi = -127;
+        xSemaphoreTake(data_mutex, portMAX_DELAY);
+        for (int i = 0; i < peer_count; i++) {
+            if (peer_list[i].active) {
+                n_active++;
+                if (peer_list[i].rssi_last > best_rssi)
+                    best_rssi = peer_list[i].rssi_last;
+            }
+        }
+        for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++)
+            if (!bundle_store[i].is_empty) n_bundles++;
+        xSemaphoreGive(data_mutex);
+
+        // LED
+        int led_state;
+        if (is_bs) {
+            led_state = (n_active > 0) ? 1 : 0;
+        } else {
+            if (n_active > 0 && n_bundles > 0) {
+                // fast blink, 4 Hz: toggle every 6 cycles at 50 Hz
+                led_state = (led_tick % 12) < 6 ? 1 : 0;
+            } else if (n_active > 0) {
+                led_state = 1;  // solid: connected, nothing pending
+            } else if (n_bundles > 0) {
+                // slow blink, 1 Hz: toggle every 25 cycles at 50 Hz
+                led_state = (led_tick % 50) < 25 ? 1 : 0;
+            } else {
+                led_state = 0;  // isolated and empty
+            }
+        }
+        gpio_set_level(UI_LED_PIN, led_state);
+
+        if (!is_bs) continue;   // rovers have no LCD or button
+
+        // button debounce
+        // GPIO is active-low (pull-up, button connects to GND)
+        if (gpio_get_level(UI_BTN_PIN) == 0) {
+            if (++btn_count >= UI_BTN_DEBOUNCE && btn_armed) {
+                btn_armed     = false;
+                alt_countdown = 10;
+                ESP_LOGI(TAG, "Button pressed , alt mode for 5s");
+            }
+        } else {
+            btn_count = 0;
+            btn_armed = true;
+        }
+
+        // LCD refresh 
+        if (++lcd_cycle < UI_LCD_EVERY) continue;
+        lcd_cycle = 0;
+
+        // 32-byte scratch buffers: snprintf writes full formatted string here
+        // lcd_write_line truncates to LCD_COLS chars on output.
+        char line1[32];
+        char line2[32];
+
+        if (alt_countdown > 0) {
+            alt_countdown--;
+            // Alt mode, node identity + bundle store fill
+            snprintf(line1, sizeof(line1), "Node:%-5u Ch:%-2d", my_id, ESPNOW_CHANNEL);
+            snprintf(line2, sizeof(line2), "Bndls:%-3d/%-3d", n_bundles, MAX_BUNDLES_IN_RAM);
+        } else {
+            // Normal mode, network health
+            if (n_active > 0) {
+                snprintf(line1, sizeof(line1), "Pr:%-2d  RSSI:%-4d", n_active, (int)best_rssi);
+            } else {
+                snprintf(line1, sizeof(line1), "Pr:0 -- ISOLATED");
+            }
+            uint32_t lat  = ui_last_latency_ms;
+            uint8_t  hops = ui_last_hops;
+            if (lat > 0) {
+                snprintf(line2, sizeof(line2), "Lat:%5ums H:%u", (unsigned)(lat > 99999 ? 99999 : lat), hops);
+            } else {
+                snprintf(line2, sizeof(line2), "Waiting for data");
+            }
+        }
+
+        if (lcd_initialized) {
+            lcd_write_line(0, line1);
+            lcd_write_line(1, line2);
+        }
+    }
+}
+
+/*******************************************************
  *                app_main
  *******************************************************/
 void app_main(void) {
@@ -1028,8 +1332,13 @@ void app_main(void) {
     // ESP32-C5 is dual-band; lock to 5GHz after start, then set channel
     ESP_ERROR_CHECK(esp_wifi_set_band_mode(WIFI_BAND_MODE_5G_ONLY));
 
-    // Fixed channel — all nodes must match
+    // Fixed channel , all nodes must match
     ESP_ERROR_CHECK(esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
+
+    // Create queues before registering recv_cb so the callback never sees NULL handles.
+    data_mutex       = xSemaphoreCreateMutex();
+    rx_queue         = xQueueCreate(64, sizeof(rx_item_t *));
+    antipkt_notify_q = xQueueCreate(30, sizeof(antipkt_id_t));
 
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
@@ -1050,14 +1359,47 @@ void app_main(void) {
         ESP_LOGI(TAG, "I am a Rover (ID=%u) on channel %d (5GHz)", my_id, ESPNOW_CHANNEL);
     }
 
+    // gpios for UI (LED + button on all nodes, LCD I2C lines on BS only)
+    gpio_config_t led_cfg = {
+        .pin_bit_mask = 1ULL << UI_LED_PIN,
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&led_cfg));
+    gpio_set_level(UI_LED_PIN, 0);
+
+    gpio_config_t btn_cfg = {
+        .pin_bit_mask = 1ULL << UI_BTN_PIN,
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&btn_cfg));
+
+    // i2c and lcd setup 
+    if (my_id == BASE_STATION_NODE_ID) {
+        gpio_config_t i2c_cfg = {
+            .pin_bit_mask = (1ULL << LCD_SDA_PIN) | (1ULL << LCD_SCL_PIN),
+            .mode         = GPIO_MODE_INPUT_OUTPUT_OD,
+            .pull_up_en   = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&i2c_cfg));
+        gpio_set_level(LCD_SDA_PIN, 1);
+        gpio_set_level(LCD_SCL_PIN, 1);
+        lcd_init();
+    }
+
     init_host_uart();
     init_bundle_store();
-    data_mutex       = xSemaphoreCreateMutex();
-    rx_queue         = xQueueCreate(64, sizeof(rx_item_t *));
-    antipkt_notify_q = xQueueCreate(30, sizeof(antipkt_id_t));
 
     xTaskCreate(rx_process_task, "rx_proc",    4096, NULL, 6, NULL);
     xTaskCreate(beacon_task,     "beacon",     2048, NULL, 5, NULL);
     xTaskCreate(bundle_tx_task,  "tx_loop",    4096, NULL, 4, NULL);
     xTaskCreate(host_uart_task,  "host_uart",  4096, NULL, 3, NULL);
+    xTaskCreate(ui_update_task,  "ui",         2048, NULL, 2, NULL);
 }
