@@ -1,5 +1,5 @@
 """
-Jetson node daemon — runs on a rover Jetson Orin Nano.
+Jetson node daemon, runs on a rover Jetson Orin Nano.
 Manages the local bundle store and bridges it to the attached ESP32 modem via UART.
 
 Usage:
@@ -51,7 +51,7 @@ ANTIPKT_ID_SIZE = struct.calcsize(ANTIPKT_ID_FMT)  # 10 bytes
 STATUS_FMT  = '<HBBBB'
 STATUS_SIZE = struct.calcsize(STATUS_FMT)  # 6 bytes
 
-BUNDLE_DEFAULT_LIFETIME  = 3_000_000  # ms (50 minutes)
+BUNDLE_DEFAULT_LIFETIME  = 3000000  # ms (50 minutes)
 BUNDLE_DEFAULT_HOP_LIMIT = 5
 
 # CRC-16/CCITT (poly 0x1021, init 0xFFFF)
@@ -257,8 +257,14 @@ class JetsonDaemon:
         for attempt in range(5):
             frame = encode_frame(HOST_CMD_QUERY_STATUS)
             print(f"[INIT] Attempt {attempt+1}/5: sending QUERY_STATUS {frame.hex()}")
-            with self._uart_lock:
-                self._ser.write(frame)
+            try:
+                with self._uart_lock:
+                    self._ser.write(frame)
+            except serial.SerialException as e:
+                print(f"[INIT] Write failed ({e}), waiting for device to settle...")
+                time.sleep(2.0)
+                self._ser.reset_input_buffer()
+                continue
             # Loop within the 2s window: dispatch BUNDLE_PUSH/ANTIPKT/etc. that
             # arrive before STATUS_RESP (common now that the ESP32 pushes bundles).
             deadline = time.monotonic() + 2.0
@@ -288,11 +294,16 @@ class JetsonDaemon:
         if not pending:
             self._send(HOST_CMD_NO_BUNDLES)
             return
-        sent = 0
+        sent_bundles: list[dict] = []
+        skipped = 0
         for b in pending:
+            key = (b['source_node'], b['creation_time'], b['sequence_number'])
+            if key in self._delivered:
+                skipped += 1
+                continue  # antipacket arrived for this during drain, don't re-push
             data = pack_bundle(b)
             self._send(HOST_CMD_BUNDLE_DATA, data)
-            sent += 1
+            sent_bundles.append(b)
             # Wait for the ESP32's implicit ACK (another PULL_REQ).
             # ANTIPKT_NOTIFY frames may arrive interleaved on the same UART;
             # handle them and keep waiting rather than aborting the drain.
@@ -302,7 +313,7 @@ class JetsonDaemon:
                 remaining = deadline - time.monotonic()
                 nxt = recv_frame(self._ser, timeout_s=max(0.05, remaining))
                 if nxt is None:
-                    break  # timeout — ESP32 store full, stop draining
+                    break  # timeout , ESP32 store full, stop draining
                 if nxt[0] == HOST_CMD_PULL_REQ:
                     got_pull = True
                     break
@@ -311,10 +322,11 @@ class JetsonDaemon:
                 break
         self._send(HOST_CMD_NO_BUNDLES)
         by_src: dict[int, int] = {}
-        for b in pending[:sent]:
+        for b in sent_bundles:
             by_src[b['source_node']] = by_src.get(b['source_node'], 0) + 1
         src_summary = ' '.join(f"src{n}×{c}" for n, c in sorted(by_src.items()))
-        print(f"[PULL] Sent {sent}/{len(pending)} bundles to ESP32  [{src_summary}]")
+        skip_str = f" skip:{skipped}" if skipped else ""
+        print(f"[PULL] Sent {len(sent_bundles)}/{len(pending)} bundles to ESP32{skip_str}  [{src_summary}]")
 
     # frame dispatcher 
     def _dispatch(self, cmd: int, payload: bytes) -> None:
@@ -405,7 +417,7 @@ class JetsonDaemon:
         self._ser.dtr = False
         self._ser.rts = False
         self._ser.reset_input_buffer()
-        time.sleep(1.0)
+        time.sleep(3.0)  # ESP32-C5 native USB JTAG re-enumerates ~1.5-2s after reset
 
         if self._node_id is None:
             self._node_id = self._detect_node_id()
@@ -436,7 +448,7 @@ class JetsonDaemon:
 
 def main():
     parser = argparse.ArgumentParser(description='Jetson rover node daemon')
-    parser.add_argument('--serial',   default='/dev/ttyTHS1', help='Serial port to ESP32')
+    parser.add_argument('--serial',   default='/dev/ttyUSB0', help='Serial port to ESP32')
     parser.add_argument('--baud',     type=int, default=115200, help='Baud rate')
     parser.add_argument('--interval', type=float, default=1.0,
                         help='Bundle generation interval in seconds (0 = disable)')

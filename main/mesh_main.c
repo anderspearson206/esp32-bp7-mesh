@@ -34,7 +34,7 @@
 #define PKT_TYPE_BUNDLE  0x02
 #define PKT_TYPE_ANTIPKT 0x03
 
-#define MAX_ANTIPKTS          50
+#define MAX_ANTIPKTS          200
 #define ANTIPKT_LIFETIME_MS   (120 * 1000)
 #define MAX_BS_DELIVERED      200
 
@@ -129,15 +129,20 @@ typedef struct __attribute__((packed)) {
     uint32_t sequence_number;
 } antipkt_id_t;
 
-// ESP-NOW antipacket wire format (11 bytes)
+// ESP-NOW antipacket wire format (13 bytes)
+// origin_node_id identifies the node that GENERATED this antipacket (always the BS).
+// Rovers only apply antipackets (free bundle slots) when origin_node_id == BASE_STATION_NODE_ID,
+// preventing spurious deletion if a non-BS node ever emits antipackets.
 typedef struct __attribute__((packed)) {
-    uint8_t      pkt_type;   // PKT_TYPE_ANTIPKT
+    uint8_t      pkt_type;        // PKT_TYPE_ANTIPKT
     antipkt_id_t id;
+    uint16_t     origin_node_id;  // generator node (BS node ID)
 } antipkt_pkt_t;
 
 // Antipacket store entry
 typedef struct {
     antipkt_id_t id;
+    uint16_t     origin_node_id;
     bool         is_empty;
     bool         forwarded;
     uint32_t     received_at_ms;
@@ -193,6 +198,10 @@ static QueueHandle_t     antipkt_notify_q;  // rx_process_task -> host_uart_task
 // static TX buffer , written only from bundle_tx_task (single writer, no race)
 static uint8_t tx_pkt_buf[1 + sizeof(dtn_bundle_t)];
 
+// Set by host_uart_task when Jetson responds, read by bundle_tx_task to suppress self-generation.
+static volatile uint32_t last_host_active_ms = 0;
+#define HOST_ACTIVE_TIMEOUT_MS 30000   // suppress ESP32 self-gen for 30s after last Jetson response
+
 // UI state, written by rx_process_task, read by ui_update_task.
 static volatile uint32_t ui_last_latency_ms = 0;
 static volatile uint8_t  ui_last_hops       = 0;
@@ -240,8 +249,8 @@ static bool register_espnow_peer(const uint8_t *mac) {
 }
 
 // dedup-check and store an antipacket. returns true if newly stored, false if duplicate or full.
-// caller hold data_mutex.
-static bool store_antipkt_locked(const antipkt_id_t *id, uint32_t ts) {
+// caller holds data_mutex.
+static bool store_antipkt_locked(const antipkt_id_t *id, uint16_t origin, uint32_t ts) {
     for (int i = 0; i < MAX_ANTIPKTS; i++) {
         if (!antipkt_store[i].is_empty &&
             antipkt_store[i].id.source_node     == id->source_node &&
@@ -253,6 +262,7 @@ static bool store_antipkt_locked(const antipkt_id_t *id, uint32_t ts) {
     for (int i = 0; i < MAX_ANTIPKTS; i++) {
         if (antipkt_store[i].is_empty) {
             antipkt_store[i].id             = *id;
+            antipkt_store[i].origin_node_id = origin;
             antipkt_store[i].is_empty       = false;
             antipkt_store[i].forwarded      = false;
             antipkt_store[i].received_at_ms = ts;
@@ -424,10 +434,35 @@ static void rx_process_task(void *arg) {
                 }
             }
 
+            // Rovers: also reject bundles for which we already have an antipacket.
+            // The bundle was already delivered, the peer just hasn't learned yet.
+            if (!already_have && my_id != BASE_STATION_NODE_ID) {
+                for (int i = 0; i < MAX_ANTIPKTS; i++) {
+                    if (!antipkt_store[i].is_empty &&
+                        antipkt_store[i].id.source_node     == incoming->source_node &&
+                        antipkt_store[i].id.creation_time   == incoming->creation_time &&
+                        antipkt_store[i].id.sequence_number == incoming->sequence_number) {
+                        already_have = true;
+                        break;
+                    }
+                }
+            }
+
             if (already_have) {
                 xSemaphoreGive(data_mutex);
                 printf("@DEDUP:%u:%" PRIu32 ":%u\n",
                        incoming->source_node, incoming->sequence_number, my_id);
+                // BS re-broadcasts antipacket so lagging rovers still holding this bundle clear it
+                if (my_id == BASE_STATION_NODE_ID) {
+                    antipkt_pkt_t dedup_ap = {
+                        .pkt_type       = PKT_TYPE_ANTIPKT,
+                        .id             = { .source_node     = incoming->source_node,
+                                            .creation_time   = incoming->creation_time,
+                                            .sequence_number = incoming->sequence_number },
+                        .origin_node_id = my_id,
+                    };
+                    esp_now_send(BROADCAST_MAC, (uint8_t *)&dedup_ap, sizeof(dedup_ap));
+                }
                 continue;
             }
 
@@ -546,11 +581,12 @@ static void rx_process_task(void *arg) {
 
                 // broadcast antipacket so rovers clear their stores
                 antipkt_pkt_t ap = {
-                    .pkt_type = PKT_TYPE_ANTIPKT,
-                    .id = { .source_node = bsrc, .creation_time = btime, .sequence_number = bseq },
+                    .pkt_type       = PKT_TYPE_ANTIPKT,
+                    .id             = { .source_node = bsrc, .creation_time = btime, .sequence_number = bseq },
+                    .origin_node_id = my_id,
                 };
                 xSemaphoreTake(data_mutex, portMAX_DELAY);
-                store_antipkt_locked(&ap.id, now_ms());
+                store_antipkt_locked(&ap.id, my_id, now_ms());
                 xSemaphoreGive(data_mutex);
                 esp_now_send(BROADCAST_MAC, (uint8_t *)&ap, sizeof(ap));
                 ESP_LOGI(TAG, "ANTIPKT sent for src:%u seq:%" PRIu32, bsrc, bseq);
@@ -569,10 +605,11 @@ static void rx_process_task(void *arg) {
             antipkt_pkt_t *ap = (antipkt_pkt_t *)item->data;
 
             bool is_new = false;
+            bool from_bs = (ap->origin_node_id == BASE_STATION_NODE_ID);
             xSemaphoreTake(data_mutex, portMAX_DELAY);
-            is_new = store_antipkt_locked(&ap->id, now_ms());
-            if (is_new) {
-                // free any matching bundle from local store
+            is_new = store_antipkt_locked(&ap->id, ap->origin_node_id, now_ms());
+            if (is_new && from_bs) {
+                // free any matching bundle from local store (only BS-originated antipackets)
                 for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
                     if (!bundle_store[i].is_empty) {
                         dtn_bundle_t *b = &bundle_store[i].bundle;
@@ -590,10 +627,10 @@ static void rx_process_task(void *arg) {
             xSemaphoreGive(data_mutex);
 
             if (is_new) {
-                ESP_LOGI(TAG, "ANTIPKT received: src:%u seq:%" PRIu32,
-                         ap->id.source_node, ap->id.sequence_number);
-                // notify Jetson to drop this bundle from its store (rovers only)
-                if (my_id != BASE_STATION_NODE_ID) {
+                ESP_LOGI(TAG, "ANTIPKT received: src:%u seq:%" PRIu32 " origin:%u",
+                         ap->id.source_node, ap->id.sequence_number, ap->origin_node_id);
+                // notify Jetson to drop this bundle (rovers only, and only for BS-originated antipackets)
+                if (my_id != BASE_STATION_NODE_ID && from_bs) {
                     antipkt_id_t notif = ap->id;
                     xQueueSend(antipkt_notify_q, &notif, 0);
                 }
@@ -652,11 +689,12 @@ static void bundle_tx_task(void *arg) {
             }
         }
 
-        //generate a data bundle every 1s
+        //generate a data bundle every 1s, but not when Jetson is attached (it is the data source)
         bundle_gen_timer++;
         if (bundle_gen_timer >= 1) {
             bundle_gen_timer = 0;
-            if (my_id != BASE_STATION_NODE_ID) {
+            bool jetson_active = (ts - last_host_active_ms) < HOST_ACTIVE_TIMEOUT_MS;
+            if (my_id != BASE_STATION_NODE_ID && !jetson_active) {
                 xSemaphoreTake(data_mutex, portMAX_DELAY);
                 for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
                     if (bundle_store[i].is_empty) {
@@ -811,8 +849,9 @@ static void bundle_tx_task(void *arg) {
                 continue;
             }
             antipkt_pkt_t ap = {
-                .pkt_type = PKT_TYPE_ANTIPKT,
-                .id = antipkt_store[i].id,
+                .pkt_type       = PKT_TYPE_ANTIPKT,
+                .id             = antipkt_store[i].id,
+                .origin_node_id = antipkt_store[i].origin_node_id,
             };
             xSemaphoreGive(data_mutex);
 
@@ -903,7 +942,7 @@ static bool host_inject_bundle(const uint8_t *data, uint16_t plen) {
 
     xSemaphoreTake(data_mutex, portMAX_DELAY);
 
-    // dedup
+    // reject if already in bundle store (duplicate)
     for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
         if (!bundle_store[i].is_empty) {
             dtn_bundle_t *s = &bundle_store[i].bundle;
@@ -911,8 +950,23 @@ static bool host_inject_bundle(const uint8_t *data, uint16_t plen) {
                 s->creation_time  == b->creation_time &&
                 s->sequence_number == b->sequence_number) {
                 xSemaphoreGive(data_mutex);
-                return false; // already have it
+                return false;
             }
+        }
+    }
+
+    // reject if already delivered (antipacket exists) , prevents re-injection of
+    // delivered bundles when the Jetson hasn't received the ANTIPKT_NOTIFY yet.
+    for (int i = 0; i < MAX_ANTIPKTS; i++) {
+        if (!antipkt_store[i].is_empty &&
+            antipkt_store[i].id.source_node     == b->source_node &&
+            antipkt_store[i].id.creation_time   == b->creation_time &&
+            antipkt_store[i].id.sequence_number == b->sequence_number) {
+            antipkt_id_t notif = antipkt_store[i].id;
+            xSemaphoreGive(data_mutex);
+            // renotify Jetson so it eventually removes this bundle from its store
+            xQueueSend(antipkt_notify_q, &notif, 0);
+            return false;
         }
     }
 
@@ -950,6 +1004,7 @@ static void host_uart_task(void *arg) {
         }
 
         if (got) {
+            last_host_active_ms = now_ms();
             switch (cmd) {
             case HOST_CMD_TX_BUNDLE: {
                 bool ok = host_inject_bundle(host_rx_payload, plen);
@@ -1004,15 +1059,28 @@ static void host_uart_task(void *arg) {
             xSemaphoreGive(data_mutex);
 
             if (has_peers) {
-                // drain Jetson store: pull until NO_BUNDLES or store-full/timeout
-                for (int attempt = 0; attempt < MAX_BUNDLES_IN_RAM; attempt++) {
-                    host_send_frame(HOST_CMD_PULL_REQ, NULL, 0);
-                    uint8_t r_cmd;
-                    uint16_t r_plen;
-                    if (!host_recv_frame(&r_cmd, &r_plen, 500)) break;
-                    if (r_cmd == HOST_CMD_NO_BUNDLES) break;
-                    if (r_cmd == HOST_CMD_BUNDLE_DATA) {
-                        if (!host_inject_bundle(host_rx_payload, r_plen)) break; // store full
+                // skip pull if store is already full
+                int free_slots = 0;
+                xSemaphoreTake(data_mutex, portMAX_DELAY);
+                for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++)
+                    if (bundle_store[i].is_empty) free_slots++;
+                xSemaphoreGive(data_mutex);
+
+                if (free_slots > 0) {
+                    // drain Jetson store: pull until NO_BUNDLES or store-full/timeout
+                    for (int attempt = 0; attempt < free_slots; attempt++) {
+                        host_send_frame(HOST_CMD_PULL_REQ, NULL, 0);
+                        uint8_t r_cmd;
+                        uint16_t r_plen;
+                        if (!host_recv_frame(&r_cmd, &r_plen, 500)) break;
+                        if (r_cmd == HOST_CMD_NO_BUNDLES) {
+                            last_host_active_ms = now_ms();
+                            break;
+                        }
+                        if (r_cmd == HOST_CMD_BUNDLE_DATA) {
+                            last_host_active_ms = now_ms();
+                            if (!host_inject_bundle(host_rx_payload, r_plen)) break; // store full
+                        }
                     }
                 }
             }
@@ -1254,8 +1322,9 @@ static void ui_update_task(void *arg)
         vTaskDelayUntil(&wake, pdMS_TO_TICKS(1000 / UI_TASK_HZ));
         led_tick++;
 
-        int   n_active  = 0;
-        int   n_bundles = 0;
+        int   n_active    = 0;
+        int   n_bundles   = 0;
+        int   n_forwarded = 0;
         int8_t best_rssi = -127;
         xSemaphoreTake(data_mutex, portMAX_DELAY);
         for (int i = 0; i < peer_count; i++) {
@@ -1265,8 +1334,12 @@ static void ui_update_task(void *arg)
                     best_rssi = peer_list[i].rssi_last;
             }
         }
-        for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++)
-            if (!bundle_store[i].is_empty) n_bundles++;
+        for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
+            if (!bundle_store[i].is_empty) {
+                n_bundles++;
+                if (bundle_store[i].forwarded) n_forwarded++;
+            }
+        }
         xSemaphoreGive(data_mutex);
 
         // LED
@@ -1314,7 +1387,7 @@ static void ui_update_task(void *arg)
             alt_countdown--;
             // Alt mode: node identity + bundle store fill (same on BS and rovers)
             snprintf(line1, sizeof(line1), "Node:%-5u Ch:%-2d", my_id, ESPNOW_CHANNEL);
-            snprintf(line2, sizeof(line2), "Bndls:%-3d/%-3d", n_bundles, MAX_BUNDLES_IN_RAM);
+            snprintf(line2, sizeof(line2), "P:%-3d S:%-3d/%-3d", n_bundles - n_forwarded, n_forwarded, MAX_BUNDLES_IN_RAM);
         } else if (is_bs) {
             // BS normal mode: last received bundle latency + hops
             if (n_active > 0) {
@@ -1330,8 +1403,10 @@ static void ui_update_task(void *arg)
                 snprintf(line2, sizeof(line2), "Waiting for data");
             }
         } else {
-            // Rover normal mode: bundle store fill + peer connectivity
-            snprintf(line2, sizeof(line2), "Bndls:%-3d/%-3d", n_bundles, MAX_BUNDLES_IN_RAM);
+            // Rover normal mode: P=unsent  S=sent-awaiting-antipacket  /max
+            // e.g. "P:12  S:45 /100" , fits 16-char LCD
+            int n_unsent = n_bundles - n_forwarded;
+            snprintf(line2, sizeof(line2), "P:%-3d S:%-3d/%-3d", n_unsent, n_forwarded, MAX_BUNDLES_IN_RAM);
             if (n_active > 0) {
                 snprintf(line1, sizeof(line1), "Pr:%-2d  RSSI:%-4d", n_active, (int)best_rssi);
             } else {
