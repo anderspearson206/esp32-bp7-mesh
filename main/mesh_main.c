@@ -148,11 +148,14 @@ typedef struct {
     uint32_t     received_at_ms;
 } stored_antipkt_t;
 
-// BS-side delivered-bundle ring buffer , NOT packed so comparisons are always correct
+// BS-side delivered-bundle ring buffer, NOT packed so comparisons are always correct.
+// first_prev_node tracks which node made the first delivery so duplicate receipts can be
+// classified, same prev_node = antipacket failure, different prev_node = ferry duplicate.
 typedef struct {
     uint16_t source_node;
     uint32_t creation_time;
     uint32_t sequence_number;
+    uint16_t first_prev_node;
 } bs_delivered_id_t;
 
 typedef struct __attribute__((packed)) {
@@ -406,21 +409,24 @@ static void rx_process_task(void *arg) {
 
             xSemaphoreTake(data_mutex, portMAX_DELAY);
 
-            // dedup by (source_node, creation_time, sequence_number)
+            // dedup by (source_node, creation_time, sequence_number).
+            // first_prev_node captures who delivered it first so we can classify the duplicate type.
             bool already_have = false;
+            uint16_t first_prev_node = 0;
             for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
                 if (!bundle_store[i].is_empty) {
                     dtn_bundle_t *b = &bundle_store[i].bundle;
-                    if (b->source_node    == incoming->source_node &&
-                        b->creation_time  == incoming->creation_time &&
+                    if (b->source_node     == incoming->source_node &&
+                        b->creation_time   == incoming->creation_time &&
                         b->sequence_number == incoming->sequence_number) {
                         already_have = true;
+                        first_prev_node = b->prev_node;
                         break;
                     }
                 }
             }
-            // BS: also check bs_delivered ring buffer , catches duplicates that arrive
-            // after the bundle slot was freed (common when antipackets haven't propagated yet).
+            // BS also check bs_delivered ring buffer, catches duplicates arriving after
+            // the bundle slot was freed (common when antipackets haven't propagated yet).
             if (!already_have && my_id == BASE_STATION_NODE_ID) {
                 int n = bs_delivered_count;
                 for (int i = 0; i < n; i++) {
@@ -429,6 +435,7 @@ static void rx_process_task(void *arg) {
                         bs_delivered[idx].creation_time   == incoming->creation_time &&
                         bs_delivered[idx].sequence_number == incoming->sequence_number) {
                         already_have = true;
+                        first_prev_node = bs_delivered[idx].first_prev_node;
                         break;
                     }
                 }
@@ -450,10 +457,19 @@ static void rx_process_task(void *arg) {
 
             if (already_have) {
                 xSemaphoreGive(data_mutex);
-                printf("@DEDUP:%u:%" PRIu32 ":%u\n",
-                       incoming->source_node, incoming->sequence_number, my_id);
-                // BS re-broadcasts antipacket so lagging rovers still holding this bundle clear it
                 if (my_id == BASE_STATION_NODE_ID) {
+                    if (incoming->prev_node == first_prev_node) {
+                        // same forwarder re-sent, antipacket didn't reach that node
+                        printf("@ANTIPKT_FAIL:%u:%" PRIu32 ":%u\n",
+                               incoming->source_node, incoming->sequence_number,
+                               incoming->prev_node);
+                    } else {
+                        // different forwarder: epidemic routing delivered via two paths
+                        printf("@FERRY_DUP:%u:%" PRIu32 ":%u:%u\n",
+                               incoming->source_node, incoming->sequence_number,
+                               first_prev_node, incoming->prev_node);
+                    }
+                    // re-broadcast antipacket regardless of duplicate type
                     antipkt_pkt_t dedup_ap = {
                         .pkt_type       = PKT_TYPE_ANTIPKT,
                         .id             = { .source_node     = incoming->source_node,
@@ -462,6 +478,9 @@ static void rx_process_task(void *arg) {
                         .origin_node_id = my_id,
                     };
                     esp_now_send(BROADCAST_MAC, (uint8_t *)&dedup_ap, sizeof(dedup_ap));
+                } else {
+                    printf("@DEDUP:%u:%" PRIu32 ":%u\n",
+                           incoming->source_node, incoming->sequence_number, my_id);
                 }
                 continue;
             }
@@ -472,6 +491,7 @@ static void rx_process_task(void *arg) {
                 bs_delivered[bs_delivered_head].source_node     = incoming->source_node;
                 bs_delivered[bs_delivered_head].creation_time   = incoming->creation_time;
                 bs_delivered[bs_delivered_head].sequence_number = incoming->sequence_number;
+                bs_delivered[bs_delivered_head].first_prev_node = incoming->prev_node;
                 bs_delivered_head = (bs_delivered_head + 1) % MAX_BS_DELIVERED;
                 if (bs_delivered_count < MAX_BS_DELIVERED) bs_delivered_count++;
             }

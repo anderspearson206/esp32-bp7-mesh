@@ -18,7 +18,8 @@ lock = threading.Lock()
 node_latencies = defaultdict(lambda: deque(maxlen=20))
 event_log = deque(maxlen=20)
 delivered_bundles = {}  # (source_node_str, seq_int) -> {latency_ms, hops, time}
-dedup_counts = defaultdict(int)  # source_node_str -> count of duplicate arrivals at BS
+antipkt_fail_counts = defaultdict(int)  # source_node_str -> @ANTIPKT_FAIL count
+ferry_dup_counts    = defaultdict(int)  # source_node_str -> @FERRY_DUP count
 
 def read_line_or_frame(ser):
     """Return one stripped ASCII line, skipping binary ESP32 UART frames (SOF=0xAA).
@@ -136,14 +137,21 @@ def serial_reader_thread(port):
                         except ValueError:
                             pass
 
-                # duplicate bundle arrivals at BS
-                elif line.startswith("@DEDUP:"):
-                    # Format: @DEDUP:<source_node>:<seq_num>:<receiver_node>
+                # antipacket failure: same forwarder re-sent a bundle BS already has
+                elif line.startswith("@ANTIPKT_FAIL:"):
+                    # Format: @ANTIPKT_FAIL:<src>:<seq>:<prev>
                     parts = line.split(':')
                     if len(parts) >= 3:
-                        source_node = parts[1]
                         with lock:
-                            dedup_counts[source_node] += 1
+                            antipkt_fail_counts[parts[1]] += 1
+
+                # ferry duplicate: two different nodes delivered the same bundle
+                elif line.startswith("@FERRY_DUP:"):
+                    # Format: @FERRY_DUP:<src>:<seq>:<first_prev>:<dup_prev>
+                    parts = line.split(':')
+                    if len(parts) >= 3:
+                        with lock:
+                            ferry_dup_counts[parts[1]] += 1
 
         except (serial.SerialException, serial.PortNotOpenError) as e:
             print(f"Connection lost on {port}: {e}. Retrying in 2 seconds...")
@@ -209,19 +217,28 @@ def update_graph(frame):
             per_source[src].append(info['latency_ms'])
         for src, lats in sorted(per_source.items()):
             avg = sum(lats) / len(lats)
-            dups = dedup_counts.get(src, 0)
-            dup_str = f"  dups:{dups}" if dups else ""
+            ap_fail = antipkt_fail_counts.get(src, 0)
+            dup     = ferry_dup_counts.get(src, 0)
+            extra = ""
+            if ap_fail: extra += f"  ap_fail:{ap_fail}"
+            if dup:     extra += f"  dup:{dup}"
             ax_log.text(0.02, y_stats,
-                        f"  Node {src}: {len(lats)} pkts  avg {avg:.0f} ms{dup_str}",
+                        f"  Node {src}: {len(lats)} pkts  avg {avg:.0f} ms{extra}",
                         transform=ax_log.transAxes, fontsize=8, color='darkgreen',
                         verticalalignment='top', fontfamily='monospace')
             y_stats -= 0.045
 
-        # Dedup totals for sources not yet in delivered_bundles
-        for src, count in sorted(dedup_counts.items()):
+        # Counts for sources not yet in delivered_bundles
+        all_dup_srcs = set(antipkt_fail_counts) | set(ferry_dup_counts)
+        for src in sorted(all_dup_srcs):
             if src not in per_source:
+                ap_fail = antipkt_fail_counts.get(src, 0)
+                dup     = ferry_dup_counts.get(src, 0)
+                extra = ""
+                if ap_fail: extra += f"  ap_fail:{ap_fail}"
+                if dup:     extra += f"  dup:{dup}"
                 ax_log.text(0.02, y_stats,
-                            f"  Node {src}: 0 pkts  dups:{count}",
+                            f"  Node {src}: 0 pkts{extra}",
                             transform=ax_log.transAxes, fontsize=8, color='sienna',
                             verticalalignment='top', fontfamily='monospace')
                 y_stats -= 0.045
