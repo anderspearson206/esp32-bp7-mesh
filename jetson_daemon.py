@@ -190,6 +190,7 @@ class JetsonDaemon:
         self._store: list[dict] = []
         self._lock = threading.Lock()
         self._seq  = itertools.count(start=1)
+        self._start_ms = int(time.monotonic() * 1000)  # daemon epoch: creation_time is relative to this
 
         self._delivered: set[tuple] = set()  # (source_node, creation_time, seq) tuples
 
@@ -305,9 +306,9 @@ class JetsonDaemon:
             self._send(HOST_CMD_BUNDLE_DATA, data)
             sent_bundles.append(b)
             # Wait for the ESP32's implicit ACK (another PULL_REQ).
-            # ANTIPKT_NOTIFY frames may arrive interleaved on the same UART;
-            # handle them and keep waiting rather than aborting the drain.
-            deadline = time.monotonic() + 1.0
+            # UART log noise from the ESP32 is interleaved on UART0 (bench mode);
+            # use a generous deadline so we don't abort early when the ESP32 logs.
+            deadline = time.monotonic() + 2.0
             got_pull = False
             while time.monotonic() < deadline:
                 remaining = deadline - time.monotonic()
@@ -371,14 +372,15 @@ class JetsonDaemon:
 
     # bundle generator
     def _generate_bundle(self) -> None:
-        now_ms = int(time.monotonic() * 1000)
+        abs_ms = int(time.monotonic() * 1000)
+        creation_time = abs_ms - self._start_ms  # daemon-relative: same clock domain as ESP32 now_ms()
         payload = json.dumps({
             'ts': int(time.time()),
             'node': self._node_id,
-            'sensor': round(20.0 + (now_ms % 1000) / 100.0, 1),  # synthetic sensor value
+            'sensor': round(20.0 + (creation_time % 1000) / 100.0, 1),  # synthetic sensor value
         }).encode()
         b = {
-            'creation_time':   now_ms,
+            'creation_time':   creation_time,
             'sequence_number': next(self._seq),
             'lifetime':        BUNDLE_DEFAULT_LIFETIME,
             'source_node':     self._node_id,
@@ -388,7 +390,7 @@ class JetsonDaemon:
             'hop_count':       0,
             'is_telemetry':    False,
             'payload':         payload,
-            'added_at_ms':     now_ms,
+            'added_at_ms':     abs_ms,  # absolute monotonic for TTL comparison in _expire_bundles
         }
         if self._add_bundle(b):
             print(f"[GEN] Generated bundle seq:{b['sequence_number']}")

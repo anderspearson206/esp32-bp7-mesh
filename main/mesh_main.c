@@ -36,7 +36,7 @@
 
 #define MAX_ANTIPKTS          200
 #define ANTIPKT_LIFETIME_MS   (120 * 1000)
-#define MAX_BS_DELIVERED      200
+#define MAX_BS_DELIVERED      2000
 
 // ESP-NOW v2.0 max payload is 1470 bytes.
 // Our largest possible bundle packet: 1 (type) + bundle_header + 1024 (payload) ≈ 1053 bytes.
@@ -935,28 +935,29 @@ static bool host_recv_frame(uint8_t *cmd_out, uint16_t *plen_out, uint32_t timeo
 
 // inject a raw dtn_bundle_t (plen bytes) from host into the bundle store.
 // returns true on success, false if store is full or duplicate.
-static bool host_inject_bundle(const uint8_t *data, uint16_t plen) {
+// Returns: 1 = injected, 0 = duplicate or already-delivered (skip but continue pulling), -1 = store full
+static int host_inject_bundle(const uint8_t *data, uint16_t plen) {
     size_t min_hdr = sizeof(dtn_bundle_t) - BUNDLE_PAYLOAD_SIZE;
-    if (plen < (uint16_t)min_hdr) return false;
+    if (plen < (uint16_t)min_hdr) return -1;
     dtn_bundle_t *b = (dtn_bundle_t *)data;
 
     xSemaphoreTake(data_mutex, portMAX_DELAY);
 
-    // reject if already in bundle store (duplicate)
+    // reject if already in bundle store (duplicate from a previous pull cycle)
     for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
         if (!bundle_store[i].is_empty) {
             dtn_bundle_t *s = &bundle_store[i].bundle;
-            if (s->source_node    == b->source_node &&
-                s->creation_time  == b->creation_time &&
+            if (s->source_node     == b->source_node &&
+                s->creation_time   == b->creation_time &&
                 s->sequence_number == b->sequence_number) {
                 xSemaphoreGive(data_mutex);
-                return false;
+                return 0;
             }
         }
     }
 
     // reject if already delivered (antipacket exists) , prevents re-injection of
-    // delivered bundles when the Jetson hasn't received the ANTIPKT_NOTIFY yet.
+    // bundles the Jetson hasn't been notified about yet.
     for (int i = 0; i < MAX_ANTIPKTS; i++) {
         if (!antipkt_store[i].is_empty &&
             antipkt_store[i].id.source_node     == b->source_node &&
@@ -964,9 +965,8 @@ static bool host_inject_bundle(const uint8_t *data, uint16_t plen) {
             antipkt_store[i].id.sequence_number == b->sequence_number) {
             antipkt_id_t notif = antipkt_store[i].id;
             xSemaphoreGive(data_mutex);
-            // renotify Jetson so it eventually removes this bundle from its store
             xQueueSend(antipkt_notify_q, &notif, 0);
-            return false;
+            return 0;
         }
     }
 
@@ -977,13 +977,13 @@ static bool host_inject_bundle(const uint8_t *data, uint16_t plen) {
             bundle_store[i].forwarded = false;
             xSemaphoreGive(data_mutex);
             ESP_LOGI(TAG, "Host: injected src=%u seq=%" PRIu32, b->source_node, b->sequence_number);
-            return true;
+            return 1;
         }
     }
 
     xSemaphoreGive(data_mutex);
     ESP_LOGW(TAG, "Host: store full, dropping src=%u seq=%" PRIu32, b->source_node, b->sequence_number);
-    return false;
+    return -1;
 }
 
 static void host_uart_task(void *arg) {
@@ -1007,8 +1007,8 @@ static void host_uart_task(void *arg) {
             last_host_active_ms = now_ms();
             switch (cmd) {
             case HOST_CMD_TX_BUNDLE: {
-                bool ok = host_inject_bundle(host_rx_payload, plen);
-                uint8_t status = ok ? 0 : 1;
+                int inj = host_inject_bundle(host_rx_payload, plen);
+                uint8_t status = (inj >= 0) ? 0 : 1;  // -1 (full) = error, 0/1 = ok
                 host_send_frame(HOST_CMD_ACK, &status, 1);
                 break;
             }
@@ -1079,7 +1079,9 @@ static void host_uart_task(void *arg) {
                         }
                         if (r_cmd == HOST_CMD_BUNDLE_DATA) {
                             last_host_active_ms = now_ms();
-                            if (!host_inject_bundle(host_rx_payload, r_plen)) break; // store full
+                            int inj = host_inject_bundle(host_rx_payload, r_plen);
+                            if (inj < 0) break;  // store full, stop pulling
+                            // inj == 0: duplicate/already-delivered: continue to next bundle
                         }
                     }
                 }
