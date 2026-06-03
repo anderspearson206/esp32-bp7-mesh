@@ -15,11 +15,15 @@ TIMEOUT_SECONDS = 15
 G = nx.DiGraph()
 recent_transfers = []
 lock = threading.Lock()
-node_latencies = defaultdict(lambda: deque(maxlen=20))
-event_log = deque(maxlen=20)
-delivered_bundles = {}  # (source_node_str, seq_int) -> {latency_ms, hops, time}
-antipkt_fail_counts = defaultdict(int)  # source_node_str -> @ANTIPKT_FAIL count
-ferry_dup_counts    = defaultdict(int)  # source_node_str -> @FERRY_DUP count
+node_latencies      = defaultdict(lambda: deque(maxlen=20))  # rolling avg for live display
+event_log           = deque(maxlen=20)
+delivered_bundles   = {}                 # (source_node_str, seq_int) -> {latency_ms, hops, time}
+antipkt_fail_counts = defaultdict(int)   # source_node_str -> count  (excluded from delivery totals)
+ferry_dup_counts    = defaultdict(int)   # source_node_str -> count  (counted as deliveries)
+node_rssi           = defaultdict(list)  # source_node_str -> [rssi_int, ...]  (from @NET:)
+node_seq_range      = {}                 # source_node_str -> {'min': int, 'max': int}
+start_time          = time.time()
+
 
 def read_line_or_frame(ser):
     """Return one stripped ASCII line, skipping binary ESP32 UART frames (SOF=0xAA).
@@ -42,43 +46,44 @@ def read_line_or_frame(ser):
         if byte == ord('\n'):
             return buf.decode('utf-8', errors='ignore').strip() or None
 
+
 def serial_reader_thread(port):
-    """Reads serial data from a specific port and updates the network graph state."""
-    while True: 
+    """Read serial data from the BS port and update shared state."""
+    while True:
         try:
             ser = serial.Serial(port, BAUD_RATE, timeout=1)
             print(f"Connected to {port}. Listening for DTN telemetry...")
-            
+
             while True:
                 line = read_line_or_frame(ser)
                 if not line:
                     continue
 
-                # parse topology updates
                 if line.startswith("@"):
                     print(f"Received: {line} : {datetime.now().strftime('%H:%M:%S')}")
+
+                # topology heartbeat from rovers, e.g. @NET:node_id:parent_id:rssi
                 if line.startswith("@NET:"):
                     parts = line.split(':')
                     if len(parts) >= 4:
-                        node_id, parent, rssi = parts[1], parts[2], parts[3] 
+                        node_id, parent, rssi = parts[1], parts[2], parts[3]
                         with lock:
                             current_time = time.time()
                             edges_to_remove = [(u, v) for u, v in G.edges() if u == node_id]
                             G.remove_edges_from(edges_to_remove)
-                            
-                            # update tsamp for this node (or add it if new)
                             G.add_node(node_id, last_seen=current_time)
-                            
-                            if parent != "0": 
-                                G.add_node(parent) 
+                            if parent != "0":
+                                G.add_node(parent)
                                 G.add_edge(node_id, parent, link_type='mesh', rssi=rssi)
-                                
-                # movement bundles
+                                try:
+                                    node_rssi[node_id].append(int(rssi))
+                                except ValueError:
+                                    pass
+
+                # packet recieved
                 elif line.startswith("@DTN_RX:"):
-                    # print(f"Received: {line}")
+                    # Format: @DTN_RX:<source>:<prev_node>:<seq>:<receiver>:<hop_count>
                     parts = line.split(':')
-                    # Expected Format: @DTN_RX:<source>:<prev_node>:<seq>:<receiver>:<hop_count>
-                    # Older firmware may emit only 5 fields; default hops to 1 in that case.
                     if len(parts) >= 6:
                         source, ferry, seq, receiver = parts[1], parts[2], parts[3], parts[4]
                         try:
@@ -90,54 +95,49 @@ def serial_reader_thread(port):
                         hops = 1
                     else:
                         continue
-
                     with lock:
                         current_time = time.time()
-                        # revive/update the original source so we know it still exists in memory
-                        G.add_node(source, last_seen=current_time)
-                        G.add_node(ferry, last_seen=current_time)
+                        G.add_node(source,   last_seen=current_time)
+                        G.add_node(ferry,    last_seen=current_time)
                         G.add_node(receiver, last_seen=current_time)
-
                         is_ferry = (ferry != source) or (hops > 1)
                         recent_transfers.append({
-                            'src': source,
-                            'ferry': ferry,
-                            'dst': receiver,
-                            'hops': hops,
-                            'is_ferry': is_ferry,
-                            'time': current_time
+                            'src': source, 'ferry': ferry, 'dst': receiver,
+                            'hops': hops, 'is_ferry': is_ferry, 'time': current_time,
                         })
                         event_log.append({
-                            'time': current_time,
-                            'src': source,
-                            'ferry': ferry,
-                            'seq': seq,
-                            'hops': hops,
-                            'is_ferry': is_ferry,
+                            'time': current_time, 'src': source, 'ferry': ferry,
+                            'seq': seq, 'hops': hops, 'is_ferry': is_ferry,
                         })
-                
-                # parse latency metrics
+
+                # latency tracking
                 elif line.startswith("@METRIC:"):
+                    # Format: @METRIC:<source_node>:<seq_num>:<hop_count>:<latency_ms>
                     parts = line.split(':')
-                    # Format: @METRIC:<source_node>:<seq_num>:<hop_count>:<latency>
                     if len(parts) >= 5:
                         source_node = parts[1]
                         try:
-                            seq_num = int(parts[2])
-                            hops_val = int(parts[3])
+                            seq_num    = int(parts[2])
+                            hops_val   = int(parts[3])
                             latency_ms = int(parts[4])
                             if 0 <= latency_ms < 300000:
                                 with lock:
                                     node_latencies[source_node].append(latency_ms)
                                     delivered_bundles[(source_node, seq_num)] = {
                                         'latency_ms': latency_ms,
-                                        'hops': hops_val,
-                                        'time': time.time(),
+                                        'hops':       hops_val,
+                                        'time':       time.time(),
                                     }
+                                    if source_node not in node_seq_range:
+                                        node_seq_range[source_node] = {'min': seq_num, 'max': seq_num}
+                                    else:
+                                        r = node_seq_range[source_node]
+                                        if seq_num < r['min']: r['min'] = seq_num
+                                        if seq_num > r['max']: r['max'] = seq_num
                         except ValueError:
                             pass
 
-                # antipacket failure: same forwarder re-sent a bundle BS already has
+                # antipacket failure, same forwarder re-sent the bundle, excluded from delivery totals
                 elif line.startswith("@ANTIPKT_FAIL:"):
                     # Format: @ANTIPKT_FAIL:<src>:<seq>:<prev>
                     parts = line.split(':')
@@ -145,7 +145,7 @@ def serial_reader_thread(port):
                         with lock:
                             antipkt_fail_counts[parts[1]] += 1
 
-                # ferry duplicate: two different nodes delivered the same bundle
+                # ferry duplicate, same bundle from a second node
                 elif line.startswith("@FERRY_DUP:"):
                     # Format: @FERRY_DUP:<src>:<seq>:<first_prev>:<dup_prev>
                     parts = line.split(':')
@@ -159,8 +159,127 @@ def serial_reader_thread(port):
         except Exception as e:
             print(f"Unexpected error on {port}: {e}")
             time.sleep(2)
-            
-            
+
+
+def generate_summary():
+    """Print and save a full session summary. Called on exit (window close or Ctrl-C)."""
+    now = datetime.now()
+
+    with lock:
+        duration_s = int(time.time() - start_time)
+
+        # Compute per-node metrics from delivered_bundles
+        per_node_seqs = defaultdict(set)
+        per_node_lats = defaultdict(list)
+        for (src, seq), info in delivered_bundles.items():
+            per_node_seqs[src].add(seq)
+            per_node_lats[src].append(info['latency_ms'])
+
+        total_unique     = sum(len(s) for s in per_node_seqs.values())
+        total_ferry_dups = sum(ferry_dup_counts.values())
+        total_delivered  = total_unique + total_ferry_dups
+        total_ap_fails   = sum(antipkt_fail_counts.values())
+
+        all_nodes = sorted(
+            set(per_node_seqs) | set(ferry_dup_counts) | set(antipkt_fail_counts) | set(node_seq_range)
+        )
+
+        all_lats_flat = [info['latency_ms'] for info in delivered_bundles.values()]
+        all_rssi_flat = [v for vals in node_rssi.values() for v in vals]
+
+        W = 58
+        lines = []
+        lines.append("=" * W)
+        lines.append("  DTN Mesh Network  —  Session Summary Report")
+        lines.append(f"  Generated : {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        h, rem = divmod(duration_s, 3600)
+        m, s   = divmod(rem, 60)
+        dur_str = (f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s")
+        lines.append(f"  Duration  : {dur_str}")
+        lines.append("=" * W)
+        lines.append("")
+
+        lines.append("Totals")
+        lines.append(f"  Unique packets delivered         : {total_unique}")
+        lines.append(f"  Total deliveries (+ ferry dups)  : {total_delivered}")
+        lines.append(f"  Ferry duplicates                 : {total_ferry_dups}")
+        lines.append(f"  Antipacket failures (excluded)   : {total_ap_fails}")
+        if all_lats_flat:
+            lines.append(f"  Overall avg latency              : {sum(all_lats_flat)/len(all_lats_flat):.0f} ms")
+        else:
+            lines.append(f"  Overall avg latency              : N/A")
+        if all_rssi_flat:
+            lines.append(f"  Overall avg RSSI                 : {sum(all_rssi_flat)/len(all_rssi_flat):.1f} dBm")
+        else:
+            lines.append(f"  Overall avg RSSI                 : N/A")
+        lines.append("")
+
+        # per node
+        lines.append("Per Node")
+        hdr = f"  {'Node':<10} {'Uniq':>6} {'FDup':>6} {'APFl':>6} {'AvgLat':>10} {'AvgRSSI':>9}  SeqRange"
+        lines.append(hdr)
+        lines.append("  " + "-" * (len(hdr) - 2))
+        for node in all_nodes:
+            unique_count = len(per_node_seqs.get(node, set()))
+            ferry_dups   = ferry_dup_counts.get(node, 0)
+            ap_fails     = antipkt_fail_counts.get(node, 0)
+            lats         = per_node_lats.get(node, [])
+            rssi_vals    = node_rssi.get(node, [])
+            lat_str      = f"{sum(lats)/len(lats):.0f} ms"  if lats     else "N/A"
+            rssi_str     = f"{sum(rssi_vals)/len(rssi_vals):.1f} dBm" if rssi_vals else "N/A"
+            if node in node_seq_range:
+                r = node_seq_range[node]
+                seq_str = f"[{r['min']}..{r['max']}]"
+            else:
+                seq_str = "N/A"
+            lines.append(
+                f"  {node:<10} {unique_count:>6} {ferry_dups:>6} {ap_fails:>6} "
+                f"{lat_str:>10} {rssi_str:>9}  {seq_str}"
+            )
+        lines.append("")
+
+        # delivery estimate
+        nodes_with_range = [n for n in all_nodes if n in node_seq_range]
+        if nodes_with_range:
+            lines.append("Delivery Estimate  (based on observed seq range)")
+            hdr2 = f"  {'Node':<10} {'Possible':>9} {'Delivered':>10} {'Undelivered':>12} {'Pct':>7}"
+            lines.append(hdr2)
+            lines.append("  " + "-" * (len(hdr2) - 2))
+            for node in nodes_with_range:
+                r            = node_seq_range[node]
+                possible     = r['max'] - r['min'] + 1
+                unique_count = len(per_node_seqs.get(node, set()))
+                undelivered  = max(0, possible - unique_count)
+                pct          = 100.0 * unique_count / possible if possible > 0 else 0.0
+                lines.append(
+                    f"  {node:<10} {possible:>9} {unique_count:>10} {undelivered:>12} {pct:>6.1f}%"
+                )
+            lines.append("")
+
+        #  notes
+        lines.append("Notes")
+        lines.append("  Unique delivered  : distinct (source, seq) pairs from @METRIC events.")
+        lines.append("  Ferry dups        : same bundle reached BS via a second forwarder;")
+        lines.append("                      counted in total deliveries, not unique.")
+        lines.append("  Antipacket fails  : same forwarder re-sent the bundle; excluded from")
+        lines.append("                      both unique and total counts.")
+        lines.append("  Undelivered est.  : (last_seq - first_seq + 1) - unique_delivered.")
+        lines.append("                      Assumes contiguous seq numbers in observed window.")
+        lines.append("=" * W)
+
+        report = "\n".join(lines)
+
+    # print and save outside the lock
+    print("\n" + report)
+    filename = f"bs_reports/dtn_summary_{now.strftime('%Y%m%d_%H%M%S')}.txt"
+    try:
+        with open(filename, 'w') as f:
+            f.write(report + "\n")
+        print(f"\n[Summary saved to {filename}]")
+    except OSError as e:
+        print(f"\n[Could not save summary file: {e}]")
+
+
 def update_graph(frame):
     plt.clf()
     with lock:
@@ -175,9 +294,9 @@ def update_graph(frame):
             G.remove_node(n)
 
         ax_graph = plt.subplot(1, 2, 1)
-        ax_log = plt.subplot(1, 2, 2)
+        ax_log   = plt.subplot(1, 2, 2)
 
-        # --- event log panel (top 55%) ---
+        # event log panel
         ax_log.axis('off')
         ax_log.set_title("Bundle Events / Delivery Metrics", fontsize=10, fontweight='bold')
         y = 0.97
@@ -199,7 +318,7 @@ def update_graph(frame):
                         fontfamily='monospace')
             y -= 0.048
 
-        # --- delivery metrics panel (bottom 40%) ---
+        # delivery metrics
         y_stats = 0.42
         ax_log.text(0.02, y_stats, "— Delivery Metrics —", transform=ax_log.transAxes,
                     fontsize=8, color='black', verticalalignment='top', fontweight='bold')
@@ -211,15 +330,14 @@ def update_graph(frame):
                     verticalalignment='top', fontfamily='monospace')
         y_stats -= 0.045
 
-        # Per-source delivery summary with dedup column
         per_source = defaultdict(list)
         for (src, _seq), info in delivered_bundles.items():
             per_source[src].append(info['latency_ms'])
         for src, lats in sorted(per_source.items()):
-            avg = sum(lats) / len(lats)
+            avg     = sum(lats) / len(lats)
             ap_fail = antipkt_fail_counts.get(src, 0)
             dup     = ferry_dup_counts.get(src, 0)
-            extra = ""
+            extra   = ""
             if ap_fail: extra += f"  ap_fail:{ap_fail}"
             if dup:     extra += f"  dup:{dup}"
             ax_log.text(0.02, y_stats,
@@ -228,13 +346,12 @@ def update_graph(frame):
                         verticalalignment='top', fontfamily='monospace')
             y_stats -= 0.045
 
-        # Counts for sources not yet in delivered_bundles
         all_dup_srcs = set(antipkt_fail_counts) | set(ferry_dup_counts)
         for src in sorted(all_dup_srcs):
             if src not in per_source:
                 ap_fail = antipkt_fail_counts.get(src, 0)
                 dup     = ferry_dup_counts.get(src, 0)
-                extra = ""
+                extra   = ""
                 if ap_fail: extra += f"  ap_fail:{ap_fail}"
                 if dup:     extra += f"  dup:{dup}"
                 ax_log.text(0.02, y_stats,
@@ -243,7 +360,7 @@ def update_graph(frame):
                             verticalalignment='top', fontfamily='monospace')
                 y_stats -= 0.045
 
-        # --- graph panel ---
+        # graph panel
         if len(G.nodes) == 0:
             ax_graph.set_title("Waiting for Mesh Data...")
             ax_graph.axis('off')
@@ -271,12 +388,11 @@ def update_graph(frame):
 
         ferry_labels = {}
         for transfer in active_transfers:
-            src = transfer['src']
-            ferry = transfer['ferry']
-            dst = transfer['dst']
-            hops = transfer.get('hops', 1)
+            src      = transfer['src']
+            ferry    = transfer['ferry']
+            dst      = transfer['dst']
+            hops     = transfer.get('hops', 1)
             is_ferry = (ferry != src) or (hops > 1)
-
             if is_ferry:
                 if ferry in G and dst in G:
                     nx.draw_networkx_edges(G, pos, edgelist=[(ferry, dst)],
@@ -309,9 +425,9 @@ def update_graph(frame):
         ax_graph.set_title(title_str, fontsize=12, fontweight='bold', pad=15)
         ax_graph.axis('off')
 
+
 if __name__ == '__main__':
     thread = threading.Thread(target=serial_reader_thread, args=(SERIAL_PORT,), daemon=True)
-    
     try:
         thread.start()
         fig = plt.figure(figsize=(14, 6))
@@ -319,3 +435,5 @@ if __name__ == '__main__':
         plt.show()
     except KeyboardInterrupt:
         print("\nShutting down visualizer...")
+    finally:
+        generate_summary()

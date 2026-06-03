@@ -32,10 +32,11 @@
 
 #define PKT_TYPE_BEACON  0x01
 #define PKT_TYPE_BUNDLE  0x02
-#define PKT_TYPE_ANTIPKT 0x03
+#define PKT_TYPE_ACKMAP  0x04   // bitmap ACK: one packet ACKs up to 256 bundles per source
 
-#define MAX_ANTIPKTS          200
-#define ANTIPKT_LIFETIME_MS   (120 * 1000)
+#define ACKMAP_BITMAP_BYTES  32                  // 256 sequence numbers per ackmap packet
+#define ACKMAP_BITMAP_BITS   (ACKMAP_BITMAP_BYTES * 8)
+#define MAX_ACK_SOURCES      8
 #define MAX_BS_DELIVERED      2000
 
 // ESP-NOW v2.0 max payload is 1470 bytes.
@@ -122,31 +123,32 @@ typedef struct {
     int8_t   rssi_last;
 } peer_entry_t;
 
-// 10-byte bundle identifier used in both ESP-NOW antipackets and UART notify frames
+// 10-byte bundle identifier used in UART ANTIPKT_NOTIFY frames to Jetson
 typedef struct __attribute__((packed)) {
     uint16_t source_node;
     uint32_t creation_time;
     uint32_t sequence_number;
 } antipkt_id_t;
 
-// ESP-NOW antipacket wire format (13 bytes)
-// origin_node_id identifies the node that GENERATED this antipacket (always the BS).
-// Rovers only apply antipackets (free bundle slots) when origin_node_id == BASE_STATION_NODE_ID,
-// preventing spurious deletion if a non-BS node ever emits antipackets.
+// ESP-NOW bitmap ACK packet: one packet ACKs up to 256 bundles from one source node.
+// bit i of bitmap = 1 means sequence number (seq_base + i) has been delivered at the BS.
 typedef struct __attribute__((packed)) {
-    uint8_t      pkt_type;        // PKT_TYPE_ANTIPKT
-    antipkt_id_t id;
-    uint16_t     origin_node_id;  // generator node (BS node ID)
-} antipkt_pkt_t;
+    uint8_t  pkt_type;          // PKT_TYPE_ACKMAP
+    uint16_t origin_node_id;    // BS node ID; rovers ignore packets not from BS
+    uint16_t source_node;       // whose bundles are being ACKed
+    uint32_t seq_base;          // sequence number corresponding to bit 0
+    uint8_t  bitmap_len;        // number of valid bytes in bitmap
+    uint8_t  bitmap[ACKMAP_BITMAP_BYTES];
+} ackmap_pkt_t;  // 42 bytes
 
-// Antipacket store entry
+// Per-source ACK state maintained by the BS
 typedef struct {
-    antipkt_id_t id;
-    uint16_t     origin_node_id;
-    bool         is_empty;
-    bool         forwarded;
-    uint32_t     received_at_ms;
-} stored_antipkt_t;
+    uint16_t source_node;
+    uint32_t seq_base;          // seq number of bit 0
+    uint8_t  bitmap[ACKMAP_BITMAP_BYTES];
+    bool     valid;
+    bool     dirty;             // true if bitmap changed since last broadcast
+} ack_source_t;
 
 // BS-side delivered-bundle ring buffer, NOT packed so comparisons are always correct.
 // first_prev_node tracks which node made the first delivery so duplicate receipts can be
@@ -187,7 +189,7 @@ typedef struct {
 static const char *TAG = "dtn_now";
 
 static ram_bundle_t      bundle_store[MAX_BUNDLES_IN_RAM];
-static stored_antipkt_t  antipkt_store[MAX_ANTIPKTS];
+static ack_source_t      ack_store[MAX_ACK_SOURCES];
 static bs_delivered_id_t bs_delivered[MAX_BS_DELIVERED];
 static int               bs_delivered_head  = 0;
 static int               bs_delivered_count = 0;
@@ -214,6 +216,8 @@ static bool lcd_initialized = false;   // set by lcd_init() after successful pro
 
 static const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
+static SemaphoreHandle_t uart_tx_mutex;     // serialises host_send_frame across rx_process_task and host_uart_task
+
 /*******************************************************
  *                Helper Functions
  *******************************************************/
@@ -233,9 +237,7 @@ static void init_bundle_store(void) {
         bundle_store[i].forwarded = false;
         memset(&bundle_store[i].bundle, 0, sizeof(dtn_bundle_t));
     }
-    for (int i = 0; i < MAX_ANTIPKTS; i++) {
-        antipkt_store[i].is_empty = true;
-    }
+    memset(ack_store, 0, sizeof(ack_store));
     ESP_LOGI(TAG, "Bundle store initialized");
 }
 
@@ -251,29 +253,64 @@ static bool register_espnow_peer(const uint8_t *mac) {
     return esp_now_add_peer(&peer) == ESP_OK;
 }
 
-// dedup-check and store an antipacket. returns true if newly stored, false if duplicate or full.
-// caller holds data_mutex.
-static bool store_antipkt_locked(const antipkt_id_t *id, uint16_t origin, uint32_t ts) {
-    for (int i = 0; i < MAX_ANTIPKTS; i++) {
-        if (!antipkt_store[i].is_empty &&
-            antipkt_store[i].id.source_node     == id->source_node &&
-            antipkt_store[i].id.creation_time   == id->creation_time &&
-            antipkt_store[i].id.sequence_number == id->sequence_number) {
-            return false;
+// Mark a sequence number as delivered at the BS; updates the sliding bitmap for that source.
+// Uses a sliding window: when seq falls beyond the current 256-bit range, the window advances.
+// Caller holds data_mutex.
+static void mark_ack_locked(uint16_t source_node, uint32_t seq) {
+    ack_source_t *a = NULL;
+    for (int i = 0; i < MAX_ACK_SOURCES; i++) {
+        if (ack_store[i].valid && ack_store[i].source_node == source_node) {
+            a = &ack_store[i]; break;
         }
     }
-    for (int i = 0; i < MAX_ANTIPKTS; i++) {
-        if (antipkt_store[i].is_empty) {
-            antipkt_store[i].id             = *id;
-            antipkt_store[i].origin_node_id = origin;
-            antipkt_store[i].is_empty       = false;
-            antipkt_store[i].forwarded      = false;
-            antipkt_store[i].received_at_ms = ts;
-            return true;
+    if (!a) {
+        for (int i = 0; i < MAX_ACK_SOURCES; i++) {
+            if (!ack_store[i].valid) {
+                a = &ack_store[i];
+                a->source_node = source_node;
+                a->seq_base    = seq;
+                a->valid       = true;
+                memset(a->bitmap, 0, ACKMAP_BITMAP_BYTES);
+                break;
+            }
         }
     }
-    ESP_LOGW(TAG, "Antipkt store full");
-    return false;
+    if (!a) { ESP_LOGW(TAG, "ack_store full"); return; }
+
+    if (seq < a->seq_base) return; // predates window, ignore
+
+    uint32_t offset = seq - a->seq_base;
+    if (offset >= ACKMAP_BITMAP_BITS) {
+        // slide window forward so seq lands at the last bit
+        uint32_t advance  = offset - (ACKMAP_BITMAP_BITS - 1);
+        uint32_t byte_adv = advance / 8;
+        uint32_t bit_adv  = advance % 8;
+        uint8_t  tmp[ACKMAP_BITMAP_BYTES];
+        memset(tmp, 0, ACKMAP_BITMAP_BYTES);
+        for (int i = 0; i < ACKMAP_BITMAP_BYTES; i++) {
+            int src = i + (int)byte_adv;
+            if (src >= ACKMAP_BITMAP_BYTES) break;
+            uint8_t lo = (bit_adv > 0 && src + 1 < ACKMAP_BITMAP_BYTES)
+                         ? (a->bitmap[src + 1] << (8 - bit_adv)) : 0;
+            tmp[i] = (a->bitmap[src] >> bit_adv) | lo;
+        }
+        memcpy(a->bitmap, tmp, ACKMAP_BITMAP_BYTES);
+        a->seq_base += advance;
+        offset = seq - a->seq_base;
+    }
+    a->bitmap[offset / 8] |= (1u << (offset % 8));
+    a->dirty = true;
+}
+
+// Merge a received ackmap into the local ack_store so it can be propagated to other peers.
+// Caller holds data_mutex.
+static void merge_ackmap_locked(const ackmap_pkt_t *ap) {
+    uint8_t blen = ap->bitmap_len;
+    if (blen == 0 || blen > ACKMAP_BITMAP_BYTES) return;
+    for (int i = 0; i < blen * 8; i++) {
+        if (ap->bitmap[i / 8] & (1u << (i % 8)))
+            mark_ack_locked(ap->source_node, ap->seq_base + (uint32_t)i);
+    }
 }
 
 // Add new peer or refresh last_seen on existing one.
@@ -296,9 +333,6 @@ static bool add_or_refresh_peer(const uint8_t *mac, uint16_t node_id, int8_t rss
                 for (int j = 0; j < MAX_BUNDLES_IN_RAM; j++) {
                     if (!bundle_store[j].is_empty) bundle_store[j].forwarded = false;
                 }
-                for (int j = 0; j < MAX_ANTIPKTS; j++) {
-                    if (!antipkt_store[j].is_empty) antipkt_store[j].forwarded = false;
-                }
                 is_new = true;
             }
             xSemaphoreGive(data_mutex);
@@ -319,12 +353,9 @@ static bool add_or_refresh_peer(const uint8_t *mac, uint16_t node_id, int8_t rss
         peer_list[peer_count].rssi_last    = rssi;
         peer_count++;
         is_new = true;
-        // new peer, so reset forwarded so they receive all stored bundles and antipackets
+        // new peer, reset forwarded so they receive all stored bundles
         for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
             if (!bundle_store[i].is_empty) bundle_store[i].forwarded = false;
-        }
-        for (int i = 0; i < MAX_ANTIPKTS; i++) {
-            if (!antipkt_store[i].is_empty) antipkt_store[i].forwarded = false;
         }
     } else {
         ESP_LOGW(TAG, "Peer list full, ignoring node %u", node_id);
@@ -441,20 +472,6 @@ static void rx_process_task(void *arg) {
                 }
             }
 
-            // Rovers: also reject bundles for which we already have an antipacket.
-            // The bundle was already delivered, the peer just hasn't learned yet.
-            if (!already_have && my_id != BASE_STATION_NODE_ID) {
-                for (int i = 0; i < MAX_ANTIPKTS; i++) {
-                    if (!antipkt_store[i].is_empty &&
-                        antipkt_store[i].id.source_node     == incoming->source_node &&
-                        antipkt_store[i].id.creation_time   == incoming->creation_time &&
-                        antipkt_store[i].id.sequence_number == incoming->sequence_number) {
-                        already_have = true;
-                        break;
-                    }
-                }
-            }
-
             if (already_have) {
                 xSemaphoreGive(data_mutex);
                 if (my_id == BASE_STATION_NODE_ID) {
@@ -469,14 +486,22 @@ static void rx_process_task(void *arg) {
                                incoming->source_node, incoming->sequence_number,
                                first_prev_node, incoming->prev_node);
                     }
-                    // re-broadcast antipacket regardless of duplicate type
-                    antipkt_pkt_t dedup_ap = {
-                        .pkt_type       = PKT_TYPE_ANTIPKT,
-                        .id             = { .source_node     = incoming->source_node,
-                                            .creation_time   = incoming->creation_time,
-                                            .sequence_number = incoming->sequence_number },
-                        .origin_node_id = my_id,
-                    };
+                    // re-broadcast ackmap to hasten clearing at the forwarder
+                    ackmap_pkt_t dedup_ap;
+                    memset(&dedup_ap, 0, sizeof(dedup_ap));
+                    dedup_ap.pkt_type       = PKT_TYPE_ACKMAP;
+                    dedup_ap.origin_node_id = my_id;
+                    dedup_ap.source_node    = incoming->source_node;
+                    dedup_ap.bitmap_len     = ACKMAP_BITMAP_BYTES;
+                    xSemaphoreTake(data_mutex, portMAX_DELAY);
+                    for (int k = 0; k < MAX_ACK_SOURCES; k++) {
+                        if (ack_store[k].valid && ack_store[k].source_node == incoming->source_node) {
+                            dedup_ap.seq_base = ack_store[k].seq_base;
+                            memcpy(dedup_ap.bitmap, ack_store[k].bitmap, ACKMAP_BITMAP_BYTES);
+                            break;
+                        }
+                    }
+                    xSemaphoreGive(data_mutex);
                     esp_now_send(BROADCAST_MAC, (uint8_t *)&dedup_ap, sizeof(dedup_ap));
                 } else {
                     printf("@DEDUP:%u:%" PRIu32 ":%u\n",
@@ -599,17 +624,26 @@ static void rx_process_task(void *arg) {
                 bundle_store[slot].is_empty = true;
                 xSemaphoreGive(data_mutex);
 
-                // broadcast antipacket so rovers clear their stores
-                antipkt_pkt_t ap = {
-                    .pkt_type       = PKT_TYPE_ANTIPKT,
-                    .id             = { .source_node = bsrc, .creation_time = btime, .sequence_number = bseq },
-                    .origin_node_id = my_id,
-                };
+                // mark delivery and broadcast updated ackmap so rovers clear their stores
+                ackmap_pkt_t ap;
+                memset(&ap, 0, sizeof(ap));
+                ap.pkt_type       = PKT_TYPE_ACKMAP;
+                ap.origin_node_id = my_id;
+                ap.source_node    = bsrc;
+                ap.bitmap_len     = ACKMAP_BITMAP_BYTES;
                 xSemaphoreTake(data_mutex, portMAX_DELAY);
-                store_antipkt_locked(&ap.id, my_id, now_ms());
+                mark_ack_locked(bsrc, bseq);
+                for (int k = 0; k < MAX_ACK_SOURCES; k++) {
+                    if (ack_store[k].valid && ack_store[k].source_node == bsrc) {
+                        ap.seq_base = ack_store[k].seq_base;
+                        memcpy(ap.bitmap, ack_store[k].bitmap, ACKMAP_BITMAP_BYTES);
+                        ack_store[k].dirty = false;
+                        break;
+                    }
+                }
                 xSemaphoreGive(data_mutex);
                 esp_now_send(BROADCAST_MAC, (uint8_t *)&ap, sizeof(ap));
-                ESP_LOGI(TAG, "ANTIPKT sent for src:%u seq:%" PRIu32, bsrc, bseq);
+                ESP_LOGI(TAG, "ACKMAP sent for src:%u base:%" PRIu32, bsrc, ap.seq_base);
             } else {
                 ESP_LOGI(TAG, "STORED src:%u seq:%" PRIu32 " hops:%u | store:%d/%d",
                          bsrc, bseq, bhops, stored_count, MAX_BUNDLES_IN_RAM);
@@ -619,42 +653,41 @@ static void rx_process_task(void *arg) {
                 host_send_frame(HOST_CMD_BUNDLE_PUSH, (const uint8_t *)&push_copy, (uint16_t)push_size);
             }
 
-        // handle antipacket
-        } else if (pkt_type == PKT_TYPE_ANTIPKT) {
-            if (item->len < (uint16_t)sizeof(antipkt_pkt_t)) continue;
-            antipkt_pkt_t *ap = (antipkt_pkt_t *)item->data;
+        // handle ackmap: bitmap ACK from BS telling rovers which bundles are delivered
+        } else if (pkt_type == PKT_TYPE_ACKMAP) {
+            if (my_id == BASE_STATION_NODE_ID) continue; // BS sends ackmaps, doesn't apply them
+            size_t min_len = sizeof(ackmap_pkt_t) - ACKMAP_BITMAP_BYTES; // header without bitmap
+            if (item->len < (uint16_t)min_len) continue;
+            ackmap_pkt_t *ap = (ackmap_pkt_t *)item->data;
+            if (ap->origin_node_id != BASE_STATION_NODE_ID) continue;
+            uint8_t blen = ap->bitmap_len;
+            if (blen == 0 || blen > ACKMAP_BITMAP_BYTES) continue;
 
-            bool is_new = false;
-            bool from_bs = (ap->origin_node_id == BASE_STATION_NODE_ID);
+            int n_freed = 0;
             xSemaphoreTake(data_mutex, portMAX_DELAY);
-            is_new = store_antipkt_locked(&ap->id, ap->origin_node_id, now_ms());
-            if (is_new && from_bs) {
-                // free any matching bundle from local store (only BS-originated antipackets)
-                for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
-                    if (!bundle_store[i].is_empty) {
-                        dtn_bundle_t *b = &bundle_store[i].bundle;
-                        if (b->source_node     == ap->id.source_node &&
-                            b->creation_time   == ap->id.creation_time &&
-                            b->sequence_number == ap->id.sequence_number) {
-                            bundle_store[i].is_empty = true;
-                            ESP_LOGI(TAG, "ANTIPKT applied: freed src:%u seq:%" PRIu32,
-                                     ap->id.source_node, ap->id.sequence_number);
-                            break;
-                        }
-                    }
-                }
+            // store for propagation to peers we encounter later
+            merge_ackmap_locked(ap);
+            // apply: free any bundle slots this ackmap covers
+            for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
+                if (bundle_store[i].is_empty) continue;
+                dtn_bundle_t *b = &bundle_store[i].bundle;
+                if (b->source_node != ap->source_node) continue;
+                if (b->sequence_number < ap->seq_base) continue;
+                uint32_t off = b->sequence_number - ap->seq_base;
+                if (off >= (uint32_t)(blen * 8)) continue;
+                if (!(ap->bitmap[off / 8] & (1u << (off % 8)))) continue;
+                antipkt_id_t notif = {
+                    .source_node     = b->source_node,
+                    .creation_time   = b->creation_time,
+                    .sequence_number = b->sequence_number,
+                };
+                bundle_store[i].is_empty = true;
+                n_freed++;
+                xQueueSend(antipkt_notify_q, &notif, 0);
             }
             xSemaphoreGive(data_mutex);
-
-            if (is_new) {
-                ESP_LOGI(TAG, "ANTIPKT received: src:%u seq:%" PRIu32 " origin:%u",
-                         ap->id.source_node, ap->id.sequence_number, ap->origin_node_id);
-                // notify Jetson to drop this bundle (rovers only, and only for BS-originated antipackets)
-                if (my_id != BASE_STATION_NODE_ID && from_bs) {
-                    antipkt_id_t notif = ap->id;
-                    xQueueSend(antipkt_notify_q, &notif, 0);
-                }
-            }
+            if (n_freed > 0)
+                ESP_LOGI(TAG, "ACKMAP: freed %d for src:%u", n_freed, ap->source_node);
         }
     }
 }
@@ -790,6 +823,8 @@ static void bundle_tx_task(void *arg) {
         }
         xSemaphoreGive(data_mutex);
 
+        int rnd_bundles = 0, rnd_ok = 0, rnd_fail = 0;
+
         for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
             xSemaphoreTake(data_mutex, portMAX_DELAY);
             if (bundle_store[i].is_empty) { xSemaphoreGive(data_mutex); continue; }
@@ -838,52 +873,43 @@ static void bundle_tx_task(void *arg) {
                 if (peer_ids[j] == orig_prev) continue; // dont echo back to prev hop
 
                 esp_err_t err = esp_now_send(peer_macs[j], tx_pkt_buf, pkt_size);
-                ESP_LOGI(TAG, "TX src:%u seq:%" PRIu32 " -> node:%u %s",
-                         tx_copy->source_node, tx_copy->sequence_number,
-                         peer_ids[j], err == ESP_OK ? "OK" : "FAIL");
-                if (err == ESP_OK) sent_to_anyone = true;
+                if (err == ESP_OK) { sent_to_anyone = true; rnd_ok++; }
+                else rnd_fail++;
             }
 
             if (sent_to_anyone) {
+                rnd_bundles++;
                 xSemaphoreTake(data_mutex, portMAX_DELAY);
                 if (!bundle_store[i].is_empty) bundle_store[i].forwarded = true;
                 xSemaphoreGive(data_mutex);
             }
         }
 
-        //epidemic antipacket forwading
-        // expire old antipackets first
-        xSemaphoreTake(data_mutex, portMAX_DELAY);
-        for (int i = 0; i < MAX_ANTIPKTS; i++) {
-            if (!antipkt_store[i].is_empty &&
-                (ts - antipkt_store[i].received_at_ms) > ANTIPKT_LIFETIME_MS) {
-                antipkt_store[i].is_empty = true;
-            }
-        }
-        xSemaphoreGive(data_mutex);
+        if (rnd_bundles > 0)
+            ESP_LOGI(TAG, "TX: %d bundles %d ok %d fail", rnd_bundles, rnd_ok, rnd_fail);
 
-        for (int i = 0; i < MAX_ANTIPKTS; i++) {
-            xSemaphoreTake(data_mutex, portMAX_DELAY);
-            if (antipkt_store[i].is_empty || antipkt_store[i].forwarded || n_active == 0) {
-                xSemaphoreGive(data_mutex);
-                continue;
-            }
-            antipkt_pkt_t ap = {
-                .pkt_type       = PKT_TYPE_ANTIPKT,
-                .id             = antipkt_store[i].id,
-                .origin_node_id = antipkt_store[i].origin_node_id,
-            };
-            xSemaphoreGive(data_mutex);
-
-            bool sent_ap = false;
-            for (int j = 0; j < n_active; j++) {
-                esp_err_t err = esp_now_send(peer_macs[j], (uint8_t *)&ap, sizeof(ap));
-                if (err == ESP_OK) sent_ap = true;
-            }
-            if (sent_ap) {
+        // All nodes: forward any dirty ackmap entries to active peers.
+        // BS sends entries it just marked from deliveries; rovers forward entries they
+        // received from BS (or from other rovers) to peers they encounter.
+        // origin_node_id is always BASE_STATION_NODE_ID — these ACKs originate at the BS.
+        if (n_active > 0) {
+            for (int i = 0; i < MAX_ACK_SOURCES; i++) {
                 xSemaphoreTake(data_mutex, portMAX_DELAY);
-                if (!antipkt_store[i].is_empty) antipkt_store[i].forwarded = true;
+                if (!ack_store[i].valid || !ack_store[i].dirty) {
+                    xSemaphoreGive(data_mutex);
+                    continue;
+                }
+                ackmap_pkt_t ap;
+                memset(&ap, 0, sizeof(ap));
+                ap.pkt_type       = PKT_TYPE_ACKMAP;
+                ap.origin_node_id = BASE_STATION_NODE_ID;
+                ap.source_node    = ack_store[i].source_node;
+                ap.seq_base       = ack_store[i].seq_base;
+                ap.bitmap_len     = ACKMAP_BITMAP_BYTES;
+                memcpy(ap.bitmap, ack_store[i].bitmap, ACKMAP_BITMAP_BYTES);
+                ack_store[i].dirty = false;
                 xSemaphoreGive(data_mutex);
+                esp_now_send(BROADCAST_MAC, (uint8_t *)&ap, sizeof(ap));
             }
         }
     }
@@ -906,6 +932,7 @@ static uint16_t crc16_update(uint16_t crc, uint8_t byte) {
 
 static void host_send_frame(uint8_t cmd, const uint8_t *payload, uint16_t plen) {
     if (plen > HOST_MAX_PAYLOAD) return;
+    xSemaphoreTake(uart_tx_mutex, portMAX_DELAY);
     host_tx_buf[0] = HOST_SOF;
     host_tx_buf[1] = cmd;
     host_tx_buf[2] = (uint8_t)(plen & 0xFF);
@@ -916,6 +943,7 @@ static void host_send_frame(uint8_t cmd, const uint8_t *payload, uint16_t plen) 
     host_tx_buf[4 + plen]     = (uint8_t)(crc & 0xFF);
     host_tx_buf[4 + plen + 1] = (uint8_t)(crc >> 8);
     uart_write_bytes(HOST_UART_PORT, host_tx_buf, 6 + plen);
+    xSemaphoreGive(uart_tx_mutex);
 }
 
 // returns true if a valid frame was received within timeout_ms
@@ -976,27 +1004,12 @@ static int host_inject_bundle(const uint8_t *data, uint16_t plen) {
         }
     }
 
-    // reject if already delivered (antipacket exists) , prevents re-injection of
-    // bundles the Jetson hasn't been notified about yet.
-    for (int i = 0; i < MAX_ANTIPKTS; i++) {
-        if (!antipkt_store[i].is_empty &&
-            antipkt_store[i].id.source_node     == b->source_node &&
-            antipkt_store[i].id.creation_time   == b->creation_time &&
-            antipkt_store[i].id.sequence_number == b->sequence_number) {
-            antipkt_id_t notif = antipkt_store[i].id;
-            xSemaphoreGive(data_mutex);
-            xQueueSend(antipkt_notify_q, &notif, 0);
-            return 0;
-        }
-    }
-
     for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
         if (bundle_store[i].is_empty) {
             memcpy(&bundle_store[i].bundle, b, plen);
             bundle_store[i].is_empty  = false;
             bundle_store[i].forwarded = false;
             xSemaphoreGive(data_mutex);
-            ESP_LOGI(TAG, "Host: injected src=%u seq=%" PRIu32, b->source_node, b->sequence_number);
             return 1;
         }
     }
@@ -1087,7 +1100,9 @@ static void host_uart_task(void *arg) {
                 xSemaphoreGive(data_mutex);
 
                 if (free_slots > 0) {
-                    // drain Jetson store: pull until NO_BUNDLES or store-full/timeout
+                    // drain Jetson store: pull until NO_BUNDLES or store-full/timeout.
+                    // After each injection, flush antipkt_notify_q so ANTIPKT_NOTIFY frames
+                    // reach the Jetson while its reader is idle between PULL_REQ round-trips.
                     for (int attempt = 0; attempt < free_slots; attempt++) {
                         host_send_frame(HOST_CMD_PULL_REQ, NULL, 0);
                         uint8_t r_cmd;
@@ -1103,6 +1118,10 @@ static void host_uart_task(void *arg) {
                             if (inj < 0) break;  // store full, stop pulling
                             // inj == 0: duplicate/already-delivered: continue to next bundle
                         }
+                        // flush any pending ANTIPKT_NOTIFYs while Jetson reader is idle
+                        antipkt_id_t notif;
+                        while (xQueueReceive(antipkt_notify_q, &notif, 0) == pdTRUE)
+                            host_send_frame(HOST_CMD_ANTIPKT_NOTIFY, (uint8_t *)&notif, sizeof(notif));
                     }
                 }
             }
@@ -1270,7 +1289,7 @@ static void lcd_init(void)
 {
     i2c_bus_recover();
 
-    // Probe: send address and check ACK before touching HD44780 init
+    // Probe, send address and check ACK before touching HD44780 init
     bb_start();
     bool acked = bb_write_byte((LCD_I2C_ADDR << 1) | 0x00);
     bb_stop();
@@ -1466,6 +1485,7 @@ void app_main(void) {
 
     // Create queues before registering recv_cb so the callback never sees NULL handles.
     data_mutex       = xSemaphoreCreateMutex();
+    uart_tx_mutex    = xSemaphoreCreateMutex();
     rx_queue         = xQueueCreate(64, sizeof(rx_item_t *));
     antipkt_notify_q = xQueueCreate(30, sizeof(antipkt_id_t));
 

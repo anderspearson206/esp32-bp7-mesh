@@ -20,3 +20,6 @@ __pycache__/
 *.py[cod]
 
 CLAUDE.md
+
+bs_reports/
+
