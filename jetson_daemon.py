@@ -19,7 +19,7 @@ import struct
 import threading
 import time
 import serial
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 # protocol constants (must match mesh_main.c)
 HOST_SOF              = 0xAA
@@ -54,6 +54,12 @@ STATUS_SIZE = struct.calcsize(STATUS_FMT)  # 6 bytes
 BUNDLE_DEFAULT_LIFETIME  = 3000000  # ms (50 minutes)
 BUNDLE_DEFAULT_HOP_LIMIT = 5
 
+RECONNECT_DELAY_S  = 5.0   # seconds between reconnect attempts
+SERIAL_SETTLE_S    = 3.0   # seconds after open before talking to ESP32
+WRITE_TIMEOUT_S    = 2.0   # serial write timeout - raises SerialTimeoutException on hang
+STATUS_INTERVAL_S  = 5.0   # how often to poll ESP32 status (shorter = faster disconnect detection)
+
+
 # CRC-16/CCITT (poly 0x1021, init 0xFFFF)
 def _crc16(data: bytes) -> int:
     crc = 0xFFFF
@@ -85,10 +91,24 @@ def _read_exact(ser: serial.Serial, n: int, timeout_s: float = 1.0) -> bytes:
     return buf
 
 
-def recv_frame(ser: serial.Serial, timeout_s: float = 1.0, verbose: bool = False) -> Optional[Tuple[int, bytes]]:
-    """Block until a valid frame arrives or timeout. Returns (cmd, payload) or None."""
+def recv_frame(ser: serial.Serial, timeout_s: float = 1.0, verbose: bool = False,
+               on_ascii: Optional[Callable[[str], None]] = None) -> Optional[Tuple[int, bytes]]:
+    """Block until a valid frame arrives or timeout. Returns (cmd, payload) or None.
+
+    on_ascii: called with decoded text whenever a run of non-SOF bytes is flushed.
+              Use this to scan for ESP32 boot banners without discarding other frames.
+    """
     deadline = time.monotonic() + timeout_s
     skipped = bytearray()
+
+    def _flush_skipped() -> None:
+        if skipped:
+            text = bytes(skipped).decode('ascii', errors='replace')
+            print(f"[RECV] Skipped {len(skipped)} non-SOF bytes")
+            if on_ascii:
+                on_ascii(text)
+            skipped.clear()
+
     while time.monotonic() < deadline:
         b = ser.read(1)
         if not b:
@@ -96,10 +116,7 @@ def recv_frame(ser: serial.Serial, timeout_s: float = 1.0, verbose: bool = False
         if b[0] != HOST_SOF:
             skipped.append(b[0])
             continue
-        if skipped:
-            # print(f"[RECV] Skipped {len(skipped)} non-SOF bytes: {skipped.hex()}")
-            print(f"[RECV] Skipped {len(skipped)} non-SOF bytes")
-            skipped = bytearray()
+        _flush_skipped()
         header = _read_exact(ser, 3, timeout_s=0.2)
         if len(header) < 3:
             print(f"[RECV] Incomplete header after SOF (got {len(header)}/3 bytes)")
@@ -122,12 +139,11 @@ def recv_frame(ser: serial.Serial, timeout_s: float = 1.0, verbose: bool = False
         if verbose:
             print(f"[RECV] Frame cmd=0x{cmd:02x} len={plen}")
         return cmd, payload
-    if skipped:
-        # print(f"[RECV] Timeout with {len(skipped)} trailing non-SOF bytes: {skipped.hex()}")
-        print(f"[RECV] Timeout with {len(skipped)} trailing non-SOF bytes")
+
+    _flush_skipped()
     return None
 
-# Bundle serialization 
+# Bundle serialization
 def pack_bundle(b: dict) -> bytes:
     payload_bytes = b['payload']
     if isinstance(payload_bytes, str):
@@ -177,27 +193,29 @@ def unpack_bundle(data: bytes) -> Optional[dict]:
         'payload':                 payload_raw[:payload_len],
     }
 
-# daemon 
+# daemon
 class JetsonDaemon:
     def __init__(self, serial_port: str, baud: int, gen_interval: float, node_id_override: Optional[int]):
         assert BUNDLE_SIZE == 1052, f"Bundle struct size mismatch: got {BUNDLE_SIZE}, expected 1052"
 
-        self._port      = serial_port
-        self._baud      = baud
-        self._interval  = gen_interval
-        self._node_id   = node_id_override  # None = auto detect on startup
+        self._port             = serial_port
+        self._baud             = baud
+        self._interval         = gen_interval
+        self._node_id_override = node_id_override        # None = auto-detect
+        self._node_id          = node_id_override        # working copy, may be reset on restart
 
         self._store: list[dict] = []
         self._lock = threading.Lock()
         self._seq  = itertools.count(start=1)
-        self._start_ms = int(time.monotonic() * 1000)  # daemon epoch: creation_time is relative to this
+        self._start_ms = int(time.monotonic() * 1000)
 
-        self._delivered: set[tuple] = set()  # (source_node, creation_time, seq) tuples
+        self._delivered: set[tuple] = set()
 
-        self._detected_node_id: Optional[int] = None  # set by _dispatch when STATUS_RESP seen
+        self._detected_node_id: Optional[int] = None
+        self._restart_pending = False                    # set by _handle_ascii on boot banner
 
-        self._ser: serial.Serial | None = None
-        self._uart_lock = threading.Lock()  # serialises UART writes
+        self._ser: Optional[serial.Serial] = None
+        self._uart_lock = threading.Lock()
 
     # serial helpers
     def _send(self, cmd: int, payload: bytes = b'') -> None:
@@ -210,7 +228,7 @@ class JetsonDaemon:
         with self._uart_lock:
             return recv_frame(self._ser, timeout_s, verbose=True)
 
-    #  bundle store
+    # bundle store
     def _add_bundle(self, b: dict) -> bool:
         key = (b['source_node'], b['creation_time'], b['sequence_number'])
         with self._lock:
@@ -255,6 +273,48 @@ class JetsonDaemon:
         else:
             print(f"[ANTIPKT] src:{source_node} seq:{seq} (not in store, already clear)")
 
+    # boot-banner detector - called with ASCII text chunks skipped by recv_frame
+    def _handle_ascii(self, text: str) -> None:
+        if 'I am' in text or 'rst:0x' in text:
+            print(f"[RESTART] Boot banner detected: {text.strip()!r}")
+            self._restart_pending = True
+            if self._node_id_override is None:
+                self._node_id = None   # will be re-detected in _main_loop
+
+    # serial lifecycle
+    def _open_serial(self) -> None:
+        """Open (or reopen) the serial port, closing any existing connection first."""
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+
+        ser = serial.Serial()
+        ser.port     = self._port
+        ser.baudrate = self._baud
+        ser.timeout       = 0.1
+        ser.write_timeout = WRITE_TIMEOUT_S
+        ser.xonxoff       = False
+        ser.dsrdtr        = False
+        ser.rtscts        = False
+        ser.dtr           = False
+        ser.rts           = False
+        ser.open()
+
+        if platform.system() != 'Windows':
+            import termios
+            attrs = termios.tcgetattr(ser.fd)
+            attrs[2] &= ~termios.HUPCL
+            termios.tcsetattr(ser.fd, termios.TCSANOW, attrs)
+        ser.dtr = False
+        ser.rts = False
+        ser.reset_input_buffer()
+
+        self._ser = ser
+        time.sleep(SERIAL_SETTLE_S)
+
     # startup: detect node ID from ESP32 STATUS_RESP
     def _detect_node_id(self) -> int:
         for attempt in range(5):
@@ -268,13 +328,12 @@ class JetsonDaemon:
                 time.sleep(2.0)
                 self._ser.reset_input_buffer()
                 continue
-            # Loop within the 2s window: dispatch BUNDLE_PUSH/ANTIPKT/etc. that
-            # arrive before STATUS_RESP (common now that the ESP32 pushes bundles).
             deadline = time.monotonic() + 2.0
             found = False
             while time.monotonic() < deadline:
                 remaining = deadline - time.monotonic()
-                result = recv_frame(self._ser, timeout_s=max(0.05, remaining), verbose=True)
+                result = recv_frame(self._ser, timeout_s=max(0.05, remaining), verbose=True,
+                                    on_ascii=self._handle_ascii)
                 if result is None:
                     break
                 cmd, payload = result
@@ -282,10 +341,8 @@ class JetsonDaemon:
                     node_id = struct.unpack_from('<H', payload)[0]
                     print(f"[INIT] Auto-detected node_id={node_id}")
                     return node_id
-                # dispatch other frames (bundle pushes, antipackets) so they aren't lost
                 print(f"[INIT] Got cmd=0x{cmd:02x} while waiting for STATUS_RESP, dispatching")
                 self._dispatch(cmd, payload)
-                # STATUS_RESP may have been consumed inside _handle_pull_req's drain loop
                 if self._detected_node_id is not None:
                     print(f"[INIT] Auto-detected node_id={self._detected_node_id} (via dispatch)")
                     return self._detected_node_id
@@ -293,7 +350,7 @@ class JetsonDaemon:
             time.sleep(1)
         raise RuntimeError("Could not auto-detect node_id from ESP32. Use --node-id to override.")
 
-    #  PULL_REQ handler: drain local store to ESP32
+    # PULL_REQ handler: drain local store to ESP32
     def _handle_pull_req(self) -> None:
         self._expire_bundles()
         with self._lock:
@@ -302,39 +359,34 @@ class JetsonDaemon:
             self._send(HOST_CMD_NO_BUNDLES)
             return
         sent_bundles: list[dict] = []
-        handed_off: list[dict] = []  # accepted by ESP32 (got next PULL_REQ as ack)
+        handed_off: list[dict] = []
         skipped = 0
         for b in pending:
             key = (b['source_node'], b['creation_time'], b['sequence_number'])
             if key in self._delivered:
                 skipped += 1
-                continue  # antipacket arrived for this during drain, don't re-push
+                continue
             data = pack_bundle(b)
             self._send(HOST_CMD_BUNDLE_DATA, data)
             sent_bundles.append(b)
-            # Wait for the ESP32's implicit ACK (another PULL_REQ).
-            # UART log noise from the ESP32 is interleaved on UART0 (bench mode);
-            # use a generous deadline so we don't abort early when the ESP32 logs.
             deadline = time.monotonic() + 2.0
             got_pull = False
             while time.monotonic() < deadline:
                 remaining = deadline - time.monotonic()
-                nxt = recv_frame(self._ser, timeout_s=max(0.05, remaining))
+                nxt = recv_frame(self._ser, timeout_s=max(0.05, remaining),
+                                 on_ascii=self._handle_ascii)
                 if nxt is None:
-                    break  # timeout — ESP32 store full, stop draining
+                    break
                 if nxt[0] == HOST_CMD_PULL_REQ:
                     got_pull = True
                     break
-                self._dispatch(nxt[0], nxt[1])  # antipkt etc., keep waiting
+                self._dispatch(nxt[0], nxt[1])
             if got_pull:
-                handed_off.append(b)  # ESP32 confirmed receipt
+                handed_off.append(b)
             else:
                 break
         self._send(HOST_CMD_NO_BUNDLES)
 
-        # Remove confirmed hand-offs from Jetson store: ESP32 now owns these bundles.
-        # If the ESP32 restarts before forwarding them, they are lost — new bundles
-        # will be generated, and the store won't accumulate stale entries indefinitely.
         if handed_off:
             remove_keys = {(b['source_node'], b['creation_time'], b['sequence_number'])
                            for b in handed_off}
@@ -353,7 +405,7 @@ class JetsonDaemon:
         skip_str = f" skip:{skipped}" if skipped else ""
         print(f"[PULL] Sent {len(sent_bundles)}/{len(pending)} bundles to ESP32{skip_str}  [{src_summary}]")
 
-    # frame dispatcher 
+    # frame dispatcher
     def _dispatch(self, cmd: int, payload: bytes) -> None:
         if cmd == HOST_CMD_PULL_REQ:
             self._handle_pull_req()
@@ -394,16 +446,15 @@ class JetsonDaemon:
 
     def _poll_status(self) -> None:
         self._send(HOST_CMD_QUERY_STATUS)
-        # response arrives asynchronously via _dispatch -> _print_status
 
     # bundle generator
     def _generate_bundle(self) -> None:
         abs_ms = int(time.monotonic() * 1000)
-        creation_time = abs_ms - self._start_ms  # daemon-relative: same clock domain as ESP32 now_ms()
+        creation_time = abs_ms - self._start_ms
         payload = json.dumps({
             'ts': int(time.time()),
             'node': self._node_id,
-            'sensor': round(20.0 + (creation_time % 1000) / 100.0, 1),  # synthetic sensor value
+            'sensor': round(20.0 + (creation_time % 1000) / 100.0, 1),
         }).encode()
         b = {
             'creation_time':   creation_time,
@@ -416,62 +467,91 @@ class JetsonDaemon:
             'hop_count':       0,
             'is_telemetry':    False,
             'payload':         payload,
-            'added_at_ms':     abs_ms,  # absolute monotonic for TTL comparison in _expire_bundles
+            'added_at_ms':     abs_ms,
         }
         if self._add_bundle(b):
             print(f"[GEN] Generated bundle seq:{b['sequence_number']}")
 
-    # main loop
-    def run(self) -> None:
-        print(f"[INIT] Opening {self._port} at {self._baud} baud")
-        self._ser = serial.Serial()
-        self._ser.port     = self._port
-        self._ser.baudrate = self._baud
-        self._ser.timeout  = 0.1
-        self._ser.xonxoff  = False
-        self._ser.dsrdtr   = False
-        self._ser.rtscts   = False
-        self._ser.dtr      = False
-        self._ser.rts      = False
-        self._ser.open()
-
-        # On Linux, disable HUPCL so the kernel never toggles DTR on open/close,
-        # then force DTR low and flush any boot garbage. No-op on Windows.
-        if platform.system() != 'Windows':
-            import termios
-            attrs = termios.tcgetattr(self._ser.fd)
-            attrs[2] &= ~termios.HUPCL
-            termios.tcsetattr(self._ser.fd, termios.TCSANOW, attrs)
-        self._ser.dtr = False
-        self._ser.rts = False
-        self._ser.reset_input_buffer()
-        time.sleep(3.0)  # ESP32-C5 native USB JTAG re-enumerates ~1.5-2s after reset
-
-        if self._node_id is None:
-            self._node_id = self._detect_node_id()
-        print(f"[INIT] Running as node {self._node_id}")
-
+    # inner event loop - exits only by raising (SerialException, RuntimeError, etc.)
+    def _main_loop(self) -> None:
         last_gen    = time.monotonic()
         last_status = time.monotonic()
-        STATUS_INTERVAL_S = 30.0
 
         while True:
-            # Receive one frame (non-blocking style via short timeout)
-            result = recv_frame(self._ser, timeout_s=0.1, verbose=True)
+            # Re-sync state after an ESP32 restart detected via boot banner
+            if self._restart_pending:
+                self._restart_pending = False
+                with self._lock:
+                    dropped = len(self._store)
+                    self._store.clear()
+                self._delivered.clear()
+                print(f"[RESTART] ESP32 restarted - cleared {dropped} bundles and antipacket set")
+                if self._node_id is None:
+                    self._node_id = self._detect_node_id()
+                    print(f"[RESTART] Re-detected node_id={self._node_id}")
+
+            result = recv_frame(self._ser, timeout_s=0.1, verbose=True,
+                                on_ascii=self._handle_ascii)
             if result is not None:
                 cmd, payload = result
                 print(f"[RX] cmd=0x{cmd:02x} len={len(payload)}")
                 self._dispatch(cmd, payload)
 
-            # Periodic bundle generation
             if self._interval > 0 and (time.monotonic() - last_gen) >= self._interval:
                 last_gen = time.monotonic()
                 self._generate_bundle()
 
-            # Periodic ESP32 store status poll
             if (time.monotonic() - last_status) >= STATUS_INTERVAL_S:
                 last_status = time.monotonic()
                 self._poll_status()
+
+    def _close_serial(self) -> None:
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+
+    def _reset_after_disconnect(self) -> None:
+        self._close_serial()
+        if self._node_id_override is None:
+            self._node_id = None
+        with self._lock:
+            dropped = len(self._store)
+            self._store.clear()
+        self._delivered.clear()
+        if dropped:
+            print(f"[RECONNECT] Cleared {dropped} bundles from store")
+        print(f"[RECONNECT] Retrying in {RECONNECT_DELAY_S:.0f}s...")
+
+    def _connect_and_run(self) -> None:
+        """Open the port, detect node ID, then run the event loop. Raises on any failure."""
+        print(f"[INIT] Opening {self._port} at {self._baud} baud")
+        self._open_serial()
+        if self._node_id is None:
+            self._node_id = self._detect_node_id()
+        print(f"[INIT] Running as node {self._node_id}")
+        self._main_loop()
+
+    # outer loop - reconnects forever; exits only on Ctrl+C
+    def run(self) -> None:
+        while True:
+            try:
+                self._connect_and_run()
+            except KeyboardInterrupt:
+                print('\n[INIT] Shutting down.')
+                self._close_serial()
+                return
+            except Exception as e:
+                print(f"[ERROR] {type(e).__name__}: {e}")
+                self._reset_after_disconnect()
+            # sleep separately so Ctrl+C here also exits cleanly
+            try:
+                time.sleep(RECONNECT_DELAY_S)
+            except KeyboardInterrupt:
+                print('\n[INIT] Shutting down.')
+                return
 
 
 def main():
@@ -490,10 +570,7 @@ def main():
         gen_interval=args.interval,
         node_id_override=args.node_id,
     )
-    try:
-        daemon.run()
-    except KeyboardInterrupt:
-        print('\n[INIT] Shutting down.')
+    daemon.run()
 
 
 if __name__ == '__main__':
