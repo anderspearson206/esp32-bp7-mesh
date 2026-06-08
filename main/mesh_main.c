@@ -12,6 +12,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 #include "nvs_flash.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
@@ -53,7 +54,8 @@
 #define HOST_UART_RX_BUF      2048
 #define HOST_SOF              0xAA
 #define HOST_MAX_PAYLOAD      1060      // headroom above sizeof(dtn_bundle_t)
-#define HOST_PULL_INTERVAL_MS 1000      // pull from Jetson store every 1s when peers active
+#define HOST_PULL_INTERVAL_MS    1000   // pull from Jetson store every 1s when peers active
+#define BUNDLE_RETRANSMIT_MS     5000   // retry forwarded but unacked bundles to BS after 5s
 // Jetson -> ESP32
 #define HOST_CMD_TX_BUNDLE    0x01      // payload: raw dtn_bundle_t bytes
 #define HOST_CMD_QUERY_STATUS 0x02      // payload: none
@@ -104,14 +106,16 @@ typedef struct __attribute__((packed)) {
 
 typedef struct {
     dtn_bundle_t bundle;
-    bool is_empty;
-    bool forwarded;
+    bool     is_empty;
+    bool     forwarded;
+    uint32_t forwarded_ms;  // when forwarded was last set true, used for BS retransmit timeout
 } ram_bundle_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t  pkt_type;       // PKT_TYPE_BEACON
     uint16_t node_id;
     uint32_t timestamp_ms;
+    uint32_t boot_id;        // random value generated at startup; changes on every reboot
 } beacon_pkt_t;
 
 typedef struct {
@@ -121,6 +125,7 @@ typedef struct {
     bool     active;
     int32_t  clock_offset_ms; // peer_clock - bs_clock at last beacon; valid when active
     int8_t   rssi_last;
+    uint32_t boot_id;         // last seen boot_id; non-zero once first beacon received
 } peer_entry_t;
 
 // 10-byte bundle identifier used in UART ANTIPKT_NOTIFY frames to Jetson
@@ -215,6 +220,8 @@ static volatile int8_t   ui_last_rssi       = 0;
 static bool lcd_initialized = false;   // set by lcd_init() after successful probe + init
 
 static const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+static uint32_t my_boot_id;   // randomised in app_main, included in every beacon
 
 static SemaphoreHandle_t uart_tx_mutex;     // serialises host_send_frame across rx_process_task and host_uart_task
 
@@ -314,32 +321,46 @@ static void merge_ackmap_locked(const ackmap_pkt_t *ap) {
 }
 
 // Add new peer or refresh last_seen on existing one.
-// Returns true if this was a genuinely new peer (triggers forwarded reset).
+// Returns true if forwarded flags were reset (new peer, timeout return, or boot_id change).
+// *out_restarted is set to true whenever boot_id changed (active or timeout-return), so
+// callers can emit restart signals for any reboot regardless of whether the node timed out first.
 // Must NOT be called while holding data_mutex.
-static bool add_or_refresh_peer(const uint8_t *mac, uint16_t node_id, int8_t rssi) {
+static bool add_or_refresh_peer(const uint8_t *mac, uint16_t node_id, int8_t rssi,
+                                 uint32_t boot_id, bool *out_restarted) {
     uint32_t ts = now_ms();
-    bool is_new = false;
+    bool is_new    = false;
+    bool restarted = false;
 
     xSemaphoreTake(data_mutex, portMAX_DELAY);
 
     for (int i = 0; i < peer_count; i++) {
         if (memcmp(peer_list[i].mac, mac, 6) == 0) {
             bool was_inactive = !peer_list[i].active;
+            // boot_id == 0 means the remote is old firmware with no boot_id field; skip check
+            uint32_t old_boot_id = peer_list[i].boot_id;
+            restarted = (boot_id != 0) &&
+                        (old_boot_id != 0) &&
+                        (old_boot_id != boot_id);
             peer_list[i].last_seen_ms = ts;
             peer_list[i].rssi_last    = rssi;
-            peer_list[i].active = true;
-            if (was_inactive) {
-                // peer returned after timeout, reset forwarded so it gets everything stored
+            peer_list[i].active       = true;
+            peer_list[i].boot_id      = boot_id;
+            if (was_inactive || restarted) {
                 for (int j = 0; j < MAX_BUNDLES_IN_RAM; j++) {
                     if (!bundle_store[j].is_empty) bundle_store[j].forwarded = false;
                 }
                 is_new = true;
             }
             xSemaphoreGive(data_mutex);
+            if (out_restarted) *out_restarted = restarted;
             if (is_new) {
-                register_espnow_peer(mac);  // re add - was deleted on timeout
-                ESP_LOGI(TAG, "Peer returned: node=%u mac=%02x:%02x:%02x:%02x:%02x:%02x rssi=%d",
-                         node_id, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi);
+                if (was_inactive) register_espnow_peer(mac);  // re-add, was deleted on timeout
+                if (restarted)
+                    ESP_LOGW(TAG, "Peer restarted: node=%u (boot_id 0x%08" PRIx32 "->0x%08" PRIx32 ")%s",
+                             node_id, old_boot_id, boot_id, was_inactive ? " [after timeout]" : "");
+                else
+                    ESP_LOGI(TAG, "Peer returned: node=%u mac=%02x:%02x:%02x:%02x:%02x:%02x rssi=%d",
+                             node_id, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi);
             }
             return is_new;
         }
@@ -351,6 +372,7 @@ static bool add_or_refresh_peer(const uint8_t *mac, uint16_t node_id, int8_t rss
         peer_list[peer_count].last_seen_ms = ts;
         peer_list[peer_count].active       = true;
         peer_list[peer_count].rssi_last    = rssi;
+        peer_list[peer_count].boot_id      = boot_id;
         peer_count++;
         is_new = true;
         // new peer, reset forwarded so they receive all stored bundles
@@ -362,6 +384,8 @@ static bool add_or_refresh_peer(const uint8_t *mac, uint16_t node_id, int8_t rss
     }
 
     xSemaphoreGive(data_mutex);
+
+    if (out_restarted) *out_restarted = restarted;
 
     if (is_new) {
         register_espnow_peer(mac);
@@ -412,10 +436,34 @@ static void rx_process_task(void *arg) {
 
         uint8_t pkt_type = item->data[0];
 
-        // beacon packet
-        if (pkt_type == PKT_TYPE_BEACON && item->len >= (uint16_t)sizeof(beacon_pkt_t)) {
+        // beacon packet, accept both old (no boot_id) and new format
+        if (pkt_type == PKT_TYPE_BEACON && item->len >= 7) {  // pkt_type(1)+node_id(2)+timestamp(4)
             beacon_pkt_t *beacon = (beacon_pkt_t *)item->data;
-            add_or_refresh_peer(item->src_mac, beacon->node_id, item->rssi);
+            uint32_t peer_boot_id = (item->len >= (uint16_t)sizeof(beacon_pkt_t))
+                                    ? beacon->boot_id : 0;
+            bool node_restarted = false;
+            bool peer_is_new = add_or_refresh_peer(item->src_mac, beacon->node_id,
+                                                   item->rssi, peer_boot_id, &node_restarted);
+
+            // When a peer restarts, clear its ackmap window at the BS so new (lower)
+            // sequence numbers are not rejected by the sliding-window check.
+            if (peer_is_new && my_id == BASE_STATION_NODE_ID) {
+                // Signal the visualizer to reset per-node metrics. Fires whenever boot_id
+                // changed, including timeout-returns where the node also rebooted.
+                if (node_restarted) {
+                    printf("@NODE_RESTART:%u\n", beacon->node_id);
+                }
+                xSemaphoreTake(data_mutex, portMAX_DELAY);
+                for (int k = 0; k < MAX_ACK_SOURCES; k++) {
+                    if (ack_store[k].valid && ack_store[k].source_node == beacon->node_id) {
+                        ack_store[k].valid = false;
+                        memset(ack_store[k].bitmap, 0, ACKMAP_BITMAP_BYTES);
+                        ESP_LOGW(TAG, "Cleared ack window for restarted/returned node %u", beacon->node_id);
+                        break;
+                    }
+                }
+                xSemaphoreGive(data_mutex);
+            }
 
             // update peer to peer clock and
             if (my_id == BASE_STATION_NODE_ID) {
@@ -703,6 +751,7 @@ static void beacon_task(void *arg) {
             .pkt_type     = PKT_TYPE_BEACON,
             .node_id      = my_id,
             .timestamp_ms = now_ms(),
+            .boot_id      = my_boot_id,
         };
         esp_now_send(BROADCAST_MAC, (uint8_t *)&pkt, sizeof(pkt));
         vTaskDelay(pdMS_TO_TICKS(BEACON_INTERVAL_MS));
@@ -811,7 +860,8 @@ static void bundle_tx_task(void *arg) {
         // snapshot active peer MACs (brief mutex hold), then send without holding mutex
         uint8_t  peer_macs[MAX_PEERS][6];
         uint16_t peer_ids[MAX_PEERS];
-        int n_active = 0;
+        int  n_active   = 0;
+        bool bs_is_peer = false;
 
         xSemaphoreTake(data_mutex, portMAX_DELAY);
         for (int i = 0; i < peer_count; i++) {
@@ -819,6 +869,7 @@ static void bundle_tx_task(void *arg) {
                 memcpy(peer_macs[n_active], peer_list[i].mac, 6);
                 peer_ids[n_active] = peer_list[i].node_id;
                 n_active++;
+                if (peer_list[i].node_id == BASE_STATION_NODE_ID) bs_is_peer = true;
             }
         }
         xSemaphoreGive(data_mutex);
@@ -848,6 +899,15 @@ static void bundle_tx_task(void *arg) {
                 bundle_store[i].is_empty = true;
                 xSemaphoreGive(data_mutex);
                 continue;
+            }
+
+            // If BS is reachable and this bundle has been forwarded but not acked for
+            // too long, reset forwarded so it gets re-sent.  ESP-NOW has no delivery
+            // guarantee, so ackmaps can be silently lost.
+            if (bundle_store[i].forwarded && bs_is_peer) {
+                if ((ts - bundle_store[i].forwarded_ms) >= BUNDLE_RETRANSMIT_MS) {
+                    bundle_store[i].forwarded = false;
+                }
             }
 
             if (bundle_store[i].forwarded || n_active == 0) {
@@ -880,7 +940,10 @@ static void bundle_tx_task(void *arg) {
             if (sent_to_anyone) {
                 rnd_bundles++;
                 xSemaphoreTake(data_mutex, portMAX_DELAY);
-                if (!bundle_store[i].is_empty) bundle_store[i].forwarded = true;
+                if (!bundle_store[i].is_empty) {
+                    bundle_store[i].forwarded    = true;
+                    bundle_store[i].forwarded_ms = ts;
+                }
                 xSemaphoreGive(data_mutex);
             }
         }
@@ -1542,6 +1605,9 @@ void app_main(void) {
         gpio_set_level(LCD_SCL_PIN, 1);
         lcd_init();
     }
+
+    my_boot_id = esp_random();
+    ESP_LOGI(TAG, "boot_id=0x%08" PRIx32, my_boot_id);
 
     init_host_uart();
     init_bundle_store();

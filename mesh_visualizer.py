@@ -22,6 +22,8 @@ antipkt_fail_counts = defaultdict(int)   # source_node_str -> count  (excluded f
 ferry_dup_counts    = defaultdict(int)   # source_node_str -> count  (counted as deliveries)
 node_rssi           = defaultdict(list)  # source_node_str -> [rssi_int, ...]  (from @NET:)
 node_seq_range      = {}                 # source_node_str -> {'min': int, 'max': int}
+node_boot_count     = defaultdict(int)   # node_id -> number of restarts seen this session
+node_boot_history   = defaultdict(list)  # node_id -> list of archived boot records
 start_time          = time.time()
 
 
@@ -47,16 +49,51 @@ def read_line_or_frame(ser):
             return buf.decode('utf-8', errors='ignore').strip() or None
 
 
+def reset_session_state():
+    """Wipe all per-session tracking state and restart the session clock.
+    Always save the current summary before calling this."""
+    global start_time
+    with lock:
+        G.clear()
+        recent_transfers.clear()
+        node_latencies.clear()
+        event_log.clear()
+        delivered_bundles.clear()
+        antipkt_fail_counts.clear()
+        ferry_dup_counts.clear()
+        node_rssi.clear()
+        node_seq_range.clear()
+        node_boot_count.clear()
+        node_boot_history.clear()
+        start_time = time.time()
+    print("[VISUALIZER] Session state cleared - starting fresh.")
+
+
 def serial_reader_thread(port):
     """Read serial data from the BS port and update shared state."""
+    first_connect = True
     while True:
         try:
             ser = serial.Serial(port, BAUD_RATE, timeout=1)
+            if not first_connect:
+                # BS came back after a disconnect, save old session and reset
+                print(f"[VISUALIZER] Reconnected to {port} - saving session and resetting state.")
+                generate_summary()
+                reset_session_state()
+            first_connect = False
             print(f"Connected to {port}. Listening for DTN telemetry...")
 
             while True:
                 line = read_line_or_frame(ser)
                 if not line:
+                    continue
+
+                # Detect BS reboot via its boot-time log line (covers software resets
+                # where the serial connection stays open and no SerialException fires).
+                if "I am the Base Station" in line:
+                    print(f"[VISUALIZER] BS reboot detected in serial stream - saving and resetting.")
+                    generate_summary()
+                    reset_session_state()
                     continue
 
                 if line.startswith("@"):
@@ -137,6 +174,37 @@ def serial_reader_thread(port):
                         except ValueError:
                             pass
 
+                # node restarted (boot_id changed): reset per-node metrics so stale sequence
+                # data from before the reboot doesn't corrupt delivery rate estimates
+                elif line.startswith("@NODE_RESTART:"):
+                    parts = line.split(':')
+                    if len(parts) >= 2:
+                        node_id = parts[1]
+                        with lock:
+                            archived_boot = node_boot_count[node_id]
+                            lats = list(node_latencies.get(node_id, []))
+                            boot_record = {
+                                'boot':          archived_boot,
+                                'seq_range':     dict(node_seq_range[node_id]) if node_id in node_seq_range else None,
+                                'delivered':     {seq: info for (src, seq), info in delivered_bundles.items() if src == node_id},
+                                'antipkt_fails': antipkt_fail_counts.get(node_id, 0),
+                                'ferry_dups':    ferry_dup_counts.get(node_id, 0),
+                                'avg_rssi':      sum(node_rssi[node_id]) / len(node_rssi[node_id]) if node_rssi.get(node_id) else None,
+                                'avg_latency':   sum(lats) / len(lats) if lats else None,
+                            }
+                            node_boot_history[node_id].append(boot_record)
+                            node_boot_count[node_id] += 1
+                            new_boot = node_boot_count[node_id]
+                            node_latencies.pop(node_id, None)
+                            node_seq_range.pop(node_id, None)
+                            node_rssi.pop(node_id, None)
+                            antipkt_fail_counts.pop(node_id, None)
+                            ferry_dup_counts.pop(node_id, None)
+                            stale_keys = [k for k in delivered_bundles if k[0] == node_id]
+                            for k in stale_keys:
+                                del delivered_bundles[k]
+                        print(f"[VISUALIZER] Node {node_id} restarted - boot {archived_boot} archived, now on boot {new_boot}.")
+
                 # antipacket failure, same forwarder re-sent the bundle, excluded from delivery totals
                 elif line.startswith("@ANTIPKT_FAIL:"):
                     # Format: @ANTIPKT_FAIL:<src>:<seq>:<prev>
@@ -159,6 +227,11 @@ def serial_reader_thread(port):
         except Exception as e:
             print(f"Unexpected error on {port}: {e}")
             time.sleep(2)
+        finally:
+            try:
+                ser.close()  # type: ignore[possibly-undefined]
+            except Exception:
+                pass
 
 
 def generate_summary():
@@ -190,7 +263,7 @@ def generate_summary():
         W = 58
         lines = []
         lines.append("=" * W)
-        lines.append("  DTN Mesh Network  —  Session Summary Report")
+        lines.append("  DTN Mesh Network  -  Session Summary Report")
         lines.append(f"  Generated : {now.strftime('%Y-%m-%d %H:%M:%S')}")
         h, rem = divmod(duration_s, 3600)
         m, s   = divmod(rem, 60)
@@ -256,6 +329,29 @@ def generate_summary():
                 )
             lines.append("")
 
+        # per-node restart history
+        nodes_with_restarts = [n for n in all_nodes if node_boot_history.get(n)]
+        if nodes_with_restarts:
+            lines.append("Node Restart History")
+            for node in nodes_with_restarts:
+                history    = node_boot_history[node]
+                cur_boot   = node_boot_count[node]
+                lines.append(f"  Node {node} - {len(history)} restart(s); currently boot {cur_boot}")
+                for rec in history:
+                    r        = rec['seq_range']
+                    seq_str  = f"[{r['min']}..{r['max']}]" if r else "no data"
+                    n_del    = len(rec['delivered'])
+                    lat_str  = f"{rec['avg_latency']:.0f} ms"  if rec['avg_latency'] is not None else "N/A"
+                    rssi_str = f"{rec['avg_rssi']:.1f} dBm"    if rec['avg_rssi']    is not None else "N/A"
+                    extra    = ""
+                    if rec['antipkt_fails']: extra += f"  ap_fail:{rec['antipkt_fails']}"
+                    if rec['ferry_dups']:    extra += f"  dup:{rec['ferry_dups']}"
+                    lines.append(
+                        f"    Boot {rec['boot']}: seq {seq_str}  {n_del} pkts  "
+                        f"avg {lat_str}  rssi {rssi_str}{extra}"
+                    )
+            lines.append("")
+
         #  notes
         lines.append("Notes")
         lines.append("  Unique delivered  : distinct (source, seq) pairs from @METRIC events.")
@@ -300,7 +396,7 @@ def update_graph(frame):
         ax_log.axis('off')
         ax_log.set_title("Bundle Events / Delivery Metrics", fontsize=10, fontweight='bold')
         y = 0.97
-        ax_log.text(0.02, y, "— Recent Deliveries —", transform=ax_log.transAxes,
+        ax_log.text(0.02, y, "- Recent Deliveries -", transform=ax_log.transAxes,
                     fontsize=8, color='black', verticalalignment='top', fontweight='bold')
         y -= 0.05
         for entry in list(reversed(event_log))[:10]:
@@ -320,7 +416,7 @@ def update_graph(frame):
 
         # delivery metrics
         y_stats = 0.42
-        ax_log.text(0.02, y_stats, "— Delivery Metrics —", transform=ax_log.transAxes,
+        ax_log.text(0.02, y_stats, "- Delivery Metrics -", transform=ax_log.transAxes,
                     fontsize=8, color='black', verticalalignment='top', fontweight='bold')
         y_stats -= 0.05
 
@@ -334,12 +430,14 @@ def update_graph(frame):
         for (src, _seq), info in delivered_bundles.items():
             per_source[src].append(info['latency_ms'])
         for src, lats in sorted(per_source.items()):
-            avg     = sum(lats) / len(lats)
-            ap_fail = antipkt_fail_counts.get(src, 0)
-            dup     = ferry_dup_counts.get(src, 0)
-            extra   = ""
-            if ap_fail: extra += f"  ap_fail:{ap_fail}"
-            if dup:     extra += f"  dup:{dup}"
+            avg      = sum(lats) / len(lats)
+            ap_fail  = antipkt_fail_counts.get(src, 0)
+            dup      = ferry_dup_counts.get(src, 0)
+            restarts = node_boot_count.get(src, 0)
+            extra    = ""
+            if restarts: extra += f"  restarts:{restarts}"
+            if ap_fail:  extra += f"  ap_fail:{ap_fail}"
+            if dup:      extra += f"  dup:{dup}"
             ax_log.text(0.02, y_stats,
                         f"  Node {src}: {len(lats)} pkts  avg {avg:.0f} ms{extra}",
                         transform=ax_log.transAxes, fontsize=8, color='darkgreen',

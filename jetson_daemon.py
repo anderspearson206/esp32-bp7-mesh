@@ -194,6 +194,8 @@ class JetsonDaemon:
 
         self._delivered: set[tuple] = set()  # (source_node, creation_time, seq) tuples
 
+        self._detected_node_id: Optional[int] = None  # set by _dispatch when STATUS_RESP seen
+
         self._ser: serial.Serial | None = None
         self._uart_lock = threading.Lock()  # serialises UART writes
 
@@ -283,6 +285,10 @@ class JetsonDaemon:
                 # dispatch other frames (bundle pushes, antipackets) so they aren't lost
                 print(f"[INIT] Got cmd=0x{cmd:02x} while waiting for STATUS_RESP, dispatching")
                 self._dispatch(cmd, payload)
+                # STATUS_RESP may have been consumed inside _handle_pull_req's drain loop
+                if self._detected_node_id is not None:
+                    print(f"[INIT] Auto-detected node_id={self._detected_node_id} (via dispatch)")
+                    return self._detected_node_id
             print(f"[INIT] No STATUS_RESP in 2s window, retrying...")
             time.sleep(1)
         raise RuntimeError("Could not auto-detect node_id from ESP32. Use --node-id to override.")
@@ -296,6 +302,7 @@ class JetsonDaemon:
             self._send(HOST_CMD_NO_BUNDLES)
             return
         sent_bundles: list[dict] = []
+        handed_off: list[dict] = []  # accepted by ESP32 (got next PULL_REQ as ack)
         skipped = 0
         for b in pending:
             key = (b['source_node'], b['creation_time'], b['sequence_number'])
@@ -314,14 +321,31 @@ class JetsonDaemon:
                 remaining = deadline - time.monotonic()
                 nxt = recv_frame(self._ser, timeout_s=max(0.05, remaining))
                 if nxt is None:
-                    break  # timeout , ESP32 store full, stop draining
+                    break  # timeout — ESP32 store full, stop draining
                 if nxt[0] == HOST_CMD_PULL_REQ:
                     got_pull = True
                     break
                 self._dispatch(nxt[0], nxt[1])  # antipkt etc., keep waiting
-            if not got_pull:
+            if got_pull:
+                handed_off.append(b)  # ESP32 confirmed receipt
+            else:
                 break
         self._send(HOST_CMD_NO_BUNDLES)
+
+        # Remove confirmed hand-offs from Jetson store: ESP32 now owns these bundles.
+        # If the ESP32 restarts before forwarding them, they are lost — new bundles
+        # will be generated, and the store won't accumulate stale entries indefinitely.
+        if handed_off:
+            remove_keys = {(b['source_node'], b['creation_time'], b['sequence_number'])
+                           for b in handed_off}
+            with self._lock:
+                before = len(self._store)
+                self._store = [b for b in self._store
+                               if (b['source_node'], b['creation_time'], b['sequence_number'])
+                               not in remove_keys]
+            print(f"[PULL] Cleared {before - len(self._store)} handed-off bundles "
+                  f"(store now {len(self._store)})")
+
         by_src: dict[int, int] = {}
         for b in sent_bundles:
             by_src[b['source_node']] = by_src.get(b['source_node'], 0) + 1
@@ -353,6 +377,8 @@ class JetsonDaemon:
 
         elif cmd == HOST_CMD_STATUS_RESP:
             self._print_status(payload)
+            if len(payload) >= STATUS_SIZE:
+                self._detected_node_id = struct.unpack_from('<H', payload)[0]
 
         else:
             print(f"[WARN] Unknown cmd 0x{cmd:02x} len={len(payload)}")
