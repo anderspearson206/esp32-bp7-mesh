@@ -354,12 +354,13 @@ class JetsonDaemon:
     def _handle_pull_req(self) -> None:
         self._expire_bundles()
         with self._lock:
-            pending = list(self._store)
+            # Only send bundles not yet handed off, keep all until antipacket clears them.
+            pending = [b for b in self._store if not b.get('handed_off', False)]
         if not pending:
             self._send(HOST_CMD_NO_BUNDLES)
             return
         sent_bundles: list[dict] = []
-        handed_off: list[dict] = []
+        n_handed = 0
         skipped = 0
         for b in pending:
             key = (b['source_node'], b['creation_time'], b['sequence_number'])
@@ -382,20 +383,14 @@ class JetsonDaemon:
                     break
                 self._dispatch(nxt[0], nxt[1])
             if got_pull:
-                handed_off.append(b)
+                b['handed_off'] = True
+                n_handed += 1
             else:
                 break
         self._send(HOST_CMD_NO_BUNDLES)
 
-        if handed_off:
-            remove_keys = {(b['source_node'], b['creation_time'], b['sequence_number'])
-                           for b in handed_off}
-            with self._lock:
-                before = len(self._store)
-                self._store = [b for b in self._store
-                               if (b['source_node'], b['creation_time'], b['sequence_number'])
-                               not in remove_keys]
-            print(f"[PULL] Cleared {before - len(self._store)} handed-off bundles "
+        if n_handed:
+            print(f"[PULL] Marked {n_handed} bundles handed-off "
                   f"(store now {len(self._store)})")
 
         by_src: dict[int, int] = {}
@@ -419,6 +414,11 @@ class JetsonDaemon:
             b = unpack_bundle(payload)
             if b:
                 b['added_at_ms'] = int(time.monotonic() * 1000)
+                # ESP32 already holds this bundle (received from air), mark handed_off so
+                # PULL won't re-inject it - that races with in-flight ackmap clears and
+                # causes FERRY_DUPs.  On ESP32 restart, handed_off is cleared and the
+                # Jetson re-injects everything cleanly.
+                b['handed_off'] = True
                 added = self._add_bundle(b)
                 if added:
                     print(f"[PUSH] Neighbor bundle stored: src:{b['source_node']} seq:{b['sequence_number']}")
@@ -478,14 +478,18 @@ class JetsonDaemon:
         last_status = time.monotonic()
 
         while True:
-            # Re-sync state after an ESP32 restart detected via boot banner
+            # Re-sync state after an ESP32 restart detected via boot banner.
+            # Don't clear the store, the Jetson is the primary store.
+            # Reset handed_off so everything gets re-sent to the fresh ESP32.
             if self._restart_pending:
                 self._restart_pending = False
+                self._seq = itertools.count(start=1)
                 with self._lock:
-                    dropped = len(self._store)
-                    self._store.clear()
+                    for b in self._store:
+                        b['handed_off'] = False
+                    count = len(self._store)
                 self._delivered.clear()
-                print(f"[RESTART] ESP32 restarted - cleared {dropped} bundles and antipacket set")
+                print(f"[RESTART] ESP32 restarted - reset {count} bundles for retransmit, cleared antipacket set")
                 if self._node_id is None:
                     self._node_id = self._detect_node_id()
                     print(f"[RESTART] Re-detected node_id={self._node_id}")

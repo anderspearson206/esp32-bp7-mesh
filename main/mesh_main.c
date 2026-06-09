@@ -23,7 +23,7 @@
  *                Constants / Configuration
  *******************************************************/
 #define BASE_STATION_NODE_ID  23768
-#define MAX_BUNDLES_IN_RAM    100
+#define MAX_BUNDLES_IN_RAM    150
 #define BUNDLE_PAYLOAD_SIZE   1024
 #define MAX_PEERS             10
 #define ESPNOW_CHANNEL        36      // 5GHz UNII-1, 5180 MHz, no DFS
@@ -346,8 +346,50 @@ static bool add_or_refresh_peer(const uint8_t *mac, uint16_t node_id, int8_t rss
             peer_list[i].active       = true;
             peer_list[i].boot_id      = boot_id;
             if (was_inactive || restarted) {
+                // On a true restart with BS in range, the peer's old forwarded bundles
+                // were already delivered to BS.  Discard them now rather than waiting
+                // ~130s for the ackmap window to re-cover those seq numbers - leaving
+                // them causes BUNDLE_RETRANSMIT_MS to re-send every 5s - FERRY_DUPs.
+                bool bs_active = false;
+                if (restarted) {
+                    for (int k = 0; k < peer_count; k++) {
+                        if (peer_list[k].active &&
+                            peer_list[k].node_id == BASE_STATION_NODE_ID) {
+                            bs_active = true;
+                            break;
+                        }
+                    }
+                }
                 for (int j = 0; j < MAX_BUNDLES_IN_RAM; j++) {
-                    if (!bundle_store[j].is_empty) bundle_store[j].forwarded = false;
+                    if (bundle_store[j].is_empty) continue;
+                    if (bundle_store[j].bundle.source_node == node_id) {
+                        if (bs_active && bundle_store[j].forwarded) {
+                            antipkt_id_t notif = {
+                                .source_node     = bundle_store[j].bundle.source_node,
+                                .creation_time   = bundle_store[j].bundle.creation_time,
+                                .sequence_number = bundle_store[j].bundle.sequence_number,
+                            };
+                            bundle_store[j].is_empty = true;
+                            xQueueSend(antipkt_notify_q, &notif, 0);
+                        }
+                        // forwarded=false or BS not in range: keep for potential ferry
+                    } else {
+                        bundle_store[j].forwarded = false;
+                    }
+                }
+                // Clear stale ack window for this source so we don't forward a
+                // high-seq_base ackmap to the freshly rebooted peer, which would
+                // cause it to discard its own new (low seq) bundles via the
+                // "window slid past" check.
+                if (restarted) {
+                    for (int k = 0; k < MAX_ACK_SOURCES; k++) {
+                        if (ack_store[k].valid && ack_store[k].source_node == node_id) {
+                            ack_store[k].valid = false;
+                            ack_store[k].dirty = false;
+                            memset(ack_store[k].bitmap, 0, ACKMAP_BITMAP_BYTES);
+                            break;
+                        }
+                    }
                 }
                 is_new = true;
             }
@@ -375,9 +417,14 @@ static bool add_or_refresh_peer(const uint8_t *mac, uint16_t node_id, int8_t rss
         peer_list[peer_count].boot_id      = boot_id;
         peer_count++;
         is_new = true;
-        // new peer, reset forwarded so they receive all stored bundles
+        // new peer: reset forwarded on bundles not sourced from this peer so they
+        // receive everything we have.  Skip source==node_id to avoid echoing the
+        // peer's own bundles back and re-sending them to the BS unnecessarily.
         for (int i = 0; i < MAX_BUNDLES_IN_RAM; i++) {
-            if (!bundle_store[i].is_empty) bundle_store[i].forwarded = false;
+            if (!bundle_store[i].is_empty &&
+                bundle_store[i].bundle.source_node != node_id) {
+                bundle_store[i].forwarded = false;
+            }
         }
     } else {
         ESP_LOGW(TAG, "Peer list full, ignoring node %u", node_id);
@@ -452,6 +499,14 @@ static void rx_process_task(void *arg) {
                 // changed, including timeout-returns where the node also rebooted.
                 if (node_restarted) {
                     printf("@NODE_RESTART:%u\n", beacon->node_id);
+                    // Purge bs_delivered ring buffer entries for this source so that bundles
+                    // from the fresh boot (seq resets to 0, creation_time restarts near 0)
+                    // aren't falsely rejected as duplicates of pre-restart bundles.
+                    for (int k = 0; k < MAX_BS_DELIVERED; k++) {
+                        if (bs_delivered[k].source_node == beacon->node_id) {
+                            bs_delivered[k].source_node = 0;
+                        }
+                    }
                 }
                 xSemaphoreTake(data_mutex, portMAX_DELAY);
                 for (int k = 0; k < MAX_ACK_SOURCES; k++) {
@@ -720,15 +775,21 @@ static void rx_process_task(void *arg) {
                 if (bundle_store[i].is_empty) continue;
                 dtn_bundle_t *b = &bundle_store[i].bundle;
                 if (b->source_node != ap->source_node) continue;
-                if (b->sequence_number < ap->seq_base) continue;
-                uint32_t off = b->sequence_number - ap->seq_base;
-                if (off >= (uint32_t)(blen * 8)) continue;
-                if (!(ap->bitmap[off / 8] & (1u << (off % 8)))) continue;
                 antipkt_id_t notif = {
                     .source_node     = b->source_node,
                     .creation_time   = b->creation_time,
                     .sequence_number = b->sequence_number,
                 };
+                if (b->sequence_number < ap->seq_base) {
+                    // BS ack window has slid past this seq - it was delivered, free it.
+                    bundle_store[i].is_empty = true;
+                    n_freed++;
+                    xQueueSend(antipkt_notify_q, &notif, 0);
+                    continue;
+                }
+                uint32_t off = b->sequence_number - ap->seq_base;
+                if (off >= (uint32_t)(blen * 8)) continue;
+                if (!(ap->bitmap[off / 8] & (1u << (off % 8)))) continue;
                 bundle_store[i].is_empty = true;
                 n_freed++;
                 xQueueSend(antipkt_notify_q, &notif, 0);
@@ -954,7 +1015,7 @@ static void bundle_tx_task(void *arg) {
         // All nodes: forward any dirty ackmap entries to active peers.
         // BS sends entries it just marked from deliveries; rovers forward entries they
         // received from BS (or from other rovers) to peers they encounter.
-        // origin_node_id is always BASE_STATION_NODE_ID — these ACKs originate at the BS.
+        // origin_node_id is always BASE_STATION_NODE_ID - these ACKs originate at the BS.
         if (n_active > 0) {
             for (int i = 0; i < MAX_ACK_SOURCES; i++) {
                 xSemaphoreTake(data_mutex, portMAX_DELAY);

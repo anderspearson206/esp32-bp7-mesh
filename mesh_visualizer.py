@@ -24,6 +24,7 @@ node_rssi           = defaultdict(list)  # source_node_str -> [rssi_int, ...]  (
 node_seq_range      = {}                 # source_node_str -> {'min': int, 'max': int}
 node_boot_count     = defaultdict(int)   # node_id -> number of restarts seen this session
 node_boot_history   = defaultdict(list)  # node_id -> list of archived boot records
+node_boot_start_time = {}                # node_id -> time.time() of first activity in current boot
 start_time          = time.time()
 
 
@@ -65,8 +66,81 @@ def reset_session_state():
         node_seq_range.clear()
         node_boot_count.clear()
         node_boot_history.clear()
+        node_boot_start_time.clear()
         start_time = time.time()
     print("[VISUALIZER] Session state cleared - starting fresh.")
+
+
+def save_boot_summary(node_id: str, boot_num: int, boot_record: dict) -> None:
+    """Write a summary file for one completed boot of a single node."""
+    now = datetime.now()
+    duration_s = boot_record.get('duration_s', 0)
+    lats = boot_record.get('all_latencies', [])
+    delivered = boot_record.get('delivered', {})
+    seq_range = boot_record.get('seq_range')
+    ferry_dups = boot_record.get('ferry_dups', 0)
+    ap_fails = boot_record.get('antipkt_fails', 0)
+    avg_rssi = boot_record.get('avg_rssi')
+
+    unique_count = len(delivered)
+    h, rem = divmod(duration_s, 3600)
+    m, s = divmod(rem, 60)
+    dur_str = f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
+
+    W = 58
+    lines = []
+    lines.append("=" * W)
+    lines.append(f"  DTN Mesh Network  -  Node {node_id} Boot {boot_num} Summary")
+    lines.append(f"  Saved    : {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"  Duration : {dur_str}")
+    lines.append("=" * W)
+    lines.append("")
+
+    lines.append("Deliveries")
+    lines.append(f"  Unique delivered    : {unique_count}")
+    lines.append(f"  Ferry duplicates    : {ferry_dups}")
+    lines.append(f"  Antipacket failures : {ap_fails}")
+    lines.append("")
+
+    lines.append("Latency")
+    if lats:
+        lines.append(f"  Average : {sum(lats)/len(lats):.0f} ms")
+        lines.append(f"  Min     : {min(lats)} ms")
+        lines.append(f"  Max     : {max(lats)} ms")
+    else:
+        lines.append("  No data")
+    lines.append("")
+
+    lines.append("RSSI")
+    lines.append(f"  Average : {avg_rssi:.1f} dBm" if avg_rssi is not None else "  No data")
+    lines.append("")
+
+    if seq_range:
+        lines.append(f"Sequence Range : [{seq_range['min']}..{seq_range['max']}]")
+        possible = seq_range['max'] - seq_range['min'] + 1
+        undelivered = max(0, possible - unique_count)
+        pct = 100.0 * unique_count / possible if possible > 0 else 0.0
+        lines.append("Delivery Estimate")
+        lines.append(f"  Possible    : {possible}")
+        lines.append(f"  Delivered   : {unique_count}")
+        lines.append(f"  Undelivered : {undelivered}")
+        lines.append(f"  Rate        : {pct:.1f}%")
+    else:
+        lines.append("Sequence Range : no data")
+    lines.append("")
+    lines.append("=" * W)
+
+    report = "\n".join(lines)
+    print(f"\n{report}")
+
+    os.makedirs("bs_reports", exist_ok=True)
+    filename = f"bs_reports/node_{node_id}_boot{boot_num}.txt"
+    try:
+        with open(filename, 'w') as f:
+            f.write(report + "\n")
+        print(f"[Boot summary saved to {filename}]")
+    except OSError as e:
+        print(f"[Could not save boot summary: {e}]")
 
 
 def serial_reader_thread(port):
@@ -109,6 +183,8 @@ def serial_reader_thread(port):
                             edges_to_remove = [(u, v) for u, v in G.edges() if u == node_id]
                             G.remove_edges_from(edges_to_remove)
                             G.add_node(node_id, last_seen=current_time)
+                            if node_id not in node_boot_start_time:
+                                node_boot_start_time[node_id] = current_time
                             if parent != "0":
                                 G.add_node(parent)
                                 G.add_edge(node_id, parent, link_type='mesh', rssi=rssi)
@@ -182,15 +258,21 @@ def serial_reader_thread(port):
                         node_id = parts[1]
                         with lock:
                             archived_boot = node_boot_count[node_id]
+                            now_t = time.time()
+                            boot_start = node_boot_start_time.get(node_id, start_time)
+                            duration_s = int(now_t - boot_start)
                             lats = list(node_latencies.get(node_id, []))
+                            rssi_vals = list(node_rssi.get(node_id, []))
                             boot_record = {
-                                'boot':          archived_boot,
-                                'seq_range':     dict(node_seq_range[node_id]) if node_id in node_seq_range else None,
-                                'delivered':     {seq: info for (src, seq), info in delivered_bundles.items() if src == node_id},
-                                'antipkt_fails': antipkt_fail_counts.get(node_id, 0),
-                                'ferry_dups':    ferry_dup_counts.get(node_id, 0),
-                                'avg_rssi':      sum(node_rssi[node_id]) / len(node_rssi[node_id]) if node_rssi.get(node_id) else None,
-                                'avg_latency':   sum(lats) / len(lats) if lats else None,
+                                'boot':           archived_boot,
+                                'duration_s':     duration_s,
+                                'seq_range':      dict(node_seq_range[node_id]) if node_id in node_seq_range else None,
+                                'delivered':      {seq: info for (src, seq), info in delivered_bundles.items() if src == node_id},
+                                'antipkt_fails':  antipkt_fail_counts.get(node_id, 0),
+                                'ferry_dups':     ferry_dup_counts.get(node_id, 0),
+                                'avg_rssi':       sum(rssi_vals) / len(rssi_vals) if rssi_vals else None,
+                                'avg_latency':    sum(lats) / len(lats) if lats else None,
+                                'all_latencies':  lats,
                             }
                             node_boot_history[node_id].append(boot_record)
                             node_boot_count[node_id] += 1
@@ -203,7 +285,9 @@ def serial_reader_thread(port):
                             stale_keys = [k for k in delivered_bundles if k[0] == node_id]
                             for k in stale_keys:
                                 del delivered_bundles[k]
+                            node_boot_start_time[node_id] = now_t
                         print(f"[VISUALIZER] Node {node_id} restarted - boot {archived_boot} archived, now on boot {new_boot}.")
+                        save_boot_summary(node_id, archived_boot, boot_record)
 
                 # antipacket failure, same forwarder re-sent the bundle, excluded from delivery totals
                 elif line.startswith("@ANTIPKT_FAIL:"):
@@ -241,23 +325,46 @@ def generate_summary():
     with lock:
         duration_s = int(time.time() - start_time)
 
-        # Compute per-node metrics from delivered_bundles
+        # Compute per-node metrics from delivered_bundles (current boot only)
         per_node_seqs = defaultdict(set)
         per_node_lats = defaultdict(list)
         for (src, seq), info in delivered_bundles.items():
             per_node_seqs[src].add(seq)
             per_node_lats[src].append(info['latency_ms'])
 
-        total_unique     = sum(len(s) for s in per_node_seqs.values())
-        total_ferry_dups = sum(ferry_dup_counts.values())
+        # Aggregate archived boot history into per-node totals
+        arch_unique  = defaultdict(int)
+        arch_lats    = defaultdict(list)
+        arch_fdups   = defaultdict(int)
+        arch_apfails = defaultdict(int)
+        arch_possible = defaultdict(int)
+        for nid, history in node_boot_history.items():
+            for rec in history:
+                arch_unique[nid]  += len(rec['delivered'])
+                arch_lats[nid].extend(rec.get('all_latencies', []))
+                arch_fdups[nid]   += rec.get('ferry_dups', 0)
+                arch_apfails[nid] += rec.get('antipkt_fails', 0)
+                if rec['seq_range']:
+                    r = rec['seq_range']
+                    arch_possible[nid] += r['max'] - r['min'] + 1
+
+        all_nids = (set(per_node_seqs) | set(arch_unique) | set(ferry_dup_counts)
+                    | set(antipkt_fail_counts) | set(node_seq_range))
+        agg_unique   = {n: len(per_node_seqs.get(n, set())) + arch_unique[n]  for n in all_nids}
+        agg_lats     = {n: list(per_node_lats.get(n, [])) + arch_lats[n]      for n in all_nids}
+        agg_fdups    = {n: ferry_dup_counts.get(n, 0)     + arch_fdups[n]     for n in all_nids}
+        agg_apfails  = {n: antipkt_fail_counts.get(n, 0)  + arch_apfails[n]   for n in all_nids}
+        agg_possible = {n: (node_seq_range[n]['max'] - node_seq_range[n]['min'] + 1
+                            if n in node_seq_range else 0) + arch_possible[n]  for n in all_nids}
+
+        total_unique     = sum(agg_unique.values())
+        total_ferry_dups = sum(agg_fdups.values())
         total_delivered  = total_unique + total_ferry_dups
-        total_ap_fails   = sum(antipkt_fail_counts.values())
+        total_ap_fails   = sum(agg_apfails.values())
 
-        all_nodes = sorted(
-            set(per_node_seqs) | set(ferry_dup_counts) | set(antipkt_fail_counts) | set(node_seq_range)
-        )
+        all_nodes = sorted(all_nids)
 
-        all_lats_flat = [info['latency_ms'] for info in delivered_bundles.values()]
+        all_lats_flat = [lat for lats in agg_lats.values() for lat in lats]
         all_rssi_flat = [v for vals in node_rssi.values() for v in vals]
 
         W = 58
@@ -293,10 +400,10 @@ def generate_summary():
         lines.append(hdr)
         lines.append("  " + "-" * (len(hdr) - 2))
         for node in all_nodes:
-            unique_count = len(per_node_seqs.get(node, set()))
-            ferry_dups   = ferry_dup_counts.get(node, 0)
-            ap_fails     = antipkt_fail_counts.get(node, 0)
-            lats         = per_node_lats.get(node, [])
+            unique_count = agg_unique.get(node, 0)
+            ferry_dups   = agg_fdups.get(node, 0)
+            ap_fails     = agg_apfails.get(node, 0)
+            lats         = agg_lats.get(node, [])
             rssi_vals    = node_rssi.get(node, [])
             lat_str      = f"{sum(lats)/len(lats):.0f} ms"  if lats     else "N/A"
             rssi_str     = f"{sum(rssi_vals)/len(rssi_vals):.1f} dBm" if rssi_vals else "N/A"
@@ -311,17 +418,16 @@ def generate_summary():
             )
         lines.append("")
 
-        # delivery estimate
-        nodes_with_range = [n for n in all_nodes if n in node_seq_range]
-        if nodes_with_range:
-            lines.append("Delivery Estimate  (based on observed seq range)")
+        # delivery estimate (aggregated across all boots)
+        nodes_with_possible = [n for n in all_nodes if agg_possible.get(n, 0) > 0]
+        if nodes_with_possible:
+            lines.append("Delivery Estimate  (aggregated across all boots)")
             hdr2 = f"  {'Node':<10} {'Possible':>9} {'Delivered':>10} {'Undelivered':>12} {'Pct':>7}"
             lines.append(hdr2)
             lines.append("  " + "-" * (len(hdr2) - 2))
-            for node in nodes_with_range:
-                r            = node_seq_range[node]
-                possible     = r['max'] - r['min'] + 1
-                unique_count = len(per_node_seqs.get(node, set()))
+            for node in nodes_with_possible:
+                possible     = agg_possible[node]
+                unique_count = agg_unique.get(node, 0)
                 undelivered  = max(0, possible - unique_count)
                 pct          = 100.0 * unique_count / possible if possible > 0 else 0.0
                 lines.append(
@@ -359,14 +465,16 @@ def generate_summary():
         lines.append("                      counted in total deliveries, not unique.")
         lines.append("  Antipacket fails  : same forwarder re-sent the bundle; excluded from")
         lines.append("                      both unique and total counts.")
-        lines.append("  Undelivered est.  : (last_seq - first_seq + 1) - unique_delivered.")
-        lines.append("                      Assumes contiguous seq numbers in observed window.")
+        lines.append("  Undelivered est.  : sum across all boots of (last_seq - first_seq + 1)")
+        lines.append("                      minus unique delivered per boot. Seq numbers reset")
+        lines.append("                      each boot, so boots are summed independently.")
         lines.append("=" * W)
 
         report = "\n".join(lines)
 
     # print and save outside the lock
     print("\n" + report)
+    os.makedirs("bs_reports", exist_ok=True)
     filename = f"bs_reports/dtn_summary_{now.strftime('%Y%m%d_%H%M%S')}.txt"
     try:
         with open(filename, 'w') as f:
