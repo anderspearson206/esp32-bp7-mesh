@@ -1,8 +1,10 @@
 # ESP32-C5 DTN Rover Mesh
 
-A Delay-Tolerant Networking (DTN) mesh for a fleet of autonomous ground rovers. Each rover carries a **Jetson Orin Nano** as its main computer and an **ESP32-C5** as a wireless modem. The ESP32s communicate over **ESP-NOW** and implement epidemic-style store-and-forward routing using a BPv7-inspired bundle format.
+A Delay-Tolerant Networking (DTN) mesh for a fleet of autonomous ground rovers. Each rover carries a **Jetson Orin Nano** as its main computer and an **ESP32-C5** as a wireless modem. The nodes communicate over **ESP-NOW** with epidemic-style store-and-forward routing using a BPv7-inspired bundle format.
 
 **Deployment**: 3 rovers + 1 fixed base station (BS). Most data flows rover → BS. Rovers follow pre-planned trajectories with intermittent connectivity — bundles are carried (ferried) across disconnections by intermediary rovers.
+
+**Architecture (rover side)**: On **rover** nodes the ESP32 is a *pure broadcast relay* — it broadcasts every over-air frame the Jetson hands it and forwards every received frame back to the Jetson (with source MAC + RSSI). All DTN logic (beacons, bundle store, routing, antipacket/dedup, ACK-maps) runs in **`rover_daemon.py`** on the Jetson. The **Base Station** ESP32 still runs the full firmware stack unchanged, so the over-air wire format is identical and `mesh_visualizer.py` reads the BS serial port exactly as before. A single firmware binary selects its role at boot from its node ID.
 
 ## Status
 
@@ -15,6 +17,8 @@ A Delay-Tolerant Networking (DTN) mesh for a fleet of autonomous ground rovers. 
 | Host UART interface (Jetson ↔ ESP32) | Done |
 | Antipackets (suppress redelivery) | Done |
 | LCD / LED / button UI on BS | Done |
+| Rover ESP32 = dumb relay, logic in `rover_daemon.py` | Done (builds + unit-tested) |
+| Verify relay/daemon split on hardware | In progress |
 | Downlink / ACK to rovers | Not yet done |
 | Integration onto rover hardware | Not yet done |
 
@@ -83,7 +87,20 @@ All tunable constants are at the top of `main/mesh_main.c`:
 
 ## Architecture
 
-### Firmware (`main/mesh_main.c`)
+### Node roles (one firmware, runtime branch)
+
+`app_main` reads the node ID from the STA MAC and branches:
+
+- **Base Station** (`node_id == BASE_STATION_NODE_ID`) — runs the full DTN stack described below (`rx_process_task`, `beacon_task`, `bundle_tx_task`, `host_uart_task`, `ui_update_task`). Unchanged; this is what `mesh_visualizer.py` consumes.
+- **Rover** (anything else) — runs only the relay tasks `relay_rx_task` + `relay_host_task` (plus `ui_update_task`). The DTN logic still compiles but never runs on a rover; it lives in `rover_daemon.py`.
+
+**Rover relay path**: `relay_rx_task` dequeues each received ESP-NOW packet and ships it to the Jetson as a `WIFI_RX` frame `[src_mac:6][rssi:1][air bytes]`. `relay_host_task` reads frames from the Jetson — `WIFI_TX` payloads are broadcast verbatim, `QUERY_STATUS` returns node ID + channel for auto-detection. No bundle store, beacons, or peer table on this path.
+
+### Rover daemon (`rover_daemon.py`)
+
+Reproduces the rover-side behavior in Python so the BS sees identical traffic: 1 s beacon TX, a peer table keyed by node ID (resets `forwarded` on new/returning/restarted peers), bundle RX with dedup + telemetry-ACK (`@DTN_RX:`) generation, a 1 s epidemic forward loop (rewrites `prev_node`/`hop_count` per hop, re-sends bundles unacked by the BS after 5 s), and ACK-map apply + propagate (256-bit sliding window per source). Compatible with Python 3.6+.
+
+### Firmware (`main/mesh_main.c`) — Base Station stack
 
 **Bundle store**: Flat array of 100 `ram_bundle_t` slots. Each holds a `dtn_bundle_t` (source, dest, prev\_node, sequence number, creation\_time, lifetime/TTL, hop count/limit, payload) plus `is_empty` and `forwarded` flags. A FreeRTOS mutex protects both the bundle store and peer list.
 
@@ -121,6 +138,10 @@ CRC-16/CCITT over `[CMD, LEN_LO, LEN_HI, PAYLOAD...]`.
 | `ACK` | `0x20` | ESP32 → Jetson | 1 byte (0=ok, 1=error) |
 | `STATUS_RESP` | `0x21` | ESP32 → Jetson | `host_status_t` (6 bytes) |
 | `PEERS_RESP` | `0x22` | ESP32 → Jetson | n × `host_peer_entry_t` (4 bytes each) |
+| `WIFI_TX` | `0x30` | Jetson → ESP32 | raw over-air bytes, broadcast verbatim (rover relay) |
+| `WIFI_RX` | `0x31` | ESP32 → Jetson | `[src_mac:6][rssi:1][air bytes]` per received frame (rover relay) |
+
+**Rover relay mode** (`rover_daemon.py`) uses only `WIFI_TX` / `WIFI_RX`, plus `QUERY_STATUS` / `STATUS_RESP` for node-ID detection. The bundle-centric commands (`TX_BUNDLE`, `PULL_REQ`, `BUNDLE_DATA`, `NO_BUNDLES`, `ANTIPKT_NOTIFY`, `BUNDLE_PUSH`) belong to the legacy `jetson_daemon.py` model. `HOST_MAX_PAYLOAD` is 1100 bytes (a relayed bundle is up to 6 + 1 + 1053 bytes).
 
 ### BS Serial Output (for visualizer)
 
@@ -162,24 +183,26 @@ python bs_ferry_monitor.py --port COM13
 python bs_ferry_monitor.py --port /dev/ttyUSB0 --baud 115200
 ```
 
-### Jetson Daemon
+### Rover Daemon
 
-Runs on the **Jetson Orin Nano** aboard each rover. Manages the local bundle store and bridges it to the attached ESP32 modem over UART.
+Runs on the **Jetson Orin Nano** aboard each rover. Owns the bundle store and all DTN logic, driving the rover's ESP32 (which is a dumb relay) over UART. Only needs `pyserial`; compatible with Python 3.6+.
 
 ```bash
 # Auto-detect node ID from ESP32 STATUS_RESP on startup
-python jetson_daemon.py
+python rover_daemon.py --serial /dev/ttyUSB0
 
 # Explicit options
-python jetson_daemon.py --serial /dev/ttyTHS1 --baud 115200 --interval 10 --node-id 57936
+python rover_daemon.py --serial /dev/ttyTHS1 --baud 115200 --interval 1 --node-id 57936
 ```
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--serial` | `/dev/ttyTHS1` | Jetson UART1 connected to ESP32 |
+| `--serial` | `/dev/ttyUSB0` | Serial port connected to the ESP32 |
 | `--baud` | 115200 | Must match `HOST_UART_BAUD` in firmware |
-| `--interval` | 10 | Seconds between generated sensor bundles (0 = disable) |
+| `--interval` | 1 | Seconds between generated sensor bundles (0 = disable) |
 | `--node-id` | auto | Override node ID (normally auto-detected from ESP32) |
+
+> `jetson_daemon.py` is the **legacy** daemon for the old model where the ESP32 held the DTN logic (PULL/BUNDLE_PUSH). It is superseded by `rover_daemon.py` and kept only for reference.
 
 ## Jetson Deployment
 
@@ -196,7 +219,7 @@ python jetson_daemon.py --serial /dev/ttyTHS1 --baud 115200 --interval 10 --node
    - GND shared
 4. On the Jetson, run:
    ```bash
-   python jetson_daemon.py --serial /dev/ttyTHS1
+   python rover_daemon.py --serial /dev/ttyTHS1
    ```
 5. UART0 remains free on the ESP32 for `idf.py monitor` debugging.
 
