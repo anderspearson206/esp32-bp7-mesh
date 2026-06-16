@@ -53,7 +53,7 @@
 #define HOST_UART_BAUD        115200
 #define HOST_UART_RX_BUF      2048
 #define HOST_SOF              0xAA
-#define HOST_MAX_PAYLOAD      1060      // headroom above sizeof(dtn_bundle_t)
+#define HOST_MAX_PAYLOAD      1100      // headroom above relayed bundle (6 mac + 1 rssi + 1053 air)
 #define HOST_PULL_INTERVAL_MS    1000   // pull from Jetson store every 1s when peers active
 #define BUNDLE_RETRANSMIT_MS     5000   // retry forwarded but unacked bundles to BS after 5s
 // Jetson -> ESP32
@@ -70,6 +70,9 @@
 #define HOST_CMD_NO_BUNDLES   0x12      // payload: none
 #define HOST_CMD_ANTIPKT_NOTIFY 0x13   // ESP32 -> Jetson: drop bundle; payload: antipkt_id_t (10 bytes)
 #define HOST_CMD_BUNDLE_PUSH    0x14   // ESP32 -> Jetson: store received bundle; payload: raw dtn_bundle_t bytes
+// Rover relay mode (ESP32 = dumb tunnel; all DTN logic on the Jetson daemon)
+#define HOST_CMD_WIFI_TX        0x30   // Jetson -> ESP32: broadcast these raw over-air bytes verbatim
+#define HOST_CMD_WIFI_RX        0x31   // ESP32 -> Jetson: received frame; payload: [src_mac:6][rssi:1][air bytes]
 
 // UI hardware , adjust GPIO numbers to match your board
 #define UI_LED_PIN          GPIO_NUM_10  // status LED, all nodes          (J1 pin 11)
@@ -1271,6 +1274,67 @@ static void init_host_uart(void) {
 }
 
 /*******************************************************
+ *                Rover Relay Tasks
+ *
+ * On rover nodes the ESP32 is a pure broadcast relay: it ships every received
+ * over-air frame to the Jetson (WIFI_RX) and broadcasts every frame the Jetson
+ * hands it (WIFI_TX). All DTN logic (beacons, store, routing, antipacket, ackmaps)
+ * lives in rover_daemon.py. The Base Station path is unaffected.
+ *******************************************************/
+
+// air -> serial: dequeue ESP-NOW packets and forward [src_mac][rssi][data] to the Jetson
+static void relay_rx_task(void *arg) {
+    rx_item_t *item = NULL;
+    static uint8_t relay_buf[7 + RX_BUF_MAX];
+    while (1) {
+        free(item);   // free(NULL) is a no-op, so all continue paths are safe
+        item = NULL;
+        if (xQueueReceive(rx_queue, &item, portMAX_DELAY) != pdTRUE) continue;
+        if (item->len < 1) continue;
+        uint16_t plen = (uint16_t)(7 + item->len);
+        if (plen > HOST_MAX_PAYLOAD) {
+            ESP_LOGW(TAG, "Relay RX frame too big (%u), dropping", plen);
+            continue;
+        }
+        memcpy(relay_buf, item->src_mac, 6);
+        relay_buf[6] = (uint8_t)item->rssi;
+        memcpy(relay_buf + 7, item->data, item->len);
+        host_send_frame(HOST_CMD_WIFI_RX, relay_buf, plen);
+    }
+}
+
+// serial -> air: read frames from the Jetson; broadcast WIFI_TX payloads verbatim
+static void relay_host_task(void *arg) {
+    uint16_t my_id = get_my_node_id();
+    while (1) {
+        uint8_t  cmd;
+        uint16_t plen;
+        if (!host_recv_frame(&cmd, &plen, 100)) continue;
+        switch (cmd) {
+        case HOST_CMD_WIFI_TX:
+            if (plen > 0) esp_now_send(BROADCAST_MAC, host_rx_payload, plen);
+            break;
+        case HOST_CMD_QUERY_STATUS: {
+            // store/peer state lives on the Jetson now; report node_id + channel so the
+            // daemon can auto-detect which node it is attached to.
+            host_status_t s = {
+                .node_id      = my_id,
+                .active_peers = 0,
+                .store_used   = 0,
+                .store_max    = MAX_BUNDLES_IN_RAM,
+                .channel      = ESPNOW_CHANNEL,
+            };
+            host_send_frame(HOST_CMD_STATUS_RESP, (uint8_t *)&s, sizeof(s));
+            break;
+        }
+        default:
+            ESP_LOGW(TAG, "Relay: unknown cmd 0x%02x len=%u", cmd, plen);
+            break;
+        }
+    }
+}
+
+/*******************************************************
  *                LCD driver, software I2C
  *
  * PCF8574 pin mapping: P0=RS P1=RW P2=EN P3=BL P4-P7=D4-D7
@@ -1673,9 +1737,17 @@ void app_main(void) {
     init_host_uart();
     init_bundle_store();
 
-    xTaskCreate(rx_process_task, "rx_proc",    4096, NULL, 6, NULL);
-    xTaskCreate(beacon_task,     "beacon",     2048, NULL, 5, NULL);
-    xTaskCreate(bundle_tx_task,  "tx_loop",    4096, NULL, 4, NULL);
-    xTaskCreate(host_uart_task,  "host_uart",  4096, NULL, 3, NULL);
-    xTaskCreate(ui_update_task,  "ui",         2048, NULL, 2, NULL);
+    if (my_id == BASE_STATION_NODE_ID) {
+        // Base Station: full DTN stack (unchanged).
+        xTaskCreate(rx_process_task, "rx_proc",    4096, NULL, 6, NULL);
+        xTaskCreate(beacon_task,     "beacon",     2048, NULL, 5, NULL);
+        xTaskCreate(bundle_tx_task,  "tx_loop",    4096, NULL, 4, NULL);
+        xTaskCreate(host_uart_task,  "host_uart",  4096, NULL, 3, NULL);
+        xTaskCreate(ui_update_task,  "ui",         2048, NULL, 2, NULL);
+    } else {
+        // Rover: pure broadcast relay. All DTN logic lives on the Jetson daemon.
+        xTaskCreate(relay_rx_task,   "relay_rx",   4096, NULL, 6, NULL);
+        xTaskCreate(relay_host_task, "relay_host", 4096, NULL, 3, NULL);
+        xTaskCreate(ui_update_task,  "ui",         2048, NULL, 2, NULL);
+    }
 }
