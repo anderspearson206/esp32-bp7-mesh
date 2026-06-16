@@ -259,7 +259,7 @@ def unpack_ackmap(rest: bytes):
 
 
 # location (de)serialization
-# pkt_type(u8), node_id(u16), lat(f32), lon(f32), alt(f32)  — 15 bytes total
+# pkt_type(u8), node_id(u16), lat(f32), lon(f32), alt(f32)- 15 bytes total
 LOCATION_FMT  = '<BHfff'
 LOCATION_SIZE = struct.calcsize(LOCATION_FMT)   # 15
 
@@ -383,7 +383,7 @@ class RoverDaemon:
         with self._uart_lock:
             self._ser.write(frame)
 
-    # ---- bundle store ----
+    # bundle store
     def _add_bundle(self, b: dict, is_local: bool = False) -> bool:
         key = (b['source_node'], b['creation_time'], b['sequence_number'])
         b.setdefault('forwarded', False)
@@ -415,7 +415,7 @@ class RoverDaemon:
         if drop:
             print(f"[STORE] Expired {len(drop)} bundles by TTL")
 
-    # ---- ACK window (sliding 256-bit bitmap per source), mirrors mark_ack_locked ----
+    #ACK window (sliding 256-bit bitmap per source), mirrors mark_ack_locked 
     def _mark_ack(self, source_node: int, seq: int) -> None:
         a = self._ack.get(source_node)
         if a is None:
@@ -465,7 +465,7 @@ class RoverDaemon:
         if dropped:
             print(f"[ANTIPKT] ACKMAP freed {len(dropped)} for src:{source_node} (store now {len(self._store)})")
 
-    # ---- peer table ----
+    # -peer table
     def _active_peer_ids(self) -> List[int]:
         now = int(time.monotonic() * 1000)
         return [pid for pid, p in self._peers.items()
@@ -513,7 +513,7 @@ class RoverDaemon:
         else:
             print(f"[PEER] node {node_id} {'returned' if prev else 'discovered'}; reset forwarded flags")
 
-    # ---- bundle RX ----
+    # bundle rx
     def _on_bundle(self, rest: bytes) -> None:
         b = unpack_bundle(rest[1:])
         if not b:
@@ -560,7 +560,7 @@ class RoverDaemon:
         }
         self._add_bundle(ack, is_local=True)
 
-    # ---- ackmap RX ----
+    # ackmap rx
     def _on_ackmap(self, rest: bytes) -> None:
         fields = unpack_ackmap(rest)
         if fields is None:
@@ -573,7 +573,7 @@ class RoverDaemon:
         self._merge_ackmap(source, seq_base, bitmap, blen)        # for propagation
         self._apply_ackmap_to_store(source, seq_base, bitmap, blen)
 
-    # ---- forwarding + ackmap propagation ----
+    # forward and ack map propagation loop, runs every FORWARD_INTERVAL_S seconds
     def _forward(self) -> None:
         self._expire_bundles()
         now = int(time.monotonic() * 1000)
@@ -599,6 +599,21 @@ class RoverDaemon:
             out = dict(b)
             out['prev_node'] = self._node_id
             out['hop_count'] = b['hop_count'] + 1
+            # Translate creation_time into this daemon's clock domain so the BS can
+            # compute correct latency for bundles from absent sources.
+            # Guards: bundle must have arrived directly from the source (prev==src, so
+            # no prior relay has already done this), the source must be absent (if still
+            # active the BS has its clock_offset directly), and the result must be >= 0
+            # (source started earlier than us → large offset → don't wrap the uint32).
+            if (bs_active
+                    and b['source_node'] != self._node_id
+                    and b['prev_node'] == b['source_node']
+                    and b['source_node'] not in active):
+                src_peer = self._peers.get(b['source_node'])
+                if src_peer and 'clock_offset_ms' in src_peer:
+                    adjusted = b['creation_time'] - src_peer['clock_offset_ms']
+                    if adjusted >= 0:
+                        out['creation_time'] = adjusted
             self._send(HOST_CMD_WIFI_TX, encode_air_bundle(out))
             # Generate @DTN_RX telemetry ack for non-local ferried bundles on first
             # forward to BS.  Deferred from reception time so that clock_offset_ms for
@@ -625,12 +640,12 @@ class RoverDaemon:
                     self._send(HOST_CMD_WIFI_TX, pack_ackmap(source, a['seq_base'], a['bitmap']))
                     a['dirty'] = False
 
-    # ---- beacon ----
+    # beacon
     def _send_beacon(self) -> None:
         ts = int(time.monotonic() * 1000) - self._start_ms
         self._send(HOST_CMD_WIFI_TX, pack_beacon(self._node_id, ts, self._boot_id))
 
-    # ---- location ----
+    # location
     def _send_location(self) -> None:
         if self._node_id is None:
             return
@@ -674,7 +689,7 @@ class RoverDaemon:
         }
         self._add_bundle(b, is_local=True)
 
-    # ---- bundle generator ----
+    # bundle generation 
     def _generate_bundle(self) -> None:
         abs_ms = int(time.monotonic() * 1000)
         creation_time = abs_ms - self._start_ms
@@ -705,7 +720,6 @@ class RoverDaemon:
             print(f"[RESTART] ESP32 boot banner: {text.strip()!r}")
             self._restart_pending = True
 
-    # ---- frame dispatch ----
     def _dispatch(self, cmd: int, payload: bytes) -> None:
         if cmd == HOST_CMD_WIFI_RX:
             if len(payload) < 8:   # 6 mac + 1 rssi + >=1 air byte
@@ -728,7 +742,7 @@ class RoverDaemon:
                 self._detected_node_id = struct.unpack_from('<H', payload)[0]
         # other host commands are unused on the relay link
 
-    # ---- serial lifecycle ----
+    # serial lifecycle
     def _open_serial(self) -> None:
         if self._ser is not None:
             try:
@@ -787,7 +801,6 @@ class RoverDaemon:
             time.sleep(1)
         raise RuntimeError("Could not auto-detect node_id from ESP32. Use --node-id to override.")
 
-    # ---- main loop ----
     def _main_loop(self) -> None:
         last_beacon          = 0.0
         last_forward         = 0.0
@@ -799,7 +812,7 @@ class RoverDaemon:
         while True:
             if self._restart_pending:
                 self._restart_pending = False
-                # ESP32 rebooted; the daemon (and store) survived. Re-flood through the fresh
+                # ESP32 rebooted, the daemon (and store) survived. Re-flood through the fresh
                 # modem, clear peer table (will be rediscovered), keep store + delivered set.
                 with self._lock:
                     for b in self._store:
@@ -847,7 +860,7 @@ class RoverDaemon:
         self._close_serial()
         if self._node_id_override is None:
             self._node_id = None
-        # The store is the rover's source of truth; keep it across a serial reconnect but
+        # The store is the rover's source of truth, keep it across a serial reconnect but
         # re-arm forwarding and forget transient peer/ack state.
         with self._lock:
             for b in self._store:

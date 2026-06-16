@@ -658,10 +658,23 @@ static void rx_process_task(void *arg) {
             uint8_t  bhops      = incoming->hop_count;
             int32_t  src_clock_offset = 0;
             if (my_id == BASE_STATION_NODE_ID) {
+                bool found_src = false;
                 for (int k = 0; k < peer_count; k++) {
                     if (peer_list[k].node_id == bsrc) {
                         src_clock_offset = peer_list[k].clock_offset_ms;
+                        found_src = true;
                         break;
+                    }
+                }
+                // Ferried bundle: source was never seen directly by BS. The rover daemon
+                // re-expresses creation_time in the relay's clock domain, so use the
+                // relay's (prev_node) clock offset instead.
+                if (!found_src && bprev != bsrc) {
+                    for (int k = 0; k < peer_count; k++) {
+                        if (peer_list[k].node_id == bprev) {
+                            src_clock_offset = peer_list[k].clock_offset_ms;
+                            break;
+                        }
                     }
                 }
             }
