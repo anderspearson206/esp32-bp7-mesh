@@ -27,6 +27,7 @@ import platform
 import struct
 import threading
 import time
+import traceback
 import serial
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional, Set, Tuple
@@ -478,7 +479,10 @@ class RoverDaemon:
         was_absent = prev is None or (now - prev['last_seen']) >= PEER_TIMEOUT_S * 1000
         restarted = (prev is not None and boot_id != 0 and
                      prev.get('boot_id', 0) != 0 and prev['boot_id'] != boot_id)
-        self._peers[node_id] = {'last_seen': now, 'boot_id': boot_id, 'rssi': rssi}
+        daemon_rel_now = now - self._start_ms
+        clock_offset_ms = timestamp_ms - daemon_rel_now   # peer_ts - daemon_ts; const between reboots
+        self._peers[node_id] = {'last_seen': now, 'boot_id': boot_id, 'rssi': rssi,
+                                'clock_offset_ms': clock_offset_ms}
 
         if not (was_absent or restarted):
             return
@@ -524,9 +528,25 @@ class RoverDaemon:
             self._make_telemetry_ack(b)
 
     def _make_telemetry_ack(self, orig: dict) -> None:
+        if self._node_id is None:
+            return
         now = int(time.monotonic() * 1000)
+        # For ferried bundles (from another node), estimate the true latency so the BS
+        # can display a meaningful value.  The BS uses src_clock_offset=0 for nodes it has
+        # never heard directly, so its @METRIC line shows 0ms (clamped from negative).
+        # We know the source's clock offset from its beacons, so we compute:
+        #   est_latency = daemon_rel_now - (creation_time - src_clock_offset_ms)
+        # which equals the wall-clock age of the bundle at the time we received it.
+        latency_suffix = ''
+        if orig['source_node'] != self._node_id:
+            src_peer = self._peers.get(orig['source_node'])
+            if src_peer and 'clock_offset_ms' in src_peer:
+                daemon_rel_now = now - self._start_ms
+                est_latency = daemon_rel_now - (orig['creation_time'] - src_peer['clock_offset_ms'])
+                if est_latency >= 0:
+                    latency_suffix = f':{est_latency}'
         text = (f"@DTN_RX:{orig['source_node']}:{orig['prev_node']}:"
-                f"{orig['sequence_number']}:{self._node_id}:{orig['hop_count']}")
+                f"{orig['sequence_number']}:{self._node_id}:{orig['hop_count']}{latency_suffix}")
         ack = {
             'creation_time':   now - self._start_ms,
             'sequence_number': next(self._seq),
@@ -608,6 +628,8 @@ class RoverDaemon:
 
     # ---- location ----
     def _send_location(self) -> None:
+        if self._node_id is None:
+            return
         loc = self._own_location
         self._send(HOST_CMD_WIFI_TX,
                    pack_location(self._node_id, loc['lat'], loc['lon'], loc['alt']))
@@ -627,6 +649,8 @@ class RoverDaemon:
 
     def _send_location_bundle(self) -> None:
         """Send own location as a telemetry bundle so the BS serial output captures it."""
+        if self._node_id is None:
+            return
         loc = self._own_location
         payload = (f"@LOCATION:{self._node_id}:"
                    f"{loc['lat']:.6f}:{loc['lon']:.6f}:{loc['alt']:.1f}").encode()
@@ -848,6 +872,7 @@ class RoverDaemon:
                 return
             except Exception as e:
                 print(f"[ERROR] {type(e).__name__}: {e}")
+                traceback.print_exc()
                 self._reset_after_disconnect()
             try:
                 time.sleep(RECONNECT_DELAY_S)
