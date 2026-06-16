@@ -523,9 +523,6 @@ class RoverDaemon:
             return   # duplicate or already delivered
         print(f"[RX] bundle src:{b['source_node']} seq:{b['sequence_number']} "
               f"hops:{b['hop_count']} (store {len(self._store)})")
-        # for a received DATA bundle, emit a telemetry-ACK the BS will print as @DTN_RX
-        if not b['is_telemetry']:
-            self._make_telemetry_ack(b)
 
     def _make_telemetry_ack(self, orig: dict) -> None:
         if self._node_id is None:
@@ -603,6 +600,13 @@ class RoverDaemon:
             out['prev_node'] = self._node_id
             out['hop_count'] = b['hop_count'] + 1
             self._send(HOST_CMD_WIFI_TX, encode_air_bundle(out))
+            # Generate @DTN_RX telemetry ack for non-local ferried bundles on first
+            # forward to BS.  Deferred from reception time so that clock_offset_ms for
+            # the source is already populated (avoids the burst-before-first-beacon race).
+            if (bs_active and not b.get('is_telemetry') and
+                    b['source_node'] != self._node_id and not b.get('ack_generated')):
+                b['ack_generated'] = True
+                self._make_telemetry_ack(b)
             b['forwarded'] = True
             b['forwarded_ms'] = now
             self._protocol.on_bundle_forwarded(b)
