@@ -11,16 +11,17 @@ The over-air wire format is byte-identical to the legacy firmware so the unchang
 Station keeps interoperating (it still emits @NET/@METRIC/@DTN_RX for mesh_visualizer.py).
 
 Usage:
-    python rover_daemon.py [--serial PORT] [--baud BAUD] [--interval SECS] [--node-id ID]
+    python radio_daemon.py [--serial PORT] [--baud BAUD] [--interval SECS] [--node-id ID]
 
     --serial   Serial port connected to ESP32 (default: /dev/ttyUSB0)
     --baud     Baud rate (default: 115200)
     --interval Seconds between generated sensor bundles (default: 1, 0 = disable)
     --node-id  Override node ID (default: auto-detected from ESP32 STATUS_RESP on startup)
+    
+    python3 radio_daemon.py --serial /dev/ttyUSB0 --ros-location-topic /camera/odom/sample
 """
 
 import argparse
-import itertools
 import json
 import os
 import platform
@@ -31,6 +32,13 @@ import traceback
 import serial
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional, Set, Tuple
+
+try:
+    import rospy
+    from nav_msgs.msg import Odometry as _Odometry
+    _ROS_AVAILABLE = True
+except ImportError:
+    _ROS_AVAILABLE = False
 
 # host UART framing (must match mesh_main.c)
 HOST_SOF              = 0xAA
@@ -347,7 +355,8 @@ class SprayAndWaitRouting(RoutingProtocol):
 class RoverDaemon:
     def __init__(self, serial_port: str, baud: int, gen_interval: float,
                  node_id_override: Optional[int], protocol: RoutingProtocol,
-                 lat: float = 0.0, lon: float = 0.0, alt: float = 0.0):
+                 lat: float = 0.0, lon: float = 0.0, alt: float = 0.0,
+                 ros_location_topic: Optional[str] = None):
         assert BUNDLE_SIZE == 1052, f"Bundle struct size mismatch: got {BUNDLE_SIZE}, expected 1052"
         assert ACKMAP_SIZE == 42,   f"Ackmap struct size mismatch: got {ACKMAP_SIZE}, expected 42"
 
@@ -360,7 +369,7 @@ class RoverDaemon:
 
         self._store: List[dict] = []        # each: dtn fields + added_at_ms, forwarded, forwarded_ms
         self._lock = threading.Lock()
-        self._seq  = itertools.count(start=1)
+        self._seq_next = 1
         self._start_ms = int(time.monotonic() * 1000)
         self._boot_id  = int.from_bytes(os.urandom(4), 'little')
 
@@ -368,7 +377,8 @@ class RoverDaemon:
         self._peers: Dict[int, dict] = {}                    # node_id -> {last_seen, boot_id, rssi}
         self._ack: Dict[int, dict] = {}                      # source_node -> {seq_base, bitmap, dirty}
 
-        self._own_location = {'lat': lat, 'lon': lon, 'alt': alt}
+        self._own_location    = {'lat': lat, 'lon': lon, 'alt': alt}
+        self._ros_location_topic = ros_location_topic
         self._locations: Dict[int, dict] = {}                # node_id -> {lat, lon, alt, updated_ms}
 
         self._detected_node_id: Optional[int] = None
@@ -376,6 +386,11 @@ class RoverDaemon:
 
         self._ser: Optional[serial.Serial] = None
         self._uart_lock = threading.Lock()
+
+    def _next_seq(self) -> int:
+        s = self._seq_next
+        self._seq_next += 1
+        return s
 
     # serial helpers
     def _send(self, cmd: int, payload: bytes = b'') -> None:
@@ -546,7 +561,7 @@ class RoverDaemon:
                 f"{orig['sequence_number']}:{self._node_id}:{orig['hop_count']}{latency_suffix}")
         ack = {
             'creation_time':   now - self._start_ms,
-            'sequence_number': next(self._seq),
+            'sequence_number': self._next_seq(),
             'lifetime':        TELEMETRY_ACK_LIFETIME,
             'source_node':     self._node_id,
             'dest_node':       0,
@@ -569,6 +584,12 @@ class RoverDaemon:
         if origin != BASE_STATION_NODE_ID:
             return
         if blen == 0 or blen > ACKMAP_BITMAP_BYTES:
+            return
+        # A stale pre-restart ackmap for our own node has seq_base higher than any
+        # sequence we've issued this boot.  Applying it would evict new seq=1,2,...
+        # bundles because seq < seq_base is treated as "window slid past → delivered".
+        # Also skip merge so we don't propagate the stale window to other peers.
+        if source == self._node_id and seq_base >= self._seq_next:
             return
         self._merge_ackmap(source, seq_base, bitmap, blen)        # for propagation
         self._apply_ackmap_to_store(source, seq_base, bitmap, blen)
@@ -640,6 +661,28 @@ class RoverDaemon:
                     self._send(HOST_CMD_WIFI_TX, pack_ackmap(source, a['seq_base'], a['bitmap']))
                     a['dirty'] = False
 
+    # node restart notification
+    def _send_node_restart_notification(self) -> None:
+        if self._node_id is None:
+            return
+        now = int(time.monotonic() * 1000)
+        payload = f"@NODE_RESTART:{self._node_id}".encode()
+        b = {
+            'creation_time':   now - self._start_ms,
+            'sequence_number': self._next_seq(),
+            'lifetime':        BUNDLE_DEFAULT_LIFETIME,
+            'source_node':     self._node_id,
+            'dest_node':       BASE_STATION_NODE_ID,
+            'prev_node':       self._node_id,
+            'is_telemetry':    True,
+            'hop_limit':       BUNDLE_DEFAULT_HOP_LIMIT,
+            'hop_count':       0,
+            'payload':         payload,
+            'added_at_ms':     now,
+        }
+        self._add_bundle(b, is_local=True)
+        print(f"[RESTART] queued @NODE_RESTART:{self._node_id} notification bundle")
+
     # beacon
     def _send_beacon(self) -> None:
         ts = int(time.monotonic() * 1000) - self._start_ms
@@ -671,12 +714,14 @@ class RoverDaemon:
         if self._node_id is None:
             return
         loc = self._own_location
+        bs_rssi = self._peers.get(BASE_STATION_NODE_ID, {}).get('rssi')
+        rssi_field = f":{bs_rssi}" if bs_rssi is not None else ""
         payload = (f"@LOCATION:{self._node_id}:"
-                   f"{loc['lat']:.6f}:{loc['lon']:.6f}:{loc['alt']:.1f}").encode()
+                   f"{loc['lat']:.6f}:{loc['lon']:.6f}:{loc['alt']:.1f}{rssi_field}").encode()
         now = int(time.monotonic() * 1000)
         b = {
             'creation_time':   now - self._start_ms,
-            'sequence_number': next(self._seq),
+            'sequence_number': self._next_seq(),
             'lifetime':        TELEMETRY_ACK_LIFETIME,
             'source_node':     self._node_id,
             'dest_node':       BASE_STATION_NODE_ID,
@@ -700,7 +745,7 @@ class RoverDaemon:
         }).encode()
         b = {
             'creation_time':   creation_time,
-            'sequence_number': next(self._seq),
+            'sequence_number': self._next_seq(),
             'lifetime':        BUNDLE_DEFAULT_LIFETIME,
             'source_node':     self._node_id,
             'dest_node':       BASE_STATION_NODE_ID,
@@ -812,17 +857,26 @@ class RoverDaemon:
         while True:
             if self._restart_pending:
                 self._restart_pending = False
-                # ESP32 rebooted, the daemon (and store) survived. Re-flood through the fresh
-                # modem, clear peer table (will be rediscovered), keep store + delivered set.
+                self._boot_id = int.from_bytes(os.urandom(4), 'little')
+                self._seq_next = 1
+                # Clear our own ack window so the old seq_base (> 1) doesn't mark new
+                # seq=1 bundles as already delivered.
+                if self._node_id is not None:
+                    self._ack.pop(self._node_id, None)
+                # ESP32 rebooted: drop the store entirely.  Re-flooding pre-restart bundles
+                # causes @ANTIPKT_FAIL at the BS because it already deduped them by
+                # (source, creation_time, seq) and they arrive from the same forwarder.
                 with self._lock:
-                    for b in self._store:
-                        b['forwarded'] = False
-                        b['forwarded_ms'] = 0
-                    count = len(self._store)
+                    dropped = list(self._store)
+                    self._store = []
+                for b in dropped:
+                    self._protocol.on_bundle_removed(b)
                 self._peers.clear()
-                print(f"[RESTART] re-armed {count} bundles for retransmit; cleared peer table")
+                print(f"[RESTART] new boot_id=0x{self._boot_id:08x}, seq reset; "
+                      f"cleared {len(dropped)} bundles from store; cleared peer table")
                 if self._node_id is None:
                     self._node_id = self._detect_node_id()
+                self._send_node_restart_notification()
 
             result = recv_frame(self._ser, timeout_s=0.05, on_ascii=self._handle_ascii)
             if result is not None:
@@ -879,7 +933,42 @@ class RoverDaemon:
         print(f"[INIT] Running as rover node {self._node_id}")
         self._main_loop()
 
+    def _start_ros_location(self, topic: str) -> None:
+        """Spin a background rospy subscriber that keeps self._own_location current.
+
+        The Odometry position (x, y, z metres in the odom frame) maps directly to
+        the lat/lon/alt fields used by the rest of the daemon.  When a GPS-based
+        topic is available in future, swap the subscriber and the semantics become
+        correct geographic coordinates automatically.
+        """
+        if not _ROS_AVAILABLE:
+            print("[LOC] rospy not available — location fixed at static value; "
+                  "source a ROS 1 workspace to enable live updates")
+            return
+
+        def _thread() -> None:
+            try:
+                # disable_signals=True is required when init_node is called from a
+                # non-main thread; otherwise rospy tries to install signal handlers
+                # that conflict with Python's main-thread-only signal mechanism.
+                rospy.init_node('rover_daemon_loc', anonymous=True, disable_signals=True)
+
+                def _cb(msg: _Odometry) -> None:
+                    p = msg.pose.pose.position
+                    with self._lock:
+                        self._own_location = {'lat': p.x, 'lon': p.y, 'alt': p.z}
+
+                rospy.Subscriber(topic, _Odometry, _cb)
+                print(f"[LOC] Subscribed to {topic} (nav_msgs/Odometry)")
+                rospy.spin()
+            except Exception as exc:
+                print(f"[LOC] ROS location thread failed: {exc}")
+
+        threading.Thread(target=_thread, daemon=True, name='ros-loc').start()
+
     def run(self) -> None:
+        if self._ros_location_topic:
+            self._start_ros_location(self._ros_location_topic)
         while True:
             try:
                 self._connect_and_run()
@@ -899,7 +988,7 @@ class RoverDaemon:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Rover node daemon (ESP32 is a dumb relay)')
+    parser = argparse.ArgumentParser(description='Rover node daemon (ESP32 is relay)')
     parser.add_argument('--serial',      default='/dev/ttyUSB0', help='Serial port to ESP32')
     parser.add_argument('--baud',        type=int, default=115200, help='Baud rate')
     parser.add_argument('--interval',    type=float, default=1.0,
@@ -910,9 +999,12 @@ def main():
                         help='Routing protocol (default: epidemic)')
     parser.add_argument('--spray-count', type=int, default=8,
                         help='Initial copy count for spray-and-wait (default: 8)')
-    parser.add_argument('--lat',         type=float, default=0.0, help='Own latitude')
-    parser.add_argument('--lon',         type=float, default=0.0, help='Own longitude')
-    parser.add_argument('--alt',         type=float, default=0.0, help='Own altitude (metres)')
+    parser.add_argument('--lat',         type=float, default=0.0, help='Own latitude (static fallback)')
+    parser.add_argument('--lon',         type=float, default=0.0, help='Own longitude (static fallback)')
+    parser.add_argument('--alt',         type=float, default=0.0, help='Own altitude in metres (static fallback)')
+    parser.add_argument('--ros-location-topic', default=None, metavar='TOPIC',
+                        help='ROS 1 nav_msgs/Odometry topic for live position '
+                             '(e.g. /car/t265/odom/sample); overrides --lat/--lon/--alt')
     args = parser.parse_args()
 
     if args.routing == 'spray-wait':
@@ -931,6 +1023,7 @@ def main():
         lat=args.lat,
         lon=args.lon,
         alt=args.alt,
+        ros_location_topic=args.ros_location_topic,
     ).run()
 
 
