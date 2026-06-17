@@ -108,6 +108,8 @@ Node IDs are derived from `(mac[4] << 8) | mac[5]` of the STA MAC, printed on bo
 | Rover B      | —        | 57936   | `e2:50`    |
 | Rover C      | —        | 54272   | `d4:00`    |
 
+> **Base station node ID is not auto-detected.** The firmware decides which node is the BS by comparing each node's ID against the `BASE_STATION_NODE_ID` constant in `main/mesh_main.c`. If you are using different hardware, update that constant to match your BS node ID (read off the sticker on the bottom of the device, or check the boot log). The current BS has node ID **23768**, written on the bottom of the device.
+
 ## Build and Flash
 
 Requires **ESP-IDF v6.0** with `IDF_PATH` set.

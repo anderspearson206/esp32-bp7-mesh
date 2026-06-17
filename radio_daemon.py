@@ -18,7 +18,7 @@ Usage:
     --interval Seconds between generated sensor bundles (default: 1, 0 = disable)
     --node-id  Override node ID (default: auto-detected from ESP32 STATUS_RESP on startup)
     
-    python3 radio_daemon.py --serial /dev/ttyUSB0 --ros-location-topic /camera/odom/sample
+    python3 radio_daemon.py --serial /dev/ttyUSB0 --ros-location-topic /car/t265/odom/sample
 """
 
 import argparse
@@ -1072,7 +1072,7 @@ def main():
                         help='Override node ID (default: auto-detect from ESP32)')
     parser.add_argument('--routing',     choices=['epidemic', 'spray-wait'], default='epidemic',
                         help='Routing protocol (default: epidemic)')
-    parser.add_argument('--spray-count', type=int, default=8,
+    parser.add_argument('--spray-count', type=int, default=2,
                         help='Initial copy count for spray-and-wait (default: 8)')
     parser.add_argument('--lat',         type=float, default=0.0, help='Own latitude (static fallback)')
     parser.add_argument('--lon',         type=float, default=0.0, help='Own longitude (static fallback)')
