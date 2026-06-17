@@ -1,3 +1,4 @@
+import csv
 import os
 import serial
 import threading
@@ -11,6 +12,7 @@ from datetime import datetime
 SERIAL_PORT = os.environ.get('SERIAL_PORT', 'COM5')  # override: SERIAL_PORT=/dev/ttyUSB0 python mesh_visualizer.py
 BAUD_RATE = 115200
 TIMEOUT_SECONDS = 15
+RADIO_MAP_HALF_M = 25.0   # half-width of the radio map in metres (map spans ±this value)
 
 G = nx.DiGraph()
 recent_transfers = []
@@ -25,7 +27,33 @@ node_seq_range      = {}                 # source_node_str -> {'min': int, 'max'
 node_boot_count     = defaultdict(int)   # node_id -> number of restarts seen this session
 node_boot_history   = defaultdict(list)  # node_id -> list of archived boot records
 node_boot_start_time = {}                # node_id -> time.time() of first activity in current boot
-start_time          = time.time()
+node_locations       = {}                # node_id -> {lat, lon, alt, rssi, updated_at}
+radio_map_samples    = defaultdict(lambda: deque(maxlen=2000))  # node_id -> deque of (x, y, rssi)
+start_time           = time.time()
+_coverage_csv_path: str = ""
+
+
+def _init_coverage_csv() -> None:
+    global _coverage_csv_path
+    os.makedirs("bs_reports", exist_ok=True)
+    _coverage_csv_path = f"bs_reports/coverage_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    with open(_coverage_csv_path, 'w', newline='') as f:
+        csv.writer(f).writerow(['timestamp', 'node_id', 'lat', 'lon', 'alt_m', 'rssi_to_bs_dBm'])
+    print(f"[VISUALIZER] Coverage log: {_coverage_csv_path}")
+
+
+def _append_coverage_row(node_id: str, lat: float, lon: float, alt: float, rssi) -> None:
+    if not _coverage_csv_path:
+        return
+    try:
+        with open(_coverage_csv_path, 'a', newline='') as f:
+            csv.writer(f).writerow([
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                node_id, f"{lat:.6f}", f"{lon:.6f}", f"{alt:.1f}",
+                rssi if rssi is not None else '',
+            ])
+    except OSError:
+        pass
 
 
 def read_line_or_frame(ser):
@@ -67,7 +95,10 @@ def reset_session_state():
         node_boot_count.clear()
         node_boot_history.clear()
         node_boot_start_time.clear()
+        node_locations.clear()
+        radio_map_samples.clear()
         start_time = time.time()
+    _init_coverage_csv()
     print("[VISUALIZER] Session state cleared - starting fresh.")
 
 
@@ -146,6 +177,7 @@ def save_boot_summary(node_id: str, boot_num: int, boot_record: dict) -> None:
 def serial_reader_thread(port):
     """Read serial data from the BS port and update shared state."""
     first_connect = True
+    _init_coverage_csv()
     while True:
         try:
             ser = serial.Serial(port, BAUD_RATE, timeout=1)
@@ -286,6 +318,8 @@ def serial_reader_thread(port):
                             for k in stale_keys:
                                 del delivered_bundles[k]
                             node_boot_start_time[node_id] = now_t
+                            node_locations.pop(node_id, None)
+                            radio_map_samples.pop(node_id, None)
                         print(f"[VISUALIZER] Node {node_id} restarted - boot {archived_boot} archived, now on boot {new_boot}.")
                         save_boot_summary(node_id, archived_boot, boot_record)
 
@@ -304,6 +338,29 @@ def serial_reader_thread(port):
                     if len(parts) >= 3:
                         with lock:
                             ferry_dup_counts[parts[1]] += 1
+
+                # rover location + BS RSSI at that position
+                # Format: @LOCATION:<node>:<lat>:<lon>:<alt>[:<rssi>]
+                elif line.startswith("@LOCATION:"):
+                    parts = line.split(':')
+                    if len(parts) >= 5:
+                        try:
+                            node_id = parts[1]
+                            lat  = float(parts[2])
+                            lon  = float(parts[3])
+                            alt  = float(parts[4])
+                            rssi = int(parts[5]) if len(parts) >= 6 and parts[5] else None
+                            with lock:
+                                node_locations[node_id] = {
+                                    'lat': lat, 'lon': lon, 'alt': alt,
+                                    'rssi': rssi, 'updated_at': time.time(),
+                                }
+                                if rssi is not None:
+                                    radio_map_samples[node_id].append((lat, lon, rssi))
+                            if lat != 0.0 or lon != 0.0:
+                                _append_coverage_row(node_id, lat, lon, alt, rssi)
+                        except (ValueError, IndexError):
+                            pass
 
         except (serial.SerialException, serial.PortNotOpenError) as e:
             print(f"Connection lost on {port}: {e}. Retrying in 2 seconds...")
@@ -394,46 +451,28 @@ def generate_summary():
             lines.append(f"  Overall avg RSSI                 : N/A")
         lines.append("")
 
-        # per node
-        lines.append("Per Node")
-        hdr = f"  {'Node':<10} {'Uniq':>6} {'FDup':>6} {'APFl':>6} {'AvgLat':>10} {'AvgRSSI':>9}  SeqRange"
+        # per node - all columns are aggregated across all boots
+        lines.append("Per Node  (all boots)")
+        hdr = (f"  {'Node':<10} {'Uniq':>6} {'Poss':>6} {'Rate':>7} {'Undlv':>6}"
+               f" {'FDup':>5} {'APFl':>5} {'AvgLat':>10} {'AvgRSSI':>9}")
         lines.append(hdr)
         lines.append("  " + "-" * (len(hdr) - 2))
         for node in all_nodes:
             unique_count = agg_unique.get(node, 0)
+            possible     = agg_possible.get(node, 0)
+            undelivered  = max(0, possible - unique_count)
+            rate_str     = f"{100.0 * unique_count / possible:.1f}%" if possible > 0 else "N/A"
             ferry_dups   = agg_fdups.get(node, 0)
             ap_fails     = agg_apfails.get(node, 0)
             lats         = agg_lats.get(node, [])
             rssi_vals    = node_rssi.get(node, [])
             lat_str      = f"{sum(lats)/len(lats):.0f} ms"  if lats     else "N/A"
             rssi_str     = f"{sum(rssi_vals)/len(rssi_vals):.1f} dBm" if rssi_vals else "N/A"
-            if node in node_seq_range:
-                r = node_seq_range[node]
-                seq_str = f"[{r['min']}..{r['max']}]"
-            else:
-                seq_str = "N/A"
             lines.append(
-                f"  {node:<10} {unique_count:>6} {ferry_dups:>6} {ap_fails:>6} "
-                f"{lat_str:>10} {rssi_str:>9}  {seq_str}"
+                f"  {node:<10} {unique_count:>6} {possible:>6} {rate_str:>7} {undelivered:>6}"
+                f" {ferry_dups:>5} {ap_fails:>5} {lat_str:>10} {rssi_str:>9}"
             )
         lines.append("")
-
-        # delivery estimate (aggregated across all boots)
-        nodes_with_possible = [n for n in all_nodes if agg_possible.get(n, 0) > 0]
-        if nodes_with_possible:
-            lines.append("Delivery Estimate  (aggregated across all boots)")
-            hdr2 = f"  {'Node':<10} {'Possible':>9} {'Delivered':>10} {'Undelivered':>12} {'Pct':>7}"
-            lines.append(hdr2)
-            lines.append("  " + "-" * (len(hdr2) - 2))
-            for node in nodes_with_possible:
-                possible     = agg_possible[node]
-                unique_count = agg_unique.get(node, 0)
-                undelivered  = max(0, possible - unique_count)
-                pct          = 100.0 * unique_count / possible if possible > 0 else 0.0
-                lines.append(
-                    f"  {node:<10} {possible:>9} {unique_count:>10} {undelivered:>12} {pct:>6.1f}%"
-                )
-            lines.append("")
 
         # per-node restart history
         nodes_with_restarts = [n for n in all_nodes if node_boot_history.get(n)]
@@ -456,18 +495,38 @@ def generate_summary():
                         f"    Boot {rec['boot']}: seq {seq_str}  {n_del} pkts  "
                         f"avg {lat_str}  rssi {rssi_str}{extra}"
                     )
+                # Synthesize the current (not-yet-archived) boot if it has live data
+                cur_delivered = {seq: info for (src, seq), info in delivered_bundles.items() if src == node}
+                cur_seq_range = node_seq_range.get(node)
+                if cur_delivered or cur_seq_range:
+                    cur_lats     = list(node_latencies.get(node, []))
+                    cur_rssi     = list(node_rssi.get(node, []))
+                    cur_lat_avg  = sum(cur_lats) / len(cur_lats) if cur_lats else None
+                    cur_rssi_avg = sum(cur_rssi) / len(cur_rssi) if cur_rssi else None
+                    r        = cur_seq_range
+                    seq_str  = f"[{r['min']}..{r['max']}]" if r else "no data"
+                    lat_str  = f"{cur_lat_avg:.0f} ms"   if cur_lat_avg  is not None else "N/A"
+                    rssi_str = f"{cur_rssi_avg:.1f} dBm" if cur_rssi_avg is not None else "N/A"
+                    extra    = ""
+                    if antipkt_fail_counts.get(node): extra += f"  ap_fail:{antipkt_fail_counts[node]}"
+                    if ferry_dup_counts.get(node):    extra += f"  dup:{ferry_dup_counts[node]}"
+                    lines.append(
+                        f"    Boot {cur_boot}: seq {seq_str}  {len(cur_delivered)} pkts  "
+                        f"avg {lat_str}  rssi {rssi_str}{extra}  [active at exit]"
+                    )
             lines.append("")
 
         #  notes
         lines.append("Notes")
-        lines.append("  Unique delivered  : distinct (source, seq) pairs from @METRIC events.")
+        lines.append("  Uniq / Poss / Rate: aggregated across all boots. Poss = sum of")
+        lines.append("                      (max_seq - min_seq + 1) per boot; seq resets")
+        lines.append("                      each boot so boots are counted independently.")
+        lines.append("  Unique delivered  : distinct (source, boot, seq) pairs from @METRIC.")
         lines.append("  Ferry dups        : same bundle reached BS via a second forwarder;")
         lines.append("                      counted in total deliveries, not unique.")
         lines.append("  Antipacket fails  : same forwarder re-sent the bundle; excluded from")
         lines.append("                      both unique and total counts.")
-        lines.append("  Undelivered est.  : sum across all boots of (last_seq - first_seq + 1)")
-        lines.append("                      minus unique delivered per boot. Seq numbers reset")
-        lines.append("                      each boot, so boots are summed independently.")
+        lines.append("  AvgRSSI           : current boot only (cleared on node restart).")
         lines.append("=" * W)
 
         report = "\n".join(lines)
@@ -497,8 +556,9 @@ def update_graph(frame):
             print(f"Node {n} timed out. Removing from visualizer.")
             G.remove_node(n)
 
-        ax_graph = plt.subplot(1, 2, 1)
-        ax_log   = plt.subplot(1, 2, 2)
+        ax_graph = plt.subplot(1, 3, 1)
+        ax_log   = plt.subplot(1, 3, 2)
+        ax_map   = plt.subplot(1, 3, 3)
 
         # event log panel
         ax_log.axis('off')
@@ -565,6 +625,87 @@ def update_graph(frame):
                             transform=ax_log.transAxes, fontsize=8, color='sienna',
                             verticalalignment='top', fontfamily='monospace')
                 y_stats -= 0.045
+
+        # node positions
+        known_locs = {nid: loc for nid, loc in node_locations.items()
+                      if loc['lat'] != 0.0 or loc['lon'] != 0.0}
+        if known_locs:
+            y_stats -= 0.01
+            ax_log.text(0.02, y_stats, "- Node Positions -", transform=ax_log.transAxes,
+                        fontsize=8, color='black', verticalalignment='top', fontweight='bold')
+            y_stats -= 0.05
+            for nid, loc in sorted(known_locs.items()):
+                age = int(current_time - loc['updated_at'])
+                age_str = f"{age}s ago"
+                rssi_str = f"  BS:{loc['rssi']} dBm" if loc['rssi'] is not None else ""
+                ax_log.text(0.02, y_stats,
+                            f"  Node {nid}: {loc['lat']:.5f},{loc['lon']:.5f}"
+                            f"  {loc['alt']:.0f}m{rssi_str}  ({age_str})",
+                            transform=ax_log.transAxes, fontsize=7.5, color='darkslateblue',
+                            verticalalignment='top', fontfamily='monospace')
+                y_stats -= 0.045
+
+        # radio map panel
+        _NODE_COLORS = ['dodgerblue', 'tomato', 'limegreen', 'darkorchid']
+        _NODE_MARKERS = ['o', 's', '^', 'D']
+        ax_map.set_title("Radio Map (RSSI vs Position)", fontsize=10, fontweight='bold')
+        ax_map.set_xlim(-RADIO_MAP_HALF_M, RADIO_MAP_HALF_M)
+        ax_map.set_ylim(-RADIO_MAP_HALF_M, RADIO_MAP_HALF_M)
+        ax_map.set_xlabel("X (m)", fontsize=8)
+        ax_map.set_ylabel("Y (m)", fontsize=8)
+        ax_map.set_aspect('equal')
+        ax_map.grid(True, alpha=0.3)
+        ax_map.axhline(0, color='gray', linewidth=0.5)
+        ax_map.axvline(0, color='gray', linewidth=0.5)
+
+        sorted_map_nodes = sorted(radio_map_samples.keys())
+        _rssi_sc = None
+        for idx, nid in enumerate(sorted_map_nodes):
+            samples = list(radio_map_samples[nid])
+            if not samples:
+                continue
+            xs    = [s[0] for s in samples]
+            ys    = [s[1] for s in samples]
+            rssis = [s[2] for s in samples]
+            _rssi_sc = ax_map.scatter(
+                xs, ys, c=rssis, cmap='RdYlGn',
+                vmin=-90, vmax=-30, s=80, alpha=0.8,
+                marker=_NODE_MARKERS[idx % len(_NODE_MARKERS)],
+                linewidths=0, zorder=2,
+                label=f"Node {nid}",
+            )
+
+        if _rssi_sc is not None:
+            cb = plt.colorbar(_rssi_sc, ax=ax_map, fraction=0.046, pad=0.04)
+            cb.set_label("RSSI (dBm)", fontsize=7)
+            cb.ax.tick_params(labelsize=7)
+            if len(sorted_map_nodes) > 1:
+                ax_map.legend(fontsize=7, loc='upper right', markerscale=1.2)
+
+        # current rover positions
+        for idx, nid in enumerate(sorted_map_nodes):
+            loc = node_locations.get(nid)
+            if loc is None:
+                continue
+            cx, cy = loc['lat'], loc['lon']
+            age = current_time - loc['updated_at']
+            alpha = max(0.3, 1.0 - age / 10.0)
+            ax_map.scatter([cx], [cy], s=200,
+                           marker=_NODE_MARKERS[idx % len(_NODE_MARKERS)],
+                           color='white', edgecolors='black',
+                           linewidths=1.5, zorder=6, alpha=alpha)
+            ax_map.annotate(
+                nid, (cx, cy),
+                textcoords='offset points', xytext=(6, 4),
+                fontsize=7, fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.6, lw=0),
+            )
+
+        total_samples = sum(len(v) for v in radio_map_samples.values())
+        ax_map.set_title(
+            f"Radio Map  ({total_samples} samples)",
+            fontsize=10, fontweight='bold',
+        )
 
         # graph panel
         if len(G.nodes) == 0:
@@ -636,7 +777,7 @@ if __name__ == '__main__':
     thread = threading.Thread(target=serial_reader_thread, args=(SERIAL_PORT,), daemon=True)
     try:
         thread.start()
-        fig = plt.figure(figsize=(14, 6))
+        fig = plt.figure(figsize=(21, 7))
         ani = animation.FuncAnimation(fig, update_graph, interval=500, cache_frame_data=False)
         plt.show()
     except KeyboardInterrupt:

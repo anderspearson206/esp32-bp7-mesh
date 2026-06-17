@@ -88,10 +88,10 @@ TELEMETRY_ACK_LIFETIME   = 10000    # ms
 
 BEACON_INTERVAL_S          = 1.0
 FORWARD_INTERVAL_S         = 1.0
-PEER_TIMEOUT_S             = 15.0
+PEER_TIMEOUT_S             = 10.0
 BUNDLE_RETRANSMIT_S        = 5.0    # re-send a forwarded-but-unacked bundle to the BS after 5s
 LOCATION_INTERVAL_S        = 5.0    # how often to broadcast own location to neighbors
-LOCATION_BUNDLE_INTERVAL_S = 30.0   # how often to send location as a telemetry bundle toward BS
+LOCATION_BUNDLE_INTERVAL_S = 5.0    # how often to send location as a telemetry bundle toward BS
 
 RECONNECT_DELAY_S  = 5.0
 SERIAL_SETTLE_S    = 3.0
@@ -934,23 +934,22 @@ class RoverDaemon:
         self._main_loop()
 
     def _start_ros_location(self, topic: str) -> None:
-        """Spin a background rospy subscriber that keeps self._own_location current.
+        """Keep self._own_location current from a ROS nav_msgs/Odometry topic.
 
-        The Odometry position (x, y, z metres in the odom frame) maps directly to
-        the lat/lon/alt fields used by the rest of the daemon.  When a GPS-based
-        topic is available in future, swap the subscriber and the semantics become
-        correct geographic coordinates automatically.
+        Tries rospy first; if rospy is not importable (ROS Melodic ships Python 2
+        rospy only) falls back to parsing `rostopic echo --noarr -n 0` output so
+        the daemon works under plain python3 without any extra packages.
         """
-        if not _ROS_AVAILABLE:
-            print("[LOC] rospy not available — location fixed at static value; "
-                  "source a ROS 1 workspace to enable live updates")
-            return
+        if _ROS_AVAILABLE:
+            self._start_ros_location_rospy(topic)
+        else:
+            self._start_ros_location_subprocess(topic)
 
+    def _start_ros_location_rospy(self, topic: str) -> None:
         def _thread() -> None:
             try:
-                # disable_signals=True is required when init_node is called from a
-                # non-main thread; otherwise rospy tries to install signal handlers
-                # that conflict with Python's main-thread-only signal mechanism.
+                # disable_signals=True required when init_node is called from a
+                # non-main thread (signal handlers must stay on the main thread).
                 rospy.init_node('rover_daemon_loc', anonymous=True, disable_signals=True)
 
                 def _cb(msg: _Odometry) -> None:
@@ -959,10 +958,86 @@ class RoverDaemon:
                         self._own_location = {'lat': p.x, 'lon': p.y, 'alt': p.z}
 
                 rospy.Subscriber(topic, _Odometry, _cb)
-                print(f"[LOC] Subscribed to {topic} (nav_msgs/Odometry)")
+                print(f"[LOC] Subscribed to {topic} via rospy")
                 rospy.spin()
             except Exception as exc:
-                print(f"[LOC] ROS location thread failed: {exc}")
+                print(f"[LOC] rospy location thread failed: {exc}")
+
+        threading.Thread(target=_thread, daemon=True, name='ros-loc').start()
+
+    def _start_ros_location_subprocess(self, topic: str) -> None:
+        """Parse `rostopic echo` YAML output to extract pose.pose.position x/y/z."""
+        import subprocess, re
+        print(f"[LOC] rospy unavailable - falling back to rostopic echo for {topic}")
+
+        def _thread() -> None:
+            while True:
+                try:
+                    proc = subprocess.Popen(
+                        ['rostopic', 'echo', topic],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        universal_newlines=True,
+                    )
+                    # nav_msgs/Odometry YAML structure:
+                    #   pose:          indent 0  -> pose_depth = 1
+                    #     pose:        indent 2  -> pose_depth = 2
+                    #       position:  indent 4  -> in_position = True, position_indent = 4
+                    #         x: 1.2  indent 6  -> collect (indent > position_indent)
+                    #         y: -0.5
+                    #         z: 0.08
+                    buf: dict = {}
+                    pose_depth   = 0
+                    in_position  = False
+                    position_indent = -1
+                    key_re = re.compile(r'^(\s*)(\w+)\s*:\s*(.*)')
+                    for line in proc.stdout:
+                        if line.rstrip() == '---':
+                            pose_depth = 0
+                            in_position = False
+                            position_indent = -1
+                            buf = {}
+                            continue
+                        m = key_re.match(line)
+                        if not m:
+                            continue
+                        indent = len(m.group(1))
+                        key    = m.group(2)
+                        val    = m.group(3).strip()
+
+                        if in_position:
+                            if indent <= position_indent:
+                                # exited the position block
+                                in_position = False
+                            elif key in ('x', 'y', 'z') and val:
+                                try:
+                                    buf[key] = float(val)
+                                except ValueError:
+                                    pass
+                            if len(buf) == 3:
+                                with self._lock:
+                                    self._own_location = {
+                                        'lat': buf['x'],
+                                        'lon': buf['y'],
+                                        'alt': buf['z'],
+                                    }
+                                buf = {}
+                            continue
+
+                        # state machine to find pose > pose > position
+                        if key == 'pose' and indent == 0:
+                            pose_depth = 1
+                        elif key == 'pose' and pose_depth == 1:
+                            pose_depth = 2
+                        elif key == 'position' and pose_depth == 2:
+                            in_position = True
+                            position_indent = indent
+                        elif indent == 0:
+                            # top-level key other than 'pose' resets pose tracking
+                            pose_depth = 0
+
+                except Exception as exc:
+                    print(f"[LOC] rostopic echo failed: {exc}; retrying in 5s")
+                    time.sleep(5)
 
         threading.Thread(target=_thread, daemon=True, name='ros-loc').start()
 

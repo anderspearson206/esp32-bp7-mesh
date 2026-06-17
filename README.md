@@ -6,6 +6,65 @@ A Delay-Tolerant Networking (DTN) mesh for a fleet of autonomous ground rovers. 
 
 **Architecture (rover side)**: On **rover** nodes the ESP32 is a *pure broadcast relay* — it broadcasts every over-air frame the Jetson hands it and forwards every received frame back to the Jetson (with source MAC + RSSI). All DTN logic (beacons, bundle store, routing, antipacket/dedup, ACK-maps) runs in **`rover_daemon.py`** on the Jetson. The **Base Station** ESP32 still runs the full firmware stack unchanged, so the over-air wire format is identical and `mesh_visualizer.py` reads the BS serial port exactly as before. A single firmware binary selects its role at boot from its node ID.
 
+## Quick Start
+
+### 1 — Flash the ESP32-C5s
+
+```bash
+# Build firmware (ESP-IDF v6.0 required, IDF_PATH set)
+idf.py build
+
+# Flash base station
+idf.py -p COM13 flash
+
+# Flash each rover
+idf.py -p COM14 flash
+```
+
+Each node auto-detects its role at boot from its STA MAC. The base station prints `I am the Base Station`; rovers print `I am a Rover`. Optionally configure `WIFI_BAND_MODE_5G_ONLY` in firmware to restrict to 5 GHz (see Build & Flash below — `esp_wifi_set_band_mode` must be called **after** `esp_wifi_start()`).
+
+### 2 — Start the rover daemon (one per rover)
+
+Run on the **Jetson** (or the bench laptop) attached to each rover's ESP32 over USB/UART:
+
+```bash
+pip install pyserial
+python rover_daemon.py --serial /dev/ttyUSB0   # Linux/Jetson
+python rover_daemon.py --serial COM14           # Windows bench
+```
+
+The daemon owns all DTN logic for that rover: it sends beacons, generates data bundles, stores and forwards received bundles, and applies ACK maps. Nothing happens over the air until the daemon is running. If the rover tracks its own position (e.g. from a VIO or GPS source), the daemon reads that location and sends it to the base station automatically — no extra configuration needed.
+
+### 3 — Start the visualizer on the base station laptop
+
+```bash
+pip install pyserial networkx matplotlib
+SERIAL_PORT=COM13 python mesh_visualizer.py     # Linux/macOS
+set SERIAL_PORT=COM13 && python mesh_visualizer.py  # Windows
+```
+
+The window shows three panels updated every 500 ms:
+
+| Panel | Contents |
+|---|---|
+| **Mesh graph** | Live topology — nodes, RSSI-labelled links, active bundle transfers (orange = ferried) |
+| **Bundle events / metrics** | Recent deliveries, per-node packet counts, avg latency, node positions |
+| **Radio map** | Scatter plot of every `@LOCATION:` sample received, coloured by RSSI (red = weak → green = strong); current rover position shown with a white-outlined marker |
+
+Radio map range is set by `RADIO_MAP_HALF_M` at the top of `mesh_visualizer.py` (default `25.0` → ±25 m, i.e. a 50×50 m map).
+
+### Running an experiment
+
+1. Ensure `rover_daemon.py` is running on each rover.
+2. Reboot all ESP32s (power-cycle or `idf.py -p <PORT> monitor` → `Ctrl-T Ctrl-R`). The visualizer detects each node's new `boot_id` and saves the previous session's metrics automatically — this gives you a clean slate for each run.
+3. Start `mesh_visualizer.py` on the BS laptop.
+4. Move rovers through their trajectories.
+5. **End the experiment**: press `Ctrl-C` or close the visualizer window. All delivery metrics and coverage data are saved automatically to `bs_reports/`.
+
+Per-session CSV coverage logs (`bs_reports/coverage_<timestamp>.csv`) contain every `(node, x, y, z, rssi)` sample received — useful for post-processing radio maps offline.
+
+---
+
 ## Status
 
 | Feature | State |
@@ -147,11 +206,13 @@ CRC-16/CCITT over `[CMD, LEN_LO, LEN_HI, PAYLOAD...]`.
 
 | Prefix | Format | Meaning |
 |---|---|---|
-| `@NET:` | `@NET:<node>:<parent>:<rssi>` | Topology heartbeat |
+| `@NET:` | `@NET:<node>:<parent>:<rssi>` | Topology heartbeat (BS emits self-heartbeat `@NET:<bs_id>:0:0` every 5 s) |
 | `@DTN_RX:` | `@DTN_RX:<src>:<prev>:<seq>:<receiver>:<hops>` | Bundle received at BS |
 | `@METRIC:` | `@METRIC:<src>:<seq>:<hops>:<latency_ms>` | End-to-end latency (clock-corrected) |
-| `@ANTIPKT_FAIL:` | `@ANTIPKT_FAIL:<src>:<seq>:<prev>` | Duplicate from same forwarder |
-| `@FERRY_DUP:` | `@FERRY_DUP:<src>:<seq>:<first_prev>:<dup_prev>` | Bundle arrived via two forwarders |
+| `@LOCATION:` | `@LOCATION:<node>:<x>:<y>:<z>:<rssi>` | Rover position in metres (x/y/z) with BS RSSI at that point; emitted by the rover daemon every 5 s when location data is available |
+| `@ANTIPKT_FAIL:` | `@ANTIPKT_FAIL:<src>:<seq>:<prev>` | Duplicate from same forwarder — antipacket didn't reach that node |
+| `@FERRY_DUP:` | `@FERRY_DUP:<src>:<seq>:<first_prev>:<dup_prev>` | Same bundle arrived via two different forwarders (expected epidemic behaviour) |
+| `@NODE_RESTART:` | `@NODE_RESTART:<node_id>` | BS detected a rover's `boot_id` changed; visualizer archives per-node metrics and resets counters for that node |
 
 ## Python Tools
 
@@ -162,17 +223,29 @@ pip install pyserial networkx matplotlib
 
 ### Mesh Visualizer
 
-Connects to the base station serial port, parses `@NET:` / `@DTN_RX:` / `@METRIC:` lines, and animates the live network graph.
+Connects to the base station serial port and animates a three-panel live display updated every 500 ms.
 
 ```bash
-# Set port via environment variable, then run
-SERIAL_PORT=COM13 python mesh_visualizer.py
-
-# Or edit SERIAL_PORT at the top of the file
-python mesh_visualizer.py
+SERIAL_PORT=COM13 python mesh_visualizer.py        # Windows
+SERIAL_PORT=/dev/ttyUSB0 python mesh_visualizer.py # Linux/macOS
+# or edit SERIAL_PORT at the top of the file
 ```
 
-On Linux/macOS substitute `SERIAL_PORT=/dev/ttyUSB0`.
+**Panels:**
+
+- **Mesh graph** — live topology with RSSI-labelled edges; active bundle transfers highlighted (red = direct, orange dashed = ferried).
+- **Bundle events / metrics** — scrolling delivery log, per-node packet count and average latency, current node positions with RSSI.
+- **Radio map** — metre-scale scatter plot built from `@LOCATION:` messages. Each point is coloured by RSSI (`RdYlGn` colormap: red = weak, green = strong). The current rover position is shown with a white-outlined marker that fades if no update has arrived recently. Map range is controlled by `RADIO_MAP_HALF_M` at the top of the file (default `25.0` = ±25 m).
+
+**Session management** — on serial reconnect or BS reboot detection (`"I am the Base Station"` in stream), the current session is saved to `bs_reports/` and state resets. On `@NODE_RESTART:`, only the named node's metrics reset, preserving data from other nodes. At exit (`Ctrl-C` or window close) a full summary is printed and saved.
+
+**Output files** (all written to `bs_reports/`):
+
+| File | Contents |
+|---|---|
+| `dtn_summary_<timestamp>.txt` | Full session delivery/latency/RSSI report |
+| `node_<id>_boot<n>.txt` | Per-node per-boot summary saved on each `@NODE_RESTART:` |
+| `coverage_<timestamp>.csv` | Every `(timestamp, node, x, y, z, rssi)` location sample |
 
 ### BS Ferry Monitor
 
