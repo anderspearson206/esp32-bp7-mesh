@@ -4,7 +4,7 @@ A Delay-Tolerant Networking (DTN) mesh for a fleet of autonomous ground rovers. 
 
 **Deployment**: 3 rovers + 1 fixed base station (BS). Most data flows rover → BS. Rovers follow pre-planned trajectories with intermittent connectivity — bundles are carried (ferried) across disconnections by intermediary rovers.
 
-**Architecture (rover side)**: On **rover** nodes the ESP32 is a *pure broadcast relay* — it broadcasts every over-air frame the Jetson hands it and forwards every received frame back to the Jetson (with source MAC + RSSI). All DTN logic (beacons, bundle store, routing, antipacket/dedup, ACK-maps) runs in **`rover_daemon.py`** on the Jetson. The **Base Station** ESP32 still runs the full firmware stack unchanged, so the over-air wire format is identical and `mesh_visualizer.py` reads the BS serial port exactly as before. A single firmware binary selects its role at boot from its node ID.
+**Architecture (rover side)**: On **rover** nodes the ESP32 is a _pure broadcast relay_ — it broadcasts every over-air frame the Jetson hands it and forwards every received frame back to the Jetson (with source MAC + RSSI). All DTN logic (beacons, bundle store, routing, antipacket/dedup, ACK-maps) runs in **`rover_daemon.py`** on the Jetson. The **Base Station** ESP32 still runs the full firmware stack unchanged, so the over-air wire format is identical and `mesh_visualizer.py` reads the BS serial port exactly as before. A single firmware binary selects its role at boot from its node ID.
 
 ## Quick Start
 
@@ -15,6 +15,7 @@ A Delay-Tolerant Networking (DTN) mesh for a fleet of autonomous ground rovers. 
 idf.py build
 
 # Flash base station
+# the port will change based on device
 idf.py -p COM13 flash
 
 # Flash each rover
@@ -39,17 +40,16 @@ The daemon owns all DTN logic for that rover: it sends beacons, generates data b
 
 ```bash
 pip install pyserial networkx matplotlib
-SERIAL_PORT=COM13 python mesh_visualizer.py     # Linux/macOS
-set SERIAL_PORT=COM13 && python mesh_visualizer.py  # Windows
+python mesh_visualizer.py # you may need to adjust the serial port
 ```
 
 The window shows three panels updated every 500 ms:
 
-| Panel | Contents |
-|---|---|
-| **Mesh graph** | Live topology — nodes, RSSI-labelled links, active bundle transfers (orange = ferried) |
-| **Bundle events / metrics** | Recent deliveries, per-node packet counts, avg latency, node positions |
-| **Radio map** | Scatter plot of every `@LOCATION:` sample received, coloured by RSSI (red = weak → green = strong); current rover position shown with a white-outlined marker |
+| Panel                       | Contents                                                                                                                                                      |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Mesh graph**              | Live topology — nodes, RSSI-labelled links, active bundle transfers (orange = ferried)                                                                        |
+| **Bundle events / metrics** | Recent deliveries, per-node packet counts, avg latency, node positions                                                                                        |
+| **Radio map**               | Scatter plot of every `@LOCATION:` sample received, coloured by RSSI (red = weak → green = strong); current rover position shown with a white-outlined marker |
 
 Radio map range is set by `RADIO_MAP_HALF_M` at the top of `mesh_visualizer.py` (default `25.0` → ±25 m, i.e. a 50×50 m map).
 
@@ -67,19 +67,19 @@ Per-session CSV coverage logs (`bs_reports/coverage_<timestamp>.csv`) contain ev
 
 ## Status
 
-| Feature | State |
-|---|---|
-| ESP-NOW transport | Done |
-| Epidemic store-and-forward | Done |
-| DTN ferrying (verified) | Done |
-| Clock sync / latency correction | Done |
-| Host UART interface (Jetson ↔ ESP32) | Done |
-| Antipackets (suppress redelivery) | Done |
-| LCD / LED / button UI on BS | Done |
+| Feature                                              | State                       |
+| ---------------------------------------------------- | --------------------------- |
+| ESP-NOW transport                                    | Done                        |
+| Epidemic store-and-forward                           | Done                        |
+| DTN ferrying (verified)                              | Done                        |
+| Clock sync / latency correction                      | Done                        |
+| Host UART interface (Jetson ↔ ESP32)                | Done                        |
+| Antipackets (suppress redelivery)                    | Done                        |
+| LCD / LED / button UI on BS                          | Done                        |
 | Rover ESP32 = dumb relay, logic in `rover_daemon.py` | Done (builds + unit-tested) |
-| Verify relay/daemon split on hardware | In progress |
-| Downlink / ACK to rovers | Not yet done |
-| Integration onto rover hardware | Not yet done |
+| Verify relay/daemon split on hardware                | In progress                 |
+| Downlink / ACK to rovers                             | Not yet done                |
+| Integration onto rover hardware                      | Not yet done                |
 
 ## Hardware
 
@@ -89,12 +89,12 @@ Per-session CSV coverage logs (`bs_reports/coverage_<timestamp>.csv`) contain ev
 
 ### GPIO Pinout
 
-| Pin | Function |
-|---|---|
-| GPIO 9 | Pushbutton (BS only) |
-| GPIO 10 | Status LED (all nodes) |
-| GPIO 7 | LCD SDA / UART1 TX to Jetson |
-| GPIO 8 | LCD SCL |
+| Pin     | Function                     |
+| ------- | ---------------------------- |
+| GPIO 9  | Pushbutton (BS only)         |
+| GPIO 10 | Status LED (all nodes)       |
+| GPIO 7  | LCD SDA / UART1 TX to Jetson |
+| GPIO 8  | LCD SCL                      |
 
 > When using UART1 for the Jetson interface, the LCD must be removed — they share GPIO 7/8.
 
@@ -102,11 +102,11 @@ Per-session CSV coverage logs (`bs_reports/coverage_<timestamp>.csv`) contain ev
 
 Node IDs are derived from `(mac[4] << 8) | mac[5]` of the STA MAC, printed on boot.
 
-| Node | COM Port | Node ID | MAC suffix |
-|---|---|---|---|
-| Base Station | COM13 | 23768 | `eb:5c:d8` |
-| Rover B | — | 57936 | `e2:50` |
-| Rover C | — | 54272 | `d4:00` |
+| Node         | COM Port | Node ID | MAC suffix |
+| ------------ | -------- | ------- | ---------- |
+| Base Station | COM13    | 23768   | `eb:5c:d8` |
+| Rover B      | —        | 57936   | `e2:50`    |
+| Rover C      | —        | 54272   | `d4:00`    |
 
 ## Build and Flash
 
@@ -132,17 +132,17 @@ idf.py -p COM13 flash monitor
 
 All tunable constants are at the top of `main/mesh_main.c`:
 
-| Constant | Default | Notes |
-|---|---|---|
-| `BASE_STATION_NODE_ID` | 23768 | Match to your BS hardware |
-| `ESPNOW_CHANNEL` | 36 | 5 GHz UNII-1, 5180 MHz, no DFS — all nodes must match |
-| `PEER_TIMEOUT_MS` | 15000 | ms before an unheard peer is marked inactive |
-| `HOST_UART_PORT` | `UART_NUM_0` | Bench: USB; swap to `UART_NUM_1` for Jetson |
-| `HOST_UART_TX_PIN` | `UART_PIN_NO_CHANGE` | UART0 fixed by bootloader; set GPIO 6/7 for UART1 |
-| `HOST_UART_RX_PIN` | `UART_PIN_NO_CHANGE` | Same |
-| `HOST_PULL_INTERVAL_MS` | 1000 | How often ESP32 pulls bundles from Jetson (ms) |
-| `MAX_BUNDLES_IN_RAM` | 100 | Bundle store slots per node |
-| `BUNDLE_PAYLOAD_SIZE` | 1024 | Max payload bytes per bundle |
+| Constant                | Default              | Notes                                                 |
+| ----------------------- | -------------------- | ----------------------------------------------------- |
+| `BASE_STATION_NODE_ID`  | 23768                | Match to your BS hardware                             |
+| `ESPNOW_CHANNEL`        | 36                   | 5 GHz UNII-1, 5180 MHz, no DFS — all nodes must match |
+| `PEER_TIMEOUT_MS`       | 15000                | ms before an unheard peer is marked inactive          |
+| `HOST_UART_PORT`        | `UART_NUM_0`         | Bench: USB; swap to `UART_NUM_1` for Jetson           |
+| `HOST_UART_TX_PIN`      | `UART_PIN_NO_CHANGE` | UART0 fixed by bootloader; set GPIO 6/7 for UART1     |
+| `HOST_UART_RX_PIN`      | `UART_PIN_NO_CHANGE` | Same                                                  |
+| `HOST_PULL_INTERVAL_MS` | 1000                 | How often ESP32 pulls bundles from Jetson (ms)        |
+| `MAX_BUNDLES_IN_RAM`    | 100                  | Bundle store slots per node                           |
+| `BUNDLE_PAYLOAD_SIZE`   | 1024                 | Max payload bytes per bundle                          |
 
 ## Architecture
 
@@ -161,11 +161,12 @@ Reproduces the rover-side behavior in Python so the BS sees identical traffic: 1
 
 ### Firmware (`main/mesh_main.c`) — Base Station stack
 
-**Bundle store**: Flat array of 100 `ram_bundle_t` slots. Each holds a `dtn_bundle_t` (source, dest, prev\_node, sequence number, creation\_time, lifetime/TTL, hop count/limit, payload) plus `is_empty` and `forwarded` flags. A FreeRTOS mutex protects both the bundle store and peer list.
+**Bundle store**: Flat array of 100 `ram_bundle_t` slots. Each holds a `dtn_bundle_t` (source, dest, prev_node, sequence number, creation_time, lifetime/TTL, hop count/limit, payload) plus `is_empty` and `forwarded` flags. A FreeRTOS mutex protects both the bundle store and peer list.
 
-**`beacon_task`**: Broadcasts a `beacon_pkt_t` (node\_id + timestamp\_ms) every 1 s to the ESP-NOW broadcast MAC. Used for peer discovery and clock-offset measurement.
+**`beacon_task`**: Broadcasts a `beacon_pkt_t` (node_id + timestamp_ms) every 1 s to the ESP-NOW broadcast MAC. Used for peer discovery and clock-offset measurement.
 
 **`rx_process_task`**: Receives from a queue populated by the ESP-NOW recv callback. Handles:
+
 - `PKT_TYPE_BEACON` — calls `add_or_refresh_peer`, updates clock offset at BS, emits `@NET:` line.
 - `PKT_TYPE_BUNDLE` — deduplicates by `(source_node, creation_time, sequence_number)`, stores bundle, generates telemetry ACK on rovers, prints `@METRIC:` + `@DTN_RX:` at BS.
 - `PKT_TYPE_ANTIPKT` — marks matching stored bundles for deletion (BS-originated suppression).
@@ -179,44 +180,47 @@ Reproduces the rover-side behavior in Python so the BS sees identical traffic: 1
 ### Host UART Protocol
 
 Binary framing over UART. Frame format:
+
 ```
 [SOF: 0xAA][CMD: 1][LEN_LO][LEN_HI][PAYLOAD: LEN bytes][CRC16_LO][CRC16_HI]
 ```
+
 CRC-16/CCITT over `[CMD, LEN_LO, LEN_HI, PAYLOAD...]`.
 
-| CMD | Hex | Direction | Payload |
-|---|---|---|---|
-| `TX_BUNDLE` | `0x01` | Jetson → ESP32 | raw `dtn_bundle_t` bytes |
-| `QUERY_STATUS` | `0x02` | Jetson → ESP32 | none |
-| `QUERY_PEERS` | `0x03` | Jetson → ESP32 | none |
-| `PULL_REQ` | `0x10` | ESP32 → Jetson | none |
-| `BUNDLE_DATA` | `0x11` | Jetson → ESP32 | raw `dtn_bundle_t` bytes |
-| `NO_BUNDLES` | `0x12` | Jetson → ESP32 | none |
-| `ANTIPKT_NOTIFY` | `0x13` | ESP32 → Jetson | `antipkt_id_t` (10 bytes) |
-| `BUNDLE_PUSH` | `0x14` | ESP32 → Jetson | raw `dtn_bundle_t` bytes |
-| `ACK` | `0x20` | ESP32 → Jetson | 1 byte (0=ok, 1=error) |
-| `STATUS_RESP` | `0x21` | ESP32 → Jetson | `host_status_t` (6 bytes) |
-| `PEERS_RESP` | `0x22` | ESP32 → Jetson | n × `host_peer_entry_t` (4 bytes each) |
-| `WIFI_TX` | `0x30` | Jetson → ESP32 | raw over-air bytes, broadcast verbatim (rover relay) |
-| `WIFI_RX` | `0x31` | ESP32 → Jetson | `[src_mac:6][rssi:1][air bytes]` per received frame (rover relay) |
+| CMD              | Hex    | Direction      | Payload                                                           |
+| ---------------- | ------ | -------------- | ----------------------------------------------------------------- |
+| `TX_BUNDLE`      | `0x01` | Jetson → ESP32 | raw `dtn_bundle_t` bytes                                          |
+| `QUERY_STATUS`   | `0x02` | Jetson → ESP32 | none                                                              |
+| `QUERY_PEERS`    | `0x03` | Jetson → ESP32 | none                                                              |
+| `PULL_REQ`       | `0x10` | ESP32 → Jetson | none                                                              |
+| `BUNDLE_DATA`    | `0x11` | Jetson → ESP32 | raw `dtn_bundle_t` bytes                                          |
+| `NO_BUNDLES`     | `0x12` | Jetson → ESP32 | none                                                              |
+| `ANTIPKT_NOTIFY` | `0x13` | ESP32 → Jetson | `antipkt_id_t` (10 bytes)                                         |
+| `BUNDLE_PUSH`    | `0x14` | ESP32 → Jetson | raw `dtn_bundle_t` bytes                                          |
+| `ACK`            | `0x20` | ESP32 → Jetson | 1 byte (0=ok, 1=error)                                            |
+| `STATUS_RESP`    | `0x21` | ESP32 → Jetson | `host_status_t` (6 bytes)                                         |
+| `PEERS_RESP`     | `0x22` | ESP32 → Jetson | n × `host_peer_entry_t` (4 bytes each)                            |
+| `WIFI_TX`        | `0x30` | Jetson → ESP32 | raw over-air bytes, broadcast verbatim (rover relay)              |
+| `WIFI_RX`        | `0x31` | ESP32 → Jetson | `[src_mac:6][rssi:1][air bytes]` per received frame (rover relay) |
 
 **Rover relay mode** (`rover_daemon.py`) uses only `WIFI_TX` / `WIFI_RX`, plus `QUERY_STATUS` / `STATUS_RESP` for node-ID detection. The bundle-centric commands (`TX_BUNDLE`, `PULL_REQ`, `BUNDLE_DATA`, `NO_BUNDLES`, `ANTIPKT_NOTIFY`, `BUNDLE_PUSH`) belong to the legacy `jetson_daemon.py` model. `HOST_MAX_PAYLOAD` is 1100 bytes (a relayed bundle is up to 6 + 1 + 1053 bytes).
 
 ### BS Serial Output (for visualizer)
 
-| Prefix | Format | Meaning |
-|---|---|---|
-| `@NET:` | `@NET:<node>:<parent>:<rssi>` | Topology heartbeat (BS emits self-heartbeat `@NET:<bs_id>:0:0` every 5 s) |
-| `@DTN_RX:` | `@DTN_RX:<src>:<prev>:<seq>:<receiver>:<hops>` | Bundle received at BS |
-| `@METRIC:` | `@METRIC:<src>:<seq>:<hops>:<latency_ms>` | End-to-end latency (clock-corrected) |
-| `@LOCATION:` | `@LOCATION:<node>:<x>:<y>:<z>:<rssi>` | Rover position in metres (x/y/z) with BS RSSI at that point; emitted by the rover daemon every 5 s when location data is available |
-| `@ANTIPKT_FAIL:` | `@ANTIPKT_FAIL:<src>:<seq>:<prev>` | Duplicate from same forwarder — antipacket didn't reach that node |
-| `@FERRY_DUP:` | `@FERRY_DUP:<src>:<seq>:<first_prev>:<dup_prev>` | Same bundle arrived via two different forwarders (expected epidemic behaviour) |
-| `@NODE_RESTART:` | `@NODE_RESTART:<node_id>` | BS detected a rover's `boot_id` changed; visualizer archives per-node metrics and resets counters for that node |
+| Prefix           | Format                                           | Meaning                                                                                                                            |
+| ---------------- | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `@NET:`          | `@NET:<node>:<parent>:<rssi>`                    | Topology heartbeat (BS emits self-heartbeat `@NET:<bs_id>:0:0` every 5 s)                                                          |
+| `@DTN_RX:`       | `@DTN_RX:<src>:<prev>:<seq>:<receiver>:<hops>`   | Bundle received at BS                                                                                                              |
+| `@METRIC:`       | `@METRIC:<src>:<seq>:<hops>:<latency_ms>`        | End-to-end latency (clock-corrected)                                                                                               |
+| `@LOCATION:`     | `@LOCATION:<node>:<x>:<y>:<z>:<rssi>`            | Rover position in metres (x/y/z) with BS RSSI at that point; emitted by the rover daemon every 5 s when location data is available |
+| `@ANTIPKT_FAIL:` | `@ANTIPKT_FAIL:<src>:<seq>:<prev>`               | Duplicate from same forwarder — antipacket didn't reach that node                                                                  |
+| `@FERRY_DUP:`    | `@FERRY_DUP:<src>:<seq>:<first_prev>:<dup_prev>` | Same bundle arrived via two different forwarders (expected epidemic behaviour)                                                     |
+| `@NODE_RESTART:` | `@NODE_RESTART:<node_id>`                        | BS detected a rover's `boot_id` changed; visualizer archives per-node metrics and resets counters for that node                    |
 
 ## Python Tools
 
 Install dependencies once:
+
 ```bash
 pip install pyserial networkx matplotlib
 ```
@@ -241,11 +245,11 @@ SERIAL_PORT=/dev/ttyUSB0 python mesh_visualizer.py # Linux/macOS
 
 **Output files** (all written to `bs_reports/`):
 
-| File | Contents |
-|---|---|
-| `dtn_summary_<timestamp>.txt` | Full session delivery/latency/RSSI report |
-| `node_<id>_boot<n>.txt` | Per-node per-boot summary saved on each `@NODE_RESTART:` |
-| `coverage_<timestamp>.csv` | Every `(timestamp, node, x, y, z, rssi)` location sample |
+| File                          | Contents                                                 |
+| ----------------------------- | -------------------------------------------------------- |
+| `dtn_summary_<timestamp>.txt` | Full session delivery/latency/RSSI report                |
+| `node_<id>_boot<n>.txt`       | Per-node per-boot summary saved on each `@NODE_RESTART:` |
+| `coverage_<timestamp>.csv`    | Every `(timestamp, node, x, y, z, rssi)` location sample |
 
 ### BS Ferry Monitor
 
@@ -268,12 +272,12 @@ python rover_daemon.py --serial /dev/ttyUSB0
 python rover_daemon.py --serial /dev/ttyTHS1 --baud 115200 --interval 1 --node-id 57936
 ```
 
-| Flag | Default | Notes |
-|---|---|---|
-| `--serial` | `/dev/ttyUSB0` | Serial port connected to the ESP32 |
-| `--baud` | 115200 | Must match `HOST_UART_BAUD` in firmware |
-| `--interval` | 1 | Seconds between generated sensor bundles (0 = disable) |
-| `--node-id` | auto | Override node ID (normally auto-detected from ESP32) |
+| Flag         | Default        | Notes                                                  |
+| ------------ | -------------- | ------------------------------------------------------ |
+| `--serial`   | `/dev/ttyUSB0` | Serial port connected to the ESP32                     |
+| `--baud`     | 115200         | Must match `HOST_UART_BAUD` in firmware                |
+| `--interval` | 1              | Seconds between generated sensor bundles (0 = disable) |
+| `--node-id`  | auto           | Override node ID (normally auto-detected from ESP32)   |
 
 > `jetson_daemon.py` is the **legacy** daemon for the old model where the ESP32 held the DTN logic (PULL/BUNDLE_PUSH). It is superseded by `rover_daemon.py` and kept only for reference.
 
@@ -300,7 +304,7 @@ python rover_daemon.py --serial /dev/ttyTHS1 --baud 115200 --interval 1 --node-i
 
 ## Known Issues / Gotchas
 
-**Band mode call order**: `esp_wifi_set_band_mode(WIFI_BAND_MODE_5G_ONLY)` must be called *after* `esp_wifi_start()`. Calling it before returns `ESP_ERR_WIFI_NOT_STARTED`.
+**Band mode call order**: `esp_wifi_set_band_mode(WIFI_BAND_MODE_5G_ONLY)` must be called _after_ `esp_wifi_start()`. Calling it before returns `ESP_ERR_WIFI_NOT_STARTED`.
 
 **Peer return not resetting `forwarded` flags**: When a timed-out peer comes back, its MAC is already in `peer_list` with `active=false`. The fix detects the inactive→active transition, resets `forwarded=false` on all stored bundles, and re-registers the peer with `esp_now_add_peer` (removed on timeout).
 
