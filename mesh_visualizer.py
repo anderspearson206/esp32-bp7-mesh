@@ -9,10 +9,11 @@ import matplotlib.animation as animation
 from collections import deque, defaultdict
 from datetime import datetime
 
-SERIAL_PORT = os.environ.get('SERIAL_PORT', 'COM5')  # override: SERIAL_PORT=/dev/ttyUSB0 python mesh_visualizer.py
+SERIAL_PORT = '/dev/ttyUSB0'
+SERIAL_PORT = 'COM5'
 BAUD_RATE = 115200
 TIMEOUT_SECONDS = 15
-RADIO_MAP_HALF_M = 5.0   # half-width of the radio map in metres (map spans ±this value)
+RADIO_MAP_HALF_M = 75.0   # half-width of the radio map in metres (map spans ±this value)
 
 G = nx.DiGraph()
 recent_transfers = []
@@ -181,6 +182,8 @@ def serial_reader_thread(port):
     while True:
         try:
             ser = serial.Serial(port, BAUD_RATE, timeout=1)
+            ser.dtr = False
+            ser.rts = False
             if not first_connect:
                 # BS came back after a disconnect, save old session and reset
                 print(f"[VISUALIZER] Reconnected to {port} - saving session and resetting state.")
