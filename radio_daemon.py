@@ -17,20 +17,33 @@ Usage:
     --baud     Baud rate (default: 115200)
     --interval Seconds between generated sensor bundles (default: 1, 0 = disable)
     --node-id  Override node ID (default: auto-detected from ESP32 STATUS_RESP on startup)
-    
+
     python3 radio_daemon.py --serial /dev/ttyUSB0 --ros-location-topic /car/t265/odom/sample
+
+Comms restriction modes (combinable, see --help for all options):
+    --bw-limit 1                     data bundles/s budget (beacons/ackmaps/location exempt)
+    --comms-on 30 --comms-off 60     radio fully on (TX+RX) 30 s, then fully off 60 s;
+                                     windows are aligned to wall-clock time so NTP-synced
+                                     rovers share the same schedule
+
+Every run writes a JSON-lines event log (rover_logs/ by default) with every TX/RX,
+store change, peer change, window transition and a 1 s state snapshot, plus a
+*_summary.json on shutdown.
 """
 
 import argparse
 import json
 import os
 import platform
+import signal
 import struct
 import threading
 import time
 import traceback
 import serial
 from abc import ABC, abstractmethod
+from collections import defaultdict
+from datetime import datetime
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 try:
@@ -92,11 +105,128 @@ PEER_TIMEOUT_S             = 10.0
 BUNDLE_RETRANSMIT_S        = 5.0    # re-send a forwarded-but-unacked bundle to the BS after 5s
 LOCATION_INTERVAL_S        = 5.0    # how often to broadcast own location to neighbors
 LOCATION_BUNDLE_INTERVAL_S = 5.0    # how often to send location as a telemetry bundle toward BS
+ROVER_STATUS_INTERVAL_S    = 5.0    # how often to send @ROVER_STATUS telemetry toward BS
+STATE_LOG_INTERVAL_S       = 1.0    # how often to write a full state snapshot to the event log
+BW_THROTTLE_LOG_S          = 1.0    # min spacing between bw_throttled log lines
 
 RECONNECT_DELAY_S  = 5.0
 SERIAL_SETTLE_S    = 3.0
 WRITE_TIMEOUT_S    = 2.0
 STATUS_INTERVAL_S  = 5.0
+
+
+# rover-side event log
+class EventLog:
+    """Append-only JSON-lines log, one object per line. Line-buffered so a power cut on
+    the rover loses at most the line being written."""
+
+    def __init__(self, path: Optional[str]):
+        self.path = path
+        self.node_id: Optional[int] = None
+        self._lock = threading.Lock()
+        self._t0 = time.monotonic()
+        self._f = None
+        if path:
+            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+            self._f = open(path, 'a', buffering=1)
+
+    def log(self, ev: str, **fields) -> None:
+        if self._f is None:
+            return
+        rec = {'t': round(time.time(), 3),
+               'up_ms': int((time.monotonic() - self._t0) * 1000),
+               'node': self.node_id, 'ev': ev}
+        rec.update(fields)
+        line = json.dumps(rec, separators=(',', ':'), default=str)
+        with self._lock:
+            try:
+                self._f.write(line + '\n')
+            except (OSError, ValueError):
+                pass
+
+    def close(self) -> None:
+        with self._lock:
+            if self._f is not None:
+                self._f.close()
+                self._f = None
+
+
+# artificial comms restrictions
+class CommsPolicy:
+    """Bandwidth budget + periodic radio windows.
+
+    bw_limit: data bundles per second allowed over the air (token bucket, 0 = unlimited).
+              Telemetry bundles (acks, location, status) are exempt unless count_telemetry.
+              Beacons, ackmaps and location broadcasts are never counted.
+    on_s/off_s: radio fully on for on_s, fully off (no TX, RX dropped) for off_s. Either
+              0 = always on. Windows are aligned to wall-clock time (epoch + phase_s) so
+              rovers with synced clocks open their windows together.
+    """
+
+    def __init__(self, bw_limit: float = 0.0, bw_burst: float = 1.0,
+                 count_telemetry: bool = False, on_s: float = 0.0, off_s: float = 0.0,
+                 phase_s: float = 0.0):
+        self.bw_limit        = max(0.0, bw_limit)
+        self.bw_burst        = max(1.0, bw_burst)
+        self.count_telemetry = count_telemetry
+        self.on_s            = max(0.0, on_s)
+        self.off_s           = max(0.0, off_s)
+        self.phase_s         = phase_s
+        self._tokens         = self.bw_burst
+        self._t              = time.monotonic()
+
+    @property
+    def periodic(self) -> bool:
+        return self.on_s > 0 and self.off_s > 0
+
+    def window(self) -> Tuple[bool, Optional[float], int]:
+        """(radio_on, seconds left in the current window or None, cycle index)."""
+        if not self.periodic:
+            return True, None, 0
+        rel = time.time() - self.phase_s
+        period = self.on_s + self.off_s
+        t = rel % period
+        cycle = int(rel // period)
+        if t < self.on_s:
+            return True, self.on_s - t, cycle
+        return False, period - t, cycle
+
+    def counts(self, b: dict) -> bool:
+        return self.bw_limit > 0 and (self.count_telemetry or not b.get('is_telemetry'))
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        self._tokens = min(self.bw_burst, self._tokens + (now - self._t) * self.bw_limit)
+        self._t = now
+
+    def tokens(self) -> Optional[float]:
+        if self.bw_limit <= 0:
+            return None
+        self._refill()
+        return round(self._tokens, 3)
+
+    def try_take(self) -> bool:
+        if self.bw_limit <= 0:
+            return True
+        self._refill()
+        if self._tokens >= 1.0:
+            self._tokens -= 1.0
+            return True
+        return False
+
+    def describe(self) -> dict:
+        return {'bw_limit': self.bw_limit, 'bw_burst': self.bw_burst,
+                'bw_count_telemetry': self.count_telemetry,
+                'comms_on_s': self.on_s, 'comms_off_s': self.off_s,
+                'comms_phase_s': self.phase_s, 'periodic': self.periodic}
+
+
+def _percentile(vals: List[float], p: float) -> Optional[float]:
+    if not vals:
+        return None
+    s = sorted(vals)
+    k = min(len(s) - 1, max(0, int(round(p / 100.0 * (len(s) - 1)))))
+    return s[k]
 
 
 # CRC-16/CCITT (poly 0x1021, init 0xFFFF)
@@ -356,7 +486,15 @@ class RoverDaemon:
     def __init__(self, serial_port: str, baud: int, gen_interval: float,
                  node_id_override: Optional[int], protocol: RoutingProtocol,
                  lat: float = 0.0, lon: float = 0.0, alt: float = 0.0,
-                 ros_location_topic: Optional[str] = None):
+                 ros_location_topic: Optional[str] = None,
+                 policy: Optional[CommsPolicy] = None,
+                 event_log: Optional[EventLog] = None,
+                 bw_order: str = 'oldest',
+                 payload_bytes: int = 0,
+                 retransmit_s: float = BUNDLE_RETRANSMIT_S,
+                 status_interval_s: float = ROVER_STATUS_INTERVAL_S,
+                 state_interval_s: float = STATE_LOG_INTERVAL_S,
+                 run_config: Optional[dict] = None):
         assert BUNDLE_SIZE == 1052, f"Bundle struct size mismatch: got {BUNDLE_SIZE}, expected 1052"
         assert ACKMAP_SIZE == 42,   f"Ackmap struct size mismatch: got {ACKMAP_SIZE}, expected 42"
 
@@ -366,6 +504,25 @@ class RoverDaemon:
         self._node_id_override = node_id_override
         self._node_id          = node_id_override
         self._protocol         = protocol
+
+        self._policy        = policy or CommsPolicy()
+        self._log           = event_log or EventLog(None)
+        self._log.node_id   = node_id_override
+        self._bw_order      = bw_order
+        self._payload_bytes = max(0, min(payload_bytes, 1024))
+        self._retransmit_ms = int(retransmit_s * 1000)
+        self._status_interval_s = status_interval_s
+        self._state_interval_s  = state_interval_s
+        self._run_config    = run_config or {}
+        # forward loop ticks fast enough to pace the bandwidth budget smoothly
+        self._forward_interval_s = (min(FORWARD_INTERVAL_S, 1.0 / self._policy.bw_limit)
+                                    if self._policy.bw_limit > 0 else FORWARD_INTERVAL_S)
+        self._radio_on: Optional[bool] = None
+        self._counters: Dict[str, int] = defaultdict(int)
+        self._ack_latencies_ms: List[int] = []     # own data bundles: generation -> BS ack
+        self._last_active: Set[int] = set()
+        self._last_throttle_log = 0.0
+        self._wall_start = time.time()
 
         self._store: List[dict] = []        # each: dtn fields + added_at_ms, forwarded, forwarded_ms
         self._lock = threading.Lock()
@@ -398,6 +555,40 @@ class RoverDaemon:
         with self._uart_lock:
             self._ser.write(frame)
 
+    def _air_tx(self, payload: bytes, kind: str, **fields) -> bool:
+        """Broadcast one over-air frame through the ESP32. Every air TX goes through here
+        so the periodic-comms gate and TX logging cannot be bypassed."""
+        if not self._radio_on:
+            self._counters['tx_blocked_off_' + kind] += 1
+            return False
+        self._send(HOST_CMD_WIFI_TX, payload)
+        self._counters['tx_' + kind] += 1
+        self._counters['tx_bytes'] += len(payload)
+        self._log.log('tx', kind=kind, bytes=len(payload), **fields)
+        return True
+
+    def _store_counts(self) -> dict:
+        own = ferried = tel = pending = 0
+        with self._lock:
+            for b in self._store:
+                if b.get('is_telemetry'):
+                    tel += 1
+                elif b['source_node'] == self._node_id:
+                    own += 1
+                else:
+                    ferried += 1
+                if not b.get('forwarded'):
+                    pending += 1
+            total = len(self._store)
+        return {'store': total, 'q_own_data': own, 'q_ferried_data': ferried,
+                'q_telemetry': tel, 'q_unforwarded': pending}
+
+    @staticmethod
+    def _bundle_fields(b: dict) -> dict:
+        return {'src': b['source_node'], 'seq': b['sequence_number'],
+                'prev': b.get('prev_node'), 'hops': b['hop_count'],
+                'tel': bool(b.get('is_telemetry')), 'plen': len(b.get('payload', b''))}
+
     # bundle store
     def _add_bundle(self, b: dict, is_local: bool = False) -> bool:
         key = (b['source_node'], b['creation_time'], b['sequence_number'])
@@ -427,6 +618,9 @@ class RoverDaemon:
             self._store = keep
         for b in drop:
             self._protocol.on_bundle_removed(b)
+            self._counters['expired_tel' if b.get('is_telemetry') else 'expired_data'] += 1
+            self._log.log('bundle_expired', age_ms=now - b.get('added_at_ms', now),
+                          tx_count=b.get('tx_count', 0), **self._bundle_fields(b))
         if drop:
             print(f"[STORE] Expired {len(drop)} bundles by TTL")
 
@@ -475,8 +669,22 @@ class RoverDaemon:
                 else:
                     keep.append(b)
             self._store = keep
+        now = int(time.monotonic() * 1000)
         for b in dropped:
             self._protocol.on_bundle_removed(b)
+            own = b['source_node'] == self._node_id
+            age_ms = now - b.get('added_at_ms', now)
+            first_tx = b.get('first_tx_ms')
+            if own and not b.get('is_telemetry'):
+                self._counters['acked_own_data'] += 1
+                self._ack_latencies_ms.append(age_ms)
+            elif b.get('is_telemetry'):
+                self._counters['acked_tel'] += 1
+            else:
+                self._counters['acked_ferried_data'] += 1
+            self._log.log('bundle_acked', own=own, age_ms=age_ms,
+                          queue_ms=(first_tx - b['added_at_ms']) if first_tx and 'added_at_ms' in b else None,
+                          tx_count=b.get('tx_count', 0), **self._bundle_fields(b))
         if dropped:
             print(f"[ANTIPKT] ACKMAP freed {len(dropped)} for src:{source_node} (store now {len(self._store)})")
 
@@ -498,9 +706,16 @@ class RoverDaemon:
         clock_offset_ms = timestamp_ms - daemon_rel_now   # peer_ts - daemon_ts; const between reboots
         self._peers[node_id] = {'last_seen': now, 'boot_id': boot_id, 'rssi': rssi,
                                 'clock_offset_ms': clock_offset_ms}
+        self._counters['rx_beacon'] += 1
+        self._log.log('rx_beacon', peer=node_id, rssi=rssi, peer_boot_id=boot_id,
+                      peer_ts_ms=timestamp_ms, clock_offset_ms=clock_offset_ms)
 
         if not (was_absent or restarted):
             return
+        self._last_active.add(node_id)
+        self._log.log('peer_up', peer=node_id, rssi=rssi,
+                      reason='restarted' if restarted else ('returned' if prev else 'discovered'),
+                      absent_ms=(now - prev['last_seen']) if prev else None)
 
         # A new/returned/restarted peer should receive everything we hold from other sources.
         bs_active = BASE_STATION_NODE_ID in self._active_peer_ids()
@@ -521,6 +736,7 @@ class RoverDaemon:
             self._store = keep
         for b in restart_dropped:
             self._protocol.on_bundle_removed(b)
+            self._log.log('bundle_drop_peer_restart', **self._bundle_fields(b))
         if restarted:
             self._ack.pop(node_id, None)   # clear stale ack window for the rebooted source
             print(f"[PEER] node {node_id} restarted (boot_id changed); reset forwarded flags"
@@ -529,12 +745,15 @@ class RoverDaemon:
             print(f"[PEER] node {node_id} {'returned' if prev else 'discovered'}; reset forwarded flags")
 
     # bundle rx
-    def _on_bundle(self, rest: bytes) -> None:
+    def _on_bundle(self, rest: bytes, rssi: Optional[int] = None) -> None:
         b = unpack_bundle(rest[1:])
         if not b:
             return
         b['added_at_ms'] = int(time.monotonic() * 1000)
-        if not self._add_bundle(b):
+        new = self._add_bundle(b)
+        self._counters['rx_bundle_new' if new else 'rx_bundle_dup'] += 1
+        self._log.log('rx_bundle', new=new, rssi=rssi, **self._bundle_fields(b))
+        if not new:
             return   # duplicate or already delivered
         print(f"[RX] bundle src:{b['source_node']} seq:{b['sequence_number']} "
               f"hops:{b['hop_count']} (store {len(self._store)})")
@@ -574,6 +793,7 @@ class RoverDaemon:
             'added_at_ms':     now,
         }
         self._add_bundle(ack, is_local=True)
+        self._log.log('bundle_gen', text=text, **self._bundle_fields(ack))
 
     # ackmap rx
     def _on_ackmap(self, rest: bytes) -> None:
@@ -581,6 +801,9 @@ class RoverDaemon:
         if fields is None:
             return
         _ptype, origin, source, seq_base, blen, bitmap = fields
+        self._counters['rx_ackmap'] += 1
+        self._log.log('rx_ackmap', origin=origin, ack_src=source, seq_base=seq_base, blen=blen,
+                      n_acked=sum(bin(x).count('1') for x in bitmap[:blen]))
         if origin != BASE_STATION_NODE_ID:
             return
         if blen == 0 or blen > ACKMAP_BITMAP_BYTES:
@@ -594,9 +817,11 @@ class RoverDaemon:
         self._merge_ackmap(source, seq_base, bitmap, blen)        # for propagation
         self._apply_ackmap_to_store(source, seq_base, bitmap, blen)
 
-    # forward and ack map propagation loop, runs every FORWARD_INTERVAL_S seconds
+    # forward and ack map propagation loop, runs every self._forward_interval_s seconds
     def _forward(self) -> None:
         self._expire_bundles()
+        if not self._radio_on:
+            return
         now = int(time.monotonic() * 1000)
         active = self._active_peer_ids()
         peers_active = len(active) > 0
@@ -604,18 +829,25 @@ class RoverDaemon:
 
         with self._lock:
             snapshot = list(self._store)
+        # transmission order under a bandwidth budget
+        snapshot.sort(key=lambda x: x.get('added_at_ms', 0), reverse=(self._bw_order == 'newest'))
 
         to_remove = []
+        throttled = 0
         for b in snapshot:
             if b['hop_count'] >= b['hop_limit']:
                 to_remove.append(b)
                 continue
             if (b.get('forwarded') and bs_active and
-                    (now - b.get('forwarded_ms', 0)) >= BUNDLE_RETRANSMIT_S * 1000):
+                    (now - b.get('forwarded_ms', 0)) >= self._retransmit_ms):
                 b['forwarded'] = False   # unacked too long; allow re-send
+                self._log.log('bundle_rearm', reason='unacked', **self._bundle_fields(b))
             if b.get('forwarded') or not peers_active:
                 continue
             if not self._protocol.should_forward(b, active, self._node_id, self._peers):
+                continue
+            if self._policy.counts(b) and not self._policy.try_take():
+                throttled += 1
                 continue
             out = dict(b)
             out['prev_node'] = self._node_id
@@ -635,7 +867,18 @@ class RoverDaemon:
                     adjusted = b['creation_time'] - src_peer['clock_offset_ms']
                     if adjusted >= 0:
                         out['creation_time'] = adjusted
-            self._send(HOST_CMD_WIFI_TX, encode_air_bundle(out))
+            tx_count = b.get('tx_count', 0) + 1
+            kind = 'bundle_tel' if b.get('is_telemetry') else 'bundle_data'
+            if not self._air_tx(encode_air_bundle(out), kind, tx_count=tx_count,
+                                age_ms=now - b.get('added_at_ms', now),
+                                bs_active=bs_active, peers=active,
+                                **self._bundle_fields(b)):
+                continue
+            b['tx_count'] = tx_count
+            if tx_count == 1:
+                b['first_tx_ms'] = now
+            else:
+                self._counters['retx_' + kind] += 1
             # Generate @DTN_RX telemetry ack for non-local ferried bundles on first
             # forward to BS.  Deferred from reception time so that clock_offset_ms for
             # the source is already populated (avoids the burst-before-first-beacon race).
@@ -647,9 +890,17 @@ class RoverDaemon:
             b['forwarded_ms'] = now
             self._protocol.on_bundle_forwarded(b)
 
+        if throttled:
+            self._counters['bw_denials'] += throttled
+            mono = time.monotonic()
+            if mono - self._last_throttle_log >= BW_THROTTLE_LOG_S:
+                self._last_throttle_log = mono
+                self._log.log('bw_throttled', waiting=throttled, tokens=self._policy.tokens())
+
         if to_remove:
             for b in to_remove:
                 self._protocol.on_bundle_removed(b)
+                self._log.log('bundle_drop_hoplimit', **self._bundle_fields(b))
             ids = {id(b) for b in to_remove}
             with self._lock:
                 self._store = [b for b in self._store if id(b) not in ids]
@@ -658,8 +909,9 @@ class RoverDaemon:
         if peers_active:
             for source, a in self._ack.items():
                 if a['dirty']:
-                    self._send(HOST_CMD_WIFI_TX, pack_ackmap(source, a['seq_base'], a['bitmap']))
-                    a['dirty'] = False
+                    if self._air_tx(pack_ackmap(source, a['seq_base'], a['bitmap']), 'ackmap',
+                                    ack_src=source, seq_base=a['seq_base']):
+                        a['dirty'] = False
 
     # node restart notification
     def _send_node_restart_notification(self) -> None:
@@ -681,20 +933,21 @@ class RoverDaemon:
             'added_at_ms':     now,
         }
         self._add_bundle(b, is_local=True)
+        self._log.log('bundle_gen', **self._bundle_fields(b))
         print(f"[RESTART] queued @NODE_RESTART:{self._node_id} notification bundle")
 
     # beacon
     def _send_beacon(self) -> None:
         ts = int(time.monotonic() * 1000) - self._start_ms
-        self._send(HOST_CMD_WIFI_TX, pack_beacon(self._node_id, ts, self._boot_id))
+        self._air_tx(pack_beacon(self._node_id, ts, self._boot_id), 'beacon', ts_ms=ts)
 
     # location
     def _send_location(self) -> None:
         if self._node_id is None:
             return
         loc = self._own_location
-        self._send(HOST_CMD_WIFI_TX,
-                   pack_location(self._node_id, loc['lat'], loc['lon'], loc['alt']))
+        self._air_tx(pack_location(self._node_id, loc['lat'], loc['lon'], loc['alt']),
+                     'location', **loc)
 
     def _on_location(self, data: bytes) -> None:
         result = unpack_location(data)
@@ -707,42 +960,73 @@ class RoverDaemon:
             'lat': lat, 'lon': lon, 'alt': alt,
             'updated_ms': int(time.monotonic() * 1000),
         }
+        self._log.log('rx_location', peer=node_id, lat=lat, lon=lon, alt=alt)
         print(f"[LOC] node {node_id}: lat={lat:.6f} lon={lon:.6f} alt={alt:.1f}m")
 
-    def _send_location_bundle(self) -> None:
-        """Send own location as a telemetry bundle so the BS serial output captures it."""
-        if self._node_id is None:
-            return
-        loc = self._own_location
-        bs_rssi = self._peers.get(BASE_STATION_NODE_ID, {}).get('rssi')
-        rssi_field = f":{bs_rssi}" if bs_rssi is not None else ""
-        payload = (f"@LOCATION:{self._node_id}:"
-                   f"{loc['lat']:.6f}:{loc['lon']:.6f}:{loc['alt']:.1f}{rssi_field}").encode()
+    def _queue_telemetry(self, text: str, lifetime: int = TELEMETRY_ACK_LIFETIME) -> None:
         now = int(time.monotonic() * 1000)
         b = {
             'creation_time':   now - self._start_ms,
             'sequence_number': self._next_seq(),
-            'lifetime':        TELEMETRY_ACK_LIFETIME,
+            'lifetime':        lifetime,
             'source_node':     self._node_id,
             'dest_node':       BASE_STATION_NODE_ID,
             'prev_node':       self._node_id,
             'is_telemetry':    True,
             'hop_limit':       BUNDLE_DEFAULT_HOP_LIMIT,
             'hop_count':       0,
-            'payload':         payload,
+            'payload':         text.encode(),
             'added_at_ms':     now,
         }
         self._add_bundle(b, is_local=True)
+        self._log.log('bundle_gen', text=text, **self._bundle_fields(b))
 
-    # bundle generation 
+    def _send_status_bundle(self) -> None:
+        """@ROVER_STATUS telemetry so the BS/visualizer can see queue depth and comms config.
+        key=value fields after the node id so the format can grow without breaking parsers."""
+        if self._node_id is None or not self._radio_on:
+            return
+        c = self._store_counts()
+        _on, left, cycle = self._policy.window()
+        fields = {
+            'q':    c['q_own_data'], 'qf': c['q_ferried_data'], 'qt': c['q_telemetry'],
+            'gen':  self._counters['gen_data'],
+            'tx':   self._counters['tx_bundle_data'],
+            'retx': self._counters['retx_bundle_data'],
+            'ack':  self._counters['acked_own_data'],
+            'bw':   self._policy.bw_limit, 'gi': self._interval,
+            'on':   self._policy.on_s, 'off': self._policy.off_s,
+            'win':  round(left, 1) if left is not None else -1, 'cyc': cycle,
+            'up':   int(time.time() - self._wall_start),
+        }
+        self._queue_telemetry(f"@ROVER_STATUS:{self._node_id}:"
+                              + ','.join(f"{k}={v}" for k, v in fields.items()))
+
+    def _send_location_bundle(self) -> None:
+        """Send own location as a telemetry bundle so the BS serial output captures it."""
+        if self._node_id is None or not self._radio_on:
+            return
+        loc = self._own_location
+        bs_rssi = self._peers.get(BASE_STATION_NODE_ID, {}).get('rssi')
+        rssi_field = f":{bs_rssi}" if bs_rssi is not None else ""
+        self._queue_telemetry(f"@LOCATION:{self._node_id}:"
+                              f"{loc['lat']:.6f}:{loc['lon']:.6f}:{loc['alt']:.1f}{rssi_field}")
+
+    # bundle generation
     def _generate_bundle(self) -> None:
         abs_ms = int(time.monotonic() * 1000)
         creation_time = abs_ms - self._start_ms
-        payload = json.dumps({
+        doc = {
             'ts': int(time.time()),
             'node': self._node_id,
             'sensor': round(20.0 + (creation_time % 1000) / 100.0, 1),
-        }).encode()
+        }
+        payload = json.dumps(doc).encode()
+        if len(payload) < self._payload_bytes:
+            # pad to the requested size so bandwidth tests can use realistic payloads
+            doc['pad'] = ''
+            doc['pad'] = 'x' * max(0, self._payload_bytes - len(json.dumps(doc).encode()))
+            payload = json.dumps(doc).encode()
         b = {
             'creation_time':   creation_time,
             'sequence_number': self._next_seq(),
@@ -757,10 +1041,13 @@ class RoverDaemon:
             'added_at_ms':     abs_ms,
         }
         if self._add_bundle(b, is_local=True):
+            self._counters['gen_data'] += 1
+            self._log.log('bundle_gen', radio_on=self._radio_on, **self._bundle_fields(b))
             print(f"[GEN] bundle seq:{b['sequence_number']} (store {len(self._store)})")
 
     # boot-banner detector
     def _handle_ascii(self, text: str) -> None:
+        self._log.log('esp_ascii', text=text.strip()[:500])
         if 'I am' in text or 'rst:0x' in text:
             print(f"[RESTART] ESP32 boot banner: {text.strip()!r}")
             self._restart_pending = True
@@ -772,16 +1059,24 @@ class RoverDaemon:
             rssi = struct.unpack_from('<b', payload, 6)[0]
             rest = payload[7:]
             ptype = rest[0]
+            if not self._radio_on:
+                # periodic mode: radio is "off", so nothing is heard
+                self._counters['rx_dropped_off'] += 1
+                self._log.log('rx_dropped_off', ptype=ptype, rssi=rssi, bytes=len(rest))
+                return
             if ptype == PKT_TYPE_BEACON:
                 bc = unpack_beacon(rest)
                 if bc:
                     self._on_beacon(bc[0], bc[1], bc[2], rssi)
             elif ptype == PKT_TYPE_BUNDLE:
-                self._on_bundle(rest)
+                self._on_bundle(rest, rssi)
             elif ptype == PKT_TYPE_ACKMAP:
                 self._on_ackmap(rest)
             elif ptype == PKT_TYPE_LOCATION:
                 self._on_location(rest)
+            else:
+                self._counters['rx_unknown'] += 1
+                self._log.log('rx_unknown', ptype=ptype, rssi=rssi, bytes=len(rest))
         elif cmd == HOST_CMD_STATUS_RESP:
             if len(payload) >= STATUS_SIZE:
                 self._detected_node_id = struct.unpack_from('<H', payload)[0]
@@ -846,6 +1141,103 @@ class RoverDaemon:
             time.sleep(1)
         raise RuntimeError("Could not auto-detect node_id from ESP32. Use --node-id to override.")
 
+    # comms window / state logging
+    def _update_comms_window(self) -> bool:
+        """Apply the periodic on/off schedule. Returns True on an off->on transition."""
+        on, left, cycle = self._policy.window()
+        if on == self._radio_on:
+            return False
+        first = self._radio_on is None
+        self._radio_on = on
+        counts = self._store_counts()
+        if on:
+            self._counters['windows_on'] += 1
+            print(f"[COMMS] radio ON  (cycle {cycle}"
+                  + (f", {left:.1f}s window" if left is not None else "")
+                  + f", store {counts['store']}, own data queued {counts['q_own_data']})")
+            self._log.log('radio_on', cycle=cycle, window_s=left, initial=first, **counts)
+        else:
+            self._counters['windows_off'] += 1
+            # Radio is down, so every peer is unreachable. Age them out now so the first
+            # beacon of the next window registers as a returned peer and re-arms
+            # forwarding, the same path as a real link outage.
+            now = int(time.monotonic() * 1000)
+            expired = self._active_peer_ids()
+            for p in self._peers.values():
+                p['last_seen'] = min(p['last_seen'], now - int(PEER_TIMEOUT_S * 1000) - 1)
+            print(f"[COMMS] radio OFF (cycle {cycle}, {left:.1f}s off, store {counts['store']}, "
+                  f"own data queued {counts['q_own_data']})")
+            self._log.log('radio_off', cycle=cycle, off_s=left, initial=first,
+                          peers_dropped=expired, **counts)
+        return on and not first
+
+    def _check_peers(self) -> None:
+        active = set(self._active_peer_ids())
+        for pid in self._last_active - active:
+            p = self._peers.get(pid, {})
+            self._log.log('peer_down', peer=pid, last_rssi=p.get('rssi'),
+                          radio_on=self._radio_on)
+            print(f"[PEER] node {pid} lost")
+        self._last_active = active
+
+    def _log_state(self) -> None:
+        now = int(time.monotonic() * 1000)
+        _on, left, cycle = self._policy.window()
+        peers = {str(pid): {'rssi': p['rssi'], 'age_ms': now - p['last_seen']}
+                 for pid, p in self._peers.items()
+                 if (now - p['last_seen']) < PEER_TIMEOUT_S * 1000}
+        self._log.log('state', radio_on=self._radio_on, window_left_s=left, cycle=cycle,
+                      tokens=self._policy.tokens(), peers=peers,
+                      loc=dict(self._own_location), counters=dict(self._counters),
+                      **self._store_counts())
+
+    def _print_status(self) -> None:
+        c = self._store_counts()
+        _on, left, _cycle = self._policy.window()
+        radio = 'ON ' if self._radio_on else 'OFF'
+        win = f" {left:4.0f}s left" if left is not None else ""
+        peers = ' '.join(f"{pid}({p['rssi']})" for pid, p in self._peers.items()
+                         if pid in self._last_active) or '-'
+        tok = self._policy.tokens()
+        print(f"[STATUS] radio {radio}{win} | queue own:{c['q_own_data']} ferried:{c['q_ferried_data']} "
+              f"tel:{c['q_telemetry']} | gen:{self._counters['gen_data']} "
+              f"tx:{self._counters['tx_bundle_data']} retx:{self._counters['retx_bundle_data']} "
+              f"acked:{self._counters['acked_own_data']}"
+              + (f" | tokens:{tok:.2f}" if tok is not None else "")
+              + f" | peers {peers}")
+
+    def write_summary(self) -> dict:
+        lats = self._ack_latencies_ms
+        summary = {
+            'node_id':   self._node_id,
+            'started':   datetime.fromtimestamp(self._wall_start).isoformat(timespec='seconds'),
+            'ended':     datetime.now().isoformat(timespec='seconds'),
+            'duration_s': round(time.time() - self._wall_start, 1),
+            'config':    self._run_config,
+            'counters':  dict(self._counters),
+            'store_at_exit': self._store_counts(),
+            'own_data_ack_latency_ms': {
+                'n': len(lats),
+                'mean': round(sum(lats) / len(lats)) if lats else None,
+                'p50': _percentile(lats, 50), 'p95': _percentile(lats, 95),
+                'max': max(lats) if lats else None,
+            },
+        }
+        gen = self._counters['gen_data']
+        summary['own_data_delivery_ratio'] = (round(self._counters['acked_own_data'] / gen, 4)
+                                              if gen else None)
+        self._log.log('summary', **summary)
+        if self._log.path:
+            path = os.path.splitext(self._log.path)[0] + '_summary.json'
+            try:
+                with open(path, 'w') as f:
+                    json.dump(summary, f, indent=2, default=str)
+                print(f"[SUMMARY] written to {path}")
+            except OSError as e:
+                print(f"[SUMMARY] could not write: {e}")
+        print(json.dumps(summary, indent=2, default=str))
+        return summary
+
     def _main_loop(self) -> None:
         last_beacon          = 0.0
         last_forward         = 0.0
@@ -853,8 +1245,14 @@ class RoverDaemon:
         last_status          = time.monotonic()
         last_location        = 0.0
         last_location_bundle = 0.0
+        last_rover_status    = 0.0
+        last_state_log       = 0.0
+        last_console_status  = time.monotonic()
 
         while True:
+            if self._update_comms_window():
+                last_beacon = 0.0    # announce ourselves immediately when the window opens
+                last_forward = 0.0
             if self._restart_pending:
                 self._restart_pending = False
                 self._boot_id = int.from_bytes(os.urandom(4), 'little')
@@ -872,6 +1270,11 @@ class RoverDaemon:
                 for b in dropped:
                     self._protocol.on_bundle_removed(b)
                 self._peers.clear()
+                self._last_active = set()
+                self._counters['esp_restarts'] += 1
+                self._log.log('esp_restart', new_boot_id=self._boot_id, bundles_dropped=len(dropped),
+                              own_data_dropped=sum(1 for b in dropped if not b.get('is_telemetry')
+                                                   and b['source_node'] == self._node_id))
                 print(f"[RESTART] new boot_id=0x{self._boot_id:08x}, seq reset; "
                       f"cleared {len(dropped)} bundles from store; cleared peer table")
                 if self._node_id is None:
@@ -886,7 +1289,7 @@ class RoverDaemon:
             if (mono - last_beacon) >= BEACON_INTERVAL_S:
                 last_beacon = mono
                 self._send_beacon()
-            if (mono - last_forward) >= FORWARD_INTERVAL_S:
+            if (mono - last_forward) >= self._forward_interval_s:
                 last_forward = mono
                 self._forward()
             if self._interval > 0 and (mono - last_gen) >= self._interval:
@@ -901,6 +1304,16 @@ class RoverDaemon:
             if (mono - last_location_bundle) >= LOCATION_BUNDLE_INTERVAL_S:
                 last_location_bundle = mono
                 self._send_location_bundle()
+            if self._status_interval_s > 0 and (mono - last_rover_status) >= self._status_interval_s:
+                last_rover_status = mono
+                self._send_status_bundle()
+            if (mono - last_state_log) >= self._state_interval_s:
+                last_state_log = mono
+                self._check_peers()
+                self._log_state()
+            if (mono - last_console_status) >= 5.0:
+                last_console_status = mono
+                self._print_status()
 
     def _close_serial(self) -> None:
         if self._ser is not None:
@@ -922,14 +1335,21 @@ class RoverDaemon:
                 b['forwarded_ms'] = 0
             kept = len(self._store)
         self._peers.clear()
+        self._last_active = set()
         self._ack.clear()
+        self._counters['serial_reconnects'] += 1
+        self._log.log('serial_reconnect', kept=kept)
         print(f"[RECONNECT] kept {kept} bundles, cleared peers/acks; retrying in {RECONNECT_DELAY_S:.0f}s")
 
     def _connect_and_run(self) -> None:
         print(f"[INIT] Opening {self._port} at {self._baud} baud (boot_id=0x{self._boot_id:08x})")
+        self._log.log('serial_open', port=self._port, baud=self._baud, boot_id=self._boot_id)
         self._open_serial()
+        self._update_comms_window()
         if self._node_id is None:
             self._node_id = self._detect_node_id()
+        self._log.node_id = self._node_id
+        self._log.log('node_detected', boot_id=self._boot_id)
         print(f"[INIT] Running as rover node {self._node_id}")
         self._main_loop()
 
@@ -1042,38 +1462,82 @@ class RoverDaemon:
         threading.Thread(target=_thread, daemon=True, name='ros-loc').start()
 
     def run(self) -> None:
+        self._log.log('daemon_start', config=self._run_config, boot_id=self._boot_id)
         if self._ros_location_topic:
             self._start_ros_location(self._ros_location_topic)
-        while True:
-            try:
-                self._connect_and_run()
-            except KeyboardInterrupt:
-                print('\n[INIT] Shutting down.')
-                self._close_serial()
-                return
-            except Exception as e:
-                print(f"[ERROR] {type(e).__name__}: {e}")
-                traceback.print_exc()
-                self._reset_after_disconnect()
-            try:
+        try:
+            while True:
+                try:
+                    self._connect_and_run()
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    print(f"[ERROR] {type(e).__name__}: {e}")
+                    traceback.print_exc()
+                    self._log.log('error', error=f"{type(e).__name__}: {e}",
+                                  trace=traceback.format_exc())
+                    self._reset_after_disconnect()
                 time.sleep(RECONNECT_DELAY_S)
-            except KeyboardInterrupt:
-                print('\n[INIT] Shutting down.')
-                return
+        except KeyboardInterrupt:
+            print('\n[INIT] Shutting down.')
+        finally:
+            self._close_serial()
+            self.write_summary()
+            self._log.log('daemon_stop')
+            self._log.close()
+
+
+def _sigterm(_signum, _frame):
+    # treat `kill` / tmux kill-session like Ctrl-C so the summary still gets written
+    raise KeyboardInterrupt
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Rover node daemon (ESP32 is relay)')
+    parser = argparse.ArgumentParser(description='Rover node daemon (ESP32 is relay)',
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--serial',      default='/dev/ttyUSB0', help='Serial port to ESP32')
     parser.add_argument('--baud',        type=int, default=115200, help='Baud rate')
     parser.add_argument('--interval',    type=float, default=1.0,
-                        help='Bundle generation interval in seconds (0 = disable)')
+                        help='Data bundle generation interval in seconds (0 = disable)')
+    parser.add_argument('--payload-bytes', type=int, default=0,
+                        help='Pad each data bundle payload to this many bytes (max 1024, 0 = natural ~60 B)')
     parser.add_argument('--node-id',     type=int, default=None,
                         help='Override node ID (default: auto-detect from ESP32)')
     parser.add_argument('--routing',     choices=['epidemic', 'spray-wait'], default='epidemic',
-                        help='Routing protocol (default: epidemic)')
+                        help='Routing protocol')
     parser.add_argument('--spray-count', type=int, default=2,
-                        help='Initial copy count for spray-and-wait (default: 8)')
+                        help='Initial copy count for spray-and-wait')
+    parser.add_argument('--retransmit-s', type=float, default=BUNDLE_RETRANSMIT_S,
+                        help='Re-send a forwarded bundle the BS has not acked after this many seconds')
+
+    bw = parser.add_argument_group('bandwidth-restricted mode')
+    bw.add_argument('--bw-limit', type=float, default=0.0,
+                    help='Max data bundles per second over the air (0 = unlimited). '
+                         'Beacons, ackmaps and location broadcasts are never limited')
+    bw.add_argument('--bw-burst', type=float, default=1.0,
+                    help='Token bucket size: max data bundles sent back-to-back after idling')
+    bw.add_argument('--bw-order', choices=['oldest', 'newest'], default='oldest',
+                    help='Which queued bundles get the budget first')
+    bw.add_argument('--bw-count-telemetry', action='store_true',
+                    help='Also count telemetry bundles (acks, location, status) against the budget')
+
+    pc = parser.add_argument_group('periodic comms mode')
+    pc.add_argument('--comms-on',  type=float, default=0.0,
+                    help='Seconds the radio is on per cycle (0 = always on)')
+    pc.add_argument('--comms-off', type=float, default=0.0,
+                    help='Seconds the radio is off per cycle (no TX, RX dropped; data still generated)')
+    pc.add_argument('--comms-phase', type=float, default=0.0,
+                    help="Shift this rover's schedule by N seconds (windows are aligned to wall clock)")
+
+    lg = parser.add_argument_group('logging')
+    lg.add_argument('--log-dir', default='rover_logs', help='Directory for the JSON-lines event log')
+    lg.add_argument('--run-tag', default='', help='Label added to the log filename, e.g. bw1_route3')
+    lg.add_argument('--state-interval', type=float, default=STATE_LOG_INTERVAL_S,
+                    help='Seconds between full state snapshots in the event log')
+    lg.add_argument('--status-interval', type=float, default=ROVER_STATUS_INTERVAL_S,
+                    help='Seconds between @ROVER_STATUS telemetry bundles to the BS (0 = off)')
+    lg.add_argument('--no-log', action='store_true', help='Disable the event log file')
+
     parser.add_argument('--lat',         type=float, default=0.0, help='Own latitude (static fallback)')
     parser.add_argument('--lon',         type=float, default=0.0, help='Own longitude (static fallback)')
     parser.add_argument('--alt',         type=float, default=0.0, help='Own altitude in metres (static fallback)')
@@ -1089,6 +1553,25 @@ def main():
         protocol = EpidemicRouting()
         print('[INIT] Routing: epidemic')
 
+    policy = CommsPolicy(bw_limit=args.bw_limit, bw_burst=args.bw_burst,
+                         count_telemetry=args.bw_count_telemetry,
+                         on_s=args.comms_on, off_s=args.comms_off, phase_s=args.comms_phase)
+    if (args.comms_on > 0) != (args.comms_off > 0):
+        print('[INIT] WARNING: periodic mode needs both --comms-on and --comms-off; radio stays always on')
+    print(f"[INIT] Comms: bw_limit={args.bw_limit or 'unlimited'} data bundles/s "
+          f"(burst {policy.bw_burst:g}, {args.bw_order} first)"
+          + (f", periodic {args.comms_on:g}s on / {args.comms_off:g}s off" if policy.periodic
+             else ", radio always on"))
+
+    log_path = None
+    if not args.no_log:
+        tag = f"_{args.run_tag}" if args.run_tag else ''
+        log_path = os.path.join(args.log_dir,
+                                f"rover_{datetime.now().strftime('%Y%m%d_%H%M%S')}{tag}.jsonl")
+        print(f"[INIT] Event log: {log_path}")
+
+    signal.signal(signal.SIGTERM, _sigterm)
+
     RoverDaemon(
         serial_port=args.serial,
         baud=args.baud,
@@ -1099,6 +1582,14 @@ def main():
         lon=args.lon,
         alt=args.alt,
         ros_location_topic=args.ros_location_topic,
+        policy=policy,
+        event_log=EventLog(log_path),
+        bw_order=args.bw_order,
+        payload_bytes=args.payload_bytes,
+        retransmit_s=args.retransmit_s,
+        status_interval_s=args.status_interval,
+        state_interval_s=args.state_interval,
+        run_config=dict(vars(args), **policy.describe()),
     ).run()
 
 

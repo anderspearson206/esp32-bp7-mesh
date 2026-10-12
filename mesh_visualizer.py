@@ -1,3 +1,4 @@
+import argparse
 import csv
 import os
 import serial
@@ -14,6 +15,10 @@ SERIAL_PORT = 'COM5'
 BAUD_RATE = 115200
 TIMEOUT_SECONDS = 15
 RADIO_MAP_HALF_M = 75.0   # half-width of the radio map in metres (map spans ±this value)
+REPORT_DIR = "bs_reports"
+CONTACT_GAP_S = 3.0       # no @NET from a rover for this long -> its contact with the BS has ended
+TIMELINE_S = 180          # width of the live timeline panel (seconds)
+TIMELINE_BIN_S = 5        # throughput bin width on the timeline
 
 G = nx.DiGraph()
 recent_transfers = []
@@ -33,14 +38,61 @@ radio_map_samples    = defaultdict(lambda: deque(maxlen=2000))  # node_id -> deq
 start_time           = time.time()
 _coverage_csv_path: str = ""
 
+# experiment logging / comms tracking
+delivery_timeline = deque(maxlen=20000)  # (time, src, kind 'data'|'tel', latency_ms)
+link_state        = {}                   # node_id -> {'up', 'since', 'last', 'data', 'tel', 'rssi': [...]}
+contact_history   = defaultdict(list)    # node_id -> [{'start', 'end', 'data', 'tel', 'avg_rssi'}]
+rover_status      = {}                   # node_id -> latest @ROVER_STATUS fields + 'updated_at'
+markers           = []                   # [(time, label)]
+_pending_metric   = None                 # last @METRIC awaiting classification by the next line
+session_dir: str  = ""
+_serial_log       = None
 
-def _init_coverage_csv() -> None:
-    global _coverage_csv_path
-    os.makedirs("bs_reports", exist_ok=True)
-    _coverage_csv_path = f"bs_reports/coverage_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+def _ts(t: float) -> str:
+    return datetime.fromtimestamp(t).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+
+
+def _csv_append(name: str, header: list, row: list) -> None:
+    """Append a row to <session_dir>/<name>, writing the header when the file is new."""
+    if not session_dir:
+        return
+    path = os.path.join(session_dir, name)
+    try:
+        new = not os.path.exists(path)
+        with open(path, 'a', newline='') as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(header)
+            w.writerow(row)
+    except OSError:
+        pass
+
+
+def _log_serial(line: str) -> None:
+    if _serial_log is not None:
+        try:
+            _serial_log.write(f"{_ts(time.time())}\t{line}\n")
+        except (OSError, ValueError):
+            pass
+
+
+def _init_session_files() -> None:
+    """Each session (visualizer start, BS reboot, reset key) gets its own folder holding
+    the raw serial log, CSVs and summaries, so runs never mix."""
+    global _coverage_csv_path, session_dir, _serial_log
+    session_dir = os.path.join(REPORT_DIR, f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    os.makedirs(session_dir, exist_ok=True)
+    _coverage_csv_path = os.path.join(session_dir, "coverage.csv")
     with open(_coverage_csv_path, 'w', newline='') as f:
         csv.writer(f).writerow(['timestamp', 'node_id', 'lat', 'lon', 'alt_m', 'rssi_to_bs_dBm'])
-    print(f"[VISUALIZER] Coverage log: {_coverage_csv_path}")
+    if _serial_log is not None:
+        try:
+            _serial_log.close()
+        except OSError:
+            pass
+    _serial_log = open(os.path.join(session_dir, "serial.log"), 'a', buffering=1)
+    print(f"[VISUALIZER] Session folder: {session_dir}")
 
 
 def _append_coverage_row(node_id: str, lat: float, lon: float, alt: float, rssi) -> None:
@@ -55,6 +107,88 @@ def _append_coverage_row(node_id: str, lat: float, lon: float, alt: float, rssi)
             ])
     except OSError:
         pass
+
+
+def _record_delivery(src: str, seq: int, hops: int, latency_ms: int, t: float,
+                     kind: str, via: str, label: str) -> None:
+    """Called once an @METRIC has been classified as data or telemetry. Caller holds lock."""
+    info = delivered_bundles.get((src, seq))
+    if info is not None:
+        info['kind'] = kind
+    delivery_timeline.append((t, src, kind, latency_ms))
+    ls = link_state.get(via) or link_state.get(src)
+    if ls is not None and ls['up']:
+        ls[kind] += 1
+    _csv_append("deliveries.csv",
+                ['time', 'epoch', 'src', 'seq', 'kind', 'via', 'hops', 'latency_ms', 'label'],
+                [_ts(t), f"{t:.3f}", src, seq, kind, via, hops, latency_ms, label])
+
+
+def _resolve_pending_metric(line: str) -> None:
+    """The BS prints @METRIC then, for the same bundle, either @DTN_RX (data bundle) or the
+    telemetry payload text. Classify the pending @METRIC from the line that follows it."""
+    global _pending_metric
+    if _pending_metric is None:
+        return
+    src, seq, hops, lat, t = _pending_metric
+    _pending_metric = None
+    parts = line.split(':')
+    if line.startswith("@DTN_RX:") and len(parts) >= 4 and parts[1] == src and parts[3] == str(seq):
+        _record_delivery(src, seq, hops, lat, t, 'data', parts[2], '')
+    else:
+        _record_delivery(src, seq, hops, lat, t, 'tel', src, parts[0] if line.startswith('@') else '')
+
+
+def _contact_update(node_id: str, rssi, now: float) -> None:
+    """A rover was heard by the BS (@NET). Opens a contact if the link was down. Caller holds lock."""
+    ls = link_state.get(node_id)
+    if ls is None or not ls['up']:
+        gap = (now - ls['last']) if ls else None
+        link_state[node_id] = {'up': True, 'since': now, 'last': now,
+                               'data': 0, 'tel': 0, 'rssi': []}
+        ls = link_state[node_id]
+        print(f"[CONTACT] {node_id} link UP" + (f" after {gap:.1f}s down" if gap else ""))
+        _log_serial(f"#CONTACT_UP:{node_id}")
+    ls['last'] = now
+    try:
+        ls['rssi'].append(int(rssi))
+    except (TypeError, ValueError):
+        pass
+
+
+def _close_contact(node_id: str, ls: dict, ongoing: bool = False) -> dict:
+    rec = {'start': ls['since'], 'end': ls['last'], 'data': ls['data'], 'tel': ls['tel'],
+           'avg_rssi': sum(ls['rssi']) / len(ls['rssi']) if ls['rssi'] else None}
+    if not ongoing:
+        contact_history[node_id].append(rec)
+        dur = rec['end'] - rec['start']
+        print(f"[CONTACT] {node_id} link DOWN after {dur:.1f}s ({rec['data']} data delivered)")
+        _log_serial(f"#CONTACT_DOWN:{node_id}:{dur:.1f}")
+        _csv_append("contacts.csv",
+                    ['node', 'start', 'end', 'duration_s', 'data_delivered', 'tel_delivered',
+                     'avg_rssi', 'start_epoch', 'end_epoch'],
+                    [node_id, _ts(rec['start']), _ts(rec['end']), f"{dur:.1f}", rec['data'],
+                     rec['tel'], f"{rec['avg_rssi']:.1f}" if rec['avg_rssi'] is not None else '',
+                     f"{rec['start']:.3f}", f"{rec['end']:.3f}"])
+    return rec
+
+
+def _check_contacts(now: float) -> None:
+    with lock:
+        for nid, ls in link_state.items():
+            if ls['up'] and now - ls['last'] > CONTACT_GAP_S:
+                ls['up'] = False
+                _close_contact(nid, ls)
+
+
+def add_marker(label: str = "") -> None:
+    now = time.time()
+    with lock:
+        label = label or f"M{len(markers) + 1}"
+        markers.append((now, label))
+    print(f"[MARKER] {label} at {_ts(now)}")
+    _log_serial(f"#MARKER:{label}")
+    _csv_append("markers.csv", ['time', 'epoch', 'label'], [_ts(now), f"{now:.3f}", label])
 
 
 def read_line_or_frame(ser):
@@ -98,8 +232,13 @@ def reset_session_state():
         node_boot_start_time.clear()
         node_locations.clear()
         radio_map_samples.clear()
+        delivery_timeline.clear()
+        link_state.clear()
+        contact_history.clear()
+        rover_status.clear()
+        markers.clear()
         start_time = time.time()
-    _init_coverage_csv()
+    _init_session_files()
     print("[VISUALIZER] Session state cleared - starting fresh.")
 
 
@@ -165,8 +304,8 @@ def save_boot_summary(node_id: str, boot_num: int, boot_record: dict) -> None:
     report = "\n".join(lines)
     print(f"\n{report}")
 
-    os.makedirs("bs_reports", exist_ok=True)
-    filename = f"bs_reports/node_{node_id}_boot{boot_num}.txt"
+    os.makedirs(session_dir or REPORT_DIR, exist_ok=True)
+    filename = os.path.join(session_dir or REPORT_DIR, f"node_{node_id}_boot{boot_num}.txt")
     try:
         with open(filename, 'w') as f:
             f.write(report + "\n")
@@ -177,8 +316,9 @@ def save_boot_summary(node_id: str, boot_num: int, boot_record: dict) -> None:
 
 def serial_reader_thread(port):
     """Read serial data from the BS port and update shared state."""
+    global _pending_metric
     first_connect = True
-    _init_coverage_csv()
+    _init_session_files()
     while True:
         try:
             ser = serial.Serial(port, BAUD_RATE, timeout=1)
@@ -194,8 +334,10 @@ def serial_reader_thread(port):
 
             while True:
                 line = read_line_or_frame(ser)
+                _check_contacts(time.time())
                 if not line:
                     continue
+                _log_serial(line)
 
                 # Detect BS reboot via its boot-time log line (covers software resets
                 # where the serial connection stays open and no SerialException fires).
@@ -207,6 +349,9 @@ def serial_reader_thread(port):
 
                 if line.startswith("@"):
                     print(f"Received: {line} : {datetime.now().strftime('%H:%M:%S')}")
+                    if not line.startswith("@NET:"):
+                        with lock:
+                            _resolve_pending_metric(line)
 
                 # topology heartbeat from rovers, e.g. @NET:node_id:parent_id:rssi
                 if line.startswith("@NET:"):
@@ -215,6 +360,8 @@ def serial_reader_thread(port):
                         node_id, parent, rssi = parts[1], parts[2], parts[3]
                         with lock:
                             current_time = time.time()
+                            if parent != "0":
+                                _contact_update(node_id, rssi, current_time)
                             edges_to_remove = [(u, v) for u, v in G.edges() if u == node_id]
                             G.remove_edges_from(edges_to_remove)
                             G.add_node(node_id, last_seen=current_time)
@@ -275,7 +422,10 @@ def serial_reader_thread(port):
                                         'latency_ms': latency_ms,
                                         'hops':       hops_val,
                                         'time':       time.time(),
+                                        'kind':       'tel',   # upgraded to 'data' by the next line
                                     }
+                                    _pending_metric = (source_node, seq_num, hops_val,
+                                                       latency_ms, time.time())
                                     if source_node not in node_seq_range:
                                         node_seq_range[source_node] = {'min': seq_num, 'max': seq_num}
                                     else:
@@ -364,6 +514,25 @@ def serial_reader_thread(port):
                                 _append_coverage_row(node_id, lat, lon, alt, rssi)
                         except (ValueError, IndexError):
                             pass
+
+                # rover daemon status: @ROVER_STATUS:<node>:k=v,k=v,...
+                elif line.startswith("@ROVER_STATUS:"):
+                    parts = line.split(':', 2)
+                    if len(parts) == 3:
+                        fields = {}
+                        for kv in parts[2].split(','):
+                            k, _, v = kv.partition('=')
+                            try:
+                                fields[k] = float(v)
+                            except ValueError:
+                                fields[k] = v
+                        now_t = time.time()
+                        with lock:
+                            fields['updated_at'] = now_t
+                            rover_status[parts[1]] = fields
+                        keys = sorted(k for k in fields if k != 'updated_at')
+                        _csv_append(f"rover_status_{parts[1]}.csv", ['time', 'epoch'] + keys,
+                                    [_ts(now_t), f"{now_t:.3f}"] + [fields[k] for k in keys])
 
         except (serial.SerialException, serial.PortNotOpenError) as e:
             print(f"Connection lost on {port}: {e}. Retrying in 2 seconds...")
@@ -519,6 +688,76 @@ def generate_summary():
                     )
             lines.append("")
 
+        # data vs telemetry + comms windows, per node (all boots)
+        def _pct(vals, p):
+            s = sorted(vals)
+            return s[min(len(s) - 1, int(round(p / 100.0 * (len(s) - 1))))]
+
+        all_delivered = [((src, seq), info) for (src, seq), info in delivered_bundles.items()]
+        for nid, history in node_boot_history.items():
+            for rec in history:
+                all_delivered.extend(((nid, seq), info) for seq, info in rec['delivered'].items())
+        comm_nodes = sorted(set(all_nodes) | set(contact_history) | set(link_state) | set(rover_status))
+        if comm_nodes:
+            lines.append("Data vs Telemetry  (data = generated sensor bundles only)")
+            hdr = (f"  {'Node':<10} {'Data':>6} {'Tel':>6} {'DataLat':>9} {'p50':>7} {'p95':>7}"
+                   f" {'RoverGen':>9} {'Data/Gen':>9}")
+            lines.append(hdr)
+            lines.append("  " + "-" * (len(hdr) - 2))
+            for node in comm_nodes:
+                d_lats = [i['latency_ms'] for (s, _q), i in all_delivered
+                          if s == node and i.get('kind') == 'data']
+                n_tel  = sum(1 for (s, _q), i in all_delivered if s == node and i.get('kind') != 'data')
+                st     = rover_status.get(node, {})
+                gen    = st.get('gen')
+                ratio  = f"{100.0 * len(d_lats) / gen:.1f}%" if gen else "N/A"
+                lat_s  = f"{sum(d_lats)/len(d_lats):.0f} ms" if d_lats else "N/A"
+                p50    = f"{_pct(d_lats, 50)}" if d_lats else "-"
+                p95    = f"{_pct(d_lats, 95)}" if d_lats else "-"
+                gen_s  = f"{gen:.0f}" if gen is not None else "N/A"
+                lines.append(f"  {node:<10} {len(d_lats):>6} {n_tel:>6} {lat_s:>9} {p50:>7} {p95:>7}"
+                             f" {gen_s:>9} {ratio:>9}")
+            lines.append("")
+
+            lines.append(f"Contacts with BS  (link down after {CONTACT_GAP_S:.0f}s without a beacon)")
+            hdr = (f"  {'Node':<10} {'N':>4} {'UpTime':>9} {'Up%':>6} {'MeanLen':>8}"
+                   f" {'DataInUp':>9} {'Data/s up':>10}")
+            lines.append(hdr)
+            lines.append("  " + "-" * (len(hdr) - 2))
+            for node in comm_nodes:
+                recs = list(contact_history.get(node, []))
+                ls = link_state.get(node)
+                if ls and ls['up']:
+                    recs.append(_close_contact(node, ls, ongoing=True))
+                up = sum(r['end'] - r['start'] for r in recs)
+                data_up = sum(r['data'] for r in recs)
+                pct = f"{100.0 * up / duration_s:.0f}%" if duration_s else "-"
+                mean_len = f"{up / len(recs):.1f}s" if recs else "-"
+                rate = f"{data_up / up:.2f}" if up > 0 else "-"
+                lines.append(f"  {node:<10} {len(recs):>4} {up:>8.0f}s {pct:>6} {mean_len:>8}"
+                             f" {data_up:>9} {rate:>10}")
+            lines.append("")
+
+            if rover_status:
+                lines.append("Rover comms config (last @ROVER_STATUS)")
+                for node, st in sorted(rover_status.items()):
+                    bw = st.get('bw', 0)
+                    on, off = st.get('on', 0), st.get('off', 0)
+                    mode = []
+                    mode.append(f"bw {bw:g}/s" if bw else "bw unlimited")
+                    mode.append(f"periodic {on:g}s on/{off:g}s off" if on and off else "always on")
+                    lines.append(f"  {node}: {', '.join(mode)}, gen every {st.get('gi', 0):g}s,"
+                                 f" queue {st.get('q', 0):.0f} own / {st.get('qf', 0):.0f} ferried,"
+                                 f" gen {st.get('gen', 0):.0f} tx {st.get('tx', 0):.0f}"
+                                 f" retx {st.get('retx', 0):.0f} acked {st.get('ack', 0):.0f}")
+                lines.append("")
+
+        if markers:
+            lines.append("Markers")
+            for t, label in markers:
+                lines.append(f"  {label:<8} {_ts(t)}  (+{t - start_time:.0f}s)")
+            lines.append("")
+
         #  notes
         lines.append("Notes")
         lines.append("  Uniq / Poss / Rate: aggregated across all boots. Poss = sum of")
@@ -530,20 +769,231 @@ def generate_summary():
         lines.append("  Antipacket fails  : same forwarder re-sent the bundle; excluded from")
         lines.append("                      both unique and total counts.")
         lines.append("  AvgRSSI           : current boot only (cleared on node restart).")
+        lines.append("  Uniq/Poss above   : include telemetry bundles (they share the seq space).")
+        lines.append("  Data/Gen          : BS-counted data deliveries / rover-reported data")
+        lines.append("                      generated (rover counter spans the daemon run).")
+        lines.append("  DataInUp, Data/s  : data delivered while the rover's link was up.")
         lines.append("=" * W)
 
         report = "\n".join(lines)
 
     # print and save outside the lock
     print("\n" + report)
-    os.makedirs("bs_reports", exist_ok=True)
-    filename = f"bs_reports/dtn_summary_{now.strftime('%Y%m%d_%H%M%S')}.txt"
+    out_dir = session_dir or REPORT_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    filename = os.path.join(out_dir, f"dtn_summary_{now.strftime('%Y%m%d_%H%M%S')}.txt")
     try:
         with open(filename, 'w') as f:
             f.write(report + "\n")
         print(f"\n[Summary saved to {filename}]")
     except OSError as e:
         print(f"\n[Could not save summary file: {e}]")
+
+
+_PALETTE = ['dodgerblue', 'tomato', 'limegreen', 'darkorchid', 'goldenrod', 'teal']
+_color_order: list = []
+
+
+def _node_color(nid: str) -> str:
+    if nid not in _color_order:
+        _color_order.append(nid)
+    return _PALETTE[_color_order.index(nid) % len(_PALETTE)]
+
+
+def _fmt_age(sec: float) -> str:
+    sec = int(sec)
+    m, s = divmod(sec, 60)
+    return f"{m}m{s:02d}s" if m else f"{s}s"
+
+
+def _window_estimate(st: dict, now: float):
+    """Estimate a periodic rover's radio state from its last @ROVER_STATUS.
+    Uses BS arrival time only (no clock sync needed). Returns (is_on, secs_left) or None."""
+    on, off, win = st.get('on', 0), st.get('off', 0), st.get('win', -1)
+    if not (on and off) or win is None or win < 0:
+        return None
+    period = on + off
+    x = (now - (st['updated_at'] + win)) % period     # time since the last expected off-start
+    if x < off:
+        return False, off - x
+    return True, period - x
+
+
+def _draw_log_panel(ax, now: float) -> None:
+    """Text panel: per-rover comms status, recent deliveries, delivery metrics, positions.
+    Caller holds lock."""
+    ax.axis('off')
+    ax.set_title("Comms Status / Bundle Events", fontsize=10, fontweight='bold')
+    rows = []   # (text, color, bold)
+
+    def row(text, color='black', bold=False):
+        rows.append((text, color, bold))
+
+    rovers = sorted(set(link_state) | set(rover_status) | set(contact_history))
+    if rovers:
+        row("- Rover Comms -", bold=True)
+    for nid in rovers:
+        ls = link_state.get(nid)
+        n_contacts = len(contact_history.get(nid, [])) + (1 if ls and ls['up'] else 0)
+        if ls and ls['up']:
+            rssi = f", {ls['rssi'][-1]} dBm" if ls['rssi'] else ""
+            row(f"Node {nid}: LINK UP {_fmt_age(now - ls['since'])} "
+                f"(contact #{n_contacts}{rssi})", 'green', True)
+        elif ls:
+            row(f"Node {nid}: LINK DOWN {_fmt_age(now - ls['last'])} "
+                f"({n_contacts} contacts)", 'firebrick', True)
+        else:
+            row(f"Node {nid}: no beacons heard", 'gray', True)
+        st = rover_status.get(nid)
+        if st:
+            bw = st.get('bw', 0)
+            mode = f"bw {bw:g}/s" if bw else "bw unlimited"
+            est = _window_estimate(st, now)
+            if est is not None:
+                state = "ON" if est[0] else "OFF"
+                mode += f" | {st['on']:g}s on/{st['off']:g}s off, radio ~{state} {est[1]:.0f}s left"
+            row(f"   {mode}", 'dimgray')
+            recent = sum(1 for t, s, k, _ in delivery_timeline
+                         if s == nid and k == 'data' and now - t <= 60)
+            row(f"   queue {st.get('q', 0):.0f} own/{st.get('qf', 0):.0f} ferried | "
+                f"gen {st.get('gen', 0):.0f} tx {st.get('tx', 0):.0f} retx {st.get('retx', 0):.0f} "
+                f"ack {st.get('ack', 0):.0f} | data 60s: {recent}  "
+                f"(status {_fmt_age(now - st['updated_at'])} old)", 'dimgray')
+    if rovers:
+        row("")
+
+    row("- Recent Deliveries -", bold=True)
+    for entry in list(reversed(event_log))[:6]:
+        age_str = _fmt_age(now - entry['time']) + " ago"
+        if entry['is_ferry']:
+            row(f"[FERRY]  src:{entry['src']} via:{entry['ferry']} hops:{entry['hops']} "
+                f"seq:{entry['seq']} ({age_str})", 'darkorange')
+        else:
+            row(f"[DIRECT] src:{entry['src']} hops:{entry['hops']} seq:{entry['seq']} ({age_str})",
+                'green')
+    row("")
+
+    row("- Delivery Metrics -", bold=True)
+    per_source = defaultdict(lambda: {'data': [], 'tel': 0})
+    for (src, _seq), info in delivered_bundles.items():
+        if info.get('kind') == 'data':
+            per_source[src]['data'].append(info['latency_ms'])
+        else:
+            per_source[src]['tel'] += 1
+    n_data = sum(len(v['data']) for v in per_source.values())
+    row(f"Total delivered: {len(delivered_bundles)} bundles ({n_data} data)", 'navy')
+    for src in sorted(set(per_source) | set(antipkt_fail_counts) | set(ferry_dup_counts)):
+        d = per_source[src]['data']
+        avg = f"avg {sum(d) / len(d):.0f} ms" if d else "no data"
+        extra = ""
+        if node_boot_count.get(src):       extra += f"  restarts:{node_boot_count[src]}"
+        if antipkt_fail_counts.get(src):   extra += f"  ap_fail:{antipkt_fail_counts[src]}"
+        if ferry_dup_counts.get(src):      extra += f"  dup:{ferry_dup_counts[src]}"
+        row(f"  Node {src}: {len(d)} data + {per_source[src]['tel']} tel  {avg}{extra}",
+            'darkgreen')
+
+    known_locs = {nid: loc for nid, loc in node_locations.items()
+                  if loc['lat'] != 0.0 or loc['lon'] != 0.0}
+    if known_locs:
+        row("")
+        row("- Node Positions -", bold=True)
+        for nid, loc in sorted(known_locs.items()):
+            rssi_str = f"  BS:{loc['rssi']} dBm" if loc['rssi'] is not None else ""
+            row(f"  Node {nid}: {loc['lat']:.2f},{loc['lon']:.2f}  {loc['alt']:.0f}m{rssi_str}"
+                f"  ({_fmt_age(now - loc['updated_at'])} ago)", 'darkslateblue')
+
+    y = 0.99
+    step = min(0.045, 0.93 / max(1, len(rows)))
+    for text, color, bold in rows:
+        ax.text(0.0, y, text, transform=ax.transAxes, fontsize=7.5, color=color,
+                verticalalignment='top', fontfamily='monospace',
+                fontweight='bold' if bold else 'normal')
+        y -= step
+    ax.text(0.0, -0.02, f"keys: m=marker  s=save summary  r=save+reset  h=help   "
+                        f"[{os.path.basename(session_dir)}]",
+            transform=ax.transAxes, fontsize=7, color='gray', verticalalignment='top')
+
+
+def _draw_timeline(ax, now: float) -> None:
+    """Bottom panel: per-rover link-up bands, data throughput, data latency, markers.
+    Caller holds lock."""
+    t0 = now - TIMELINE_S
+    nodes = sorted(set(s for _, s, _, _ in delivery_timeline) | set(link_state)
+                   | set(contact_history))
+    ax.set_xlim(-TIMELINE_S, 0)
+    ax.set_xlabel("seconds (0 = now)", fontsize=8)
+    ax.set_ylabel("data bundles/s", fontsize=8)
+    ax.tick_params(labelsize=7)
+    ax.grid(True, alpha=0.3)
+    ax.set_title(f"Comms timeline (last {TIMELINE_S}s): bands = link up to BS, "
+                 f"lines = data throughput ({TIMELINE_BIN_S}s bins), dots = data latency",
+                 fontsize=9, fontweight='bold')
+
+    band_h = 0.07
+    for idx, nid in enumerate(nodes):
+        color = _node_color(nid)
+        spans = [(c['start'], c['end']) for c in contact_history.get(nid, [])]
+        ls = link_state.get(nid)
+        if ls and ls['up']:
+            spans.append((ls['since'], now))
+        for a, b in spans:
+            if b < t0:
+                continue
+            a = max(a, t0)
+            ax.axvspan(a - now, b - now, ymin=1 - band_h * (idx + 1), ymax=1 - band_h * idx,
+                       color=color, alpha=0.6, lw=0)
+            ax.axvspan(a - now, b - now, color=color, alpha=0.05, lw=0)
+
+    # throughput, bins aligned to absolute time so they don't jitter between frames
+    last_edge = (int(now) // TIMELINE_BIN_S + 1) * TIMELINE_BIN_S
+    n_bins = TIMELINE_S // TIMELINE_BIN_S + 1
+    edges = [last_edge - TIMELINE_BIN_S * (n_bins - i) for i in range(n_bins + 1)]
+    ymax = 1.0
+    for nid in nodes:
+        counts = [0] * n_bins
+        for t, s, k, _lat in delivery_timeline:
+            if s == nid and k == 'data' and t >= edges[0]:
+                i = int((t - edges[0]) // TIMELINE_BIN_S)
+                if 0 <= i < n_bins:
+                    counts[i] += 1
+        rates = [c / TIMELINE_BIN_S for c in counts]
+        ymax = max(ymax, max(rates) if rates else 0)
+        ax.step([e - now for e in edges], rates + rates[-1:], where='post',
+                color=_node_color(nid), lw=1.8, label=f"{nid}")
+    ax.set_ylim(0, ymax * 1.35)
+
+    lat_pts = [(t - now, lat / 1000.0, _node_color(s)) for t, s, k, lat in delivery_timeline
+               if k == 'data' and t >= t0]
+    if lat_pts:
+        ax2 = ax.twinx()
+        ax2.scatter([p[0] for p in lat_pts], [p[1] for p in lat_pts],
+                    c=[p[2] for p in lat_pts], s=8, alpha=0.6, marker='o', linewidths=0)
+        ax2.set_ylabel("latency (s)", fontsize=8)
+        ax2.tick_params(labelsize=7)
+        ax2.set_ylim(bottom=0)
+        ax2.set_xlim(-TIMELINE_S, 0)
+
+    for t, label in markers:
+        if t >= t0:
+            ax.axvline(t - now, color='black', ls=':', lw=1)
+            ax.text(t - now, ymax * 1.3, f" {label}", fontsize=7, va='top')
+
+    if nodes:
+        ax.legend(fontsize=7, loc='upper left', title="node", title_fontsize=7)
+
+
+def _on_key(event) -> None:
+    if event.key == 'm':
+        add_marker()
+    elif event.key == 's':
+        generate_summary()
+    elif event.key == 'r':
+        print("[VISUALIZER] Manual reset - saving session and starting fresh.")
+        generate_summary()
+        reset_session_state()
+    elif event.key == 'h':
+        print("[VISUALIZER] keys: m = drop a timestamped marker (logged + drawn on timeline), "
+              "s = save summary now, r = save summary and reset session, h = this help")
 
 
 def update_graph(frame):
@@ -559,94 +1009,15 @@ def update_graph(frame):
             print(f"Node {n} timed out. Removing from visualizer.")
             G.remove_node(n)
 
-        ax_graph = plt.subplot(1, 3, 1)
-        ax_log   = plt.subplot(1, 3, 2)
-        ax_map   = plt.subplot(1, 3, 3)
-
-        # event log panel
-        ax_log.axis('off')
-        ax_log.set_title("Bundle Events / Delivery Metrics", fontsize=10, fontweight='bold')
-        y = 0.97
-        ax_log.text(0.02, y, "- Recent Deliveries -", transform=ax_log.transAxes,
-                    fontsize=8, color='black', verticalalignment='top', fontweight='bold')
-        y -= 0.05
-        for entry in list(reversed(event_log))[:10]:
-            age = int(current_time - entry['time'])
-            mins, secs = divmod(age, 60)
-            age_str = f"{mins}m{secs:02d}s ago" if mins else f"{secs}s ago"
-            if entry['is_ferry']:
-                ln = f"[FERRY]  src:{entry['src']} via:{entry['ferry']} hops:{entry['hops']} seq:{entry['seq']} ({age_str})"
-                color = 'darkorange'
-            else:
-                ln = f"[DIRECT] src:{entry['src']} hops:{entry['hops']} seq:{entry['seq']} ({age_str})"
-                color = 'green'
-            ax_log.text(0.02, y, ln, transform=ax_log.transAxes,
-                        fontsize=7.5, color=color, verticalalignment='top',
-                        fontfamily='monospace')
-            y -= 0.048
-
-        # delivery metrics
-        y_stats = 0.42
-        ax_log.text(0.02, y_stats, "- Delivery Metrics -", transform=ax_log.transAxes,
-                    fontsize=8, color='black', verticalalignment='top', fontweight='bold')
-        y_stats -= 0.05
-
-        total = len(delivered_bundles)
-        ax_log.text(0.02, y_stats, f"Total delivered: {total} bundles",
-                    transform=ax_log.transAxes, fontsize=8, color='navy',
-                    verticalalignment='top', fontfamily='monospace')
-        y_stats -= 0.045
-
-        per_source = defaultdict(list)
-        for (src, _seq), info in delivered_bundles.items():
-            per_source[src].append(info['latency_ms'])
-        for src, lats in sorted(per_source.items()):
-            avg      = sum(lats) / len(lats)
-            ap_fail  = antipkt_fail_counts.get(src, 0)
-            dup      = ferry_dup_counts.get(src, 0)
-            restarts = node_boot_count.get(src, 0)
-            extra    = ""
-            if restarts: extra += f"  restarts:{restarts}"
-            if ap_fail:  extra += f"  ap_fail:{ap_fail}"
-            if dup:      extra += f"  dup:{dup}"
-            ax_log.text(0.02, y_stats,
-                        f"  Node {src}: {len(lats)} pkts  avg {avg:.0f} ms{extra}",
-                        transform=ax_log.transAxes, fontsize=8, color='darkgreen',
-                        verticalalignment='top', fontfamily='monospace')
-            y_stats -= 0.045
-
-        all_dup_srcs = set(antipkt_fail_counts) | set(ferry_dup_counts)
-        for src in sorted(all_dup_srcs):
-            if src not in per_source:
-                ap_fail = antipkt_fail_counts.get(src, 0)
-                dup     = ferry_dup_counts.get(src, 0)
-                extra   = ""
-                if ap_fail: extra += f"  ap_fail:{ap_fail}"
-                if dup:     extra += f"  dup:{dup}"
-                ax_log.text(0.02, y_stats,
-                            f"  Node {src}: 0 pkts{extra}",
-                            transform=ax_log.transAxes, fontsize=8, color='sienna',
-                            verticalalignment='top', fontfamily='monospace')
-                y_stats -= 0.045
-
-        # node positions
-        known_locs = {nid: loc for nid, loc in node_locations.items()
-                      if loc['lat'] != 0.0 or loc['lon'] != 0.0}
-        if known_locs:
-            y_stats -= 0.01
-            ax_log.text(0.02, y_stats, "- Node Positions -", transform=ax_log.transAxes,
-                        fontsize=8, color='black', verticalalignment='top', fontweight='bold')
-            y_stats -= 0.05
-            for nid, loc in sorted(known_locs.items()):
-                age = int(current_time - loc['updated_at'])
-                age_str = f"{age}s ago"
-                rssi_str = f"  BS:{loc['rssi']} dBm" if loc['rssi'] is not None else ""
-                ax_log.text(0.02, y_stats,
-                            f"  Node {nid}: {loc['lat']:.5f},{loc['lon']:.5f}"
-                            f"  {loc['alt']:.0f}m{rssi_str}  ({age_str})",
-                            transform=ax_log.transAxes, fontsize=7.5, color='darkslateblue',
-                            verticalalignment='top', fontfamily='monospace')
-                y_stats -= 0.045
+        fig = plt.gcf()
+        gs = fig.add_gridspec(2, 3, height_ratios=[3, 1.3], hspace=0.32, wspace=0.22,
+                              left=0.03, right=0.97, top=0.9, bottom=0.07)
+        ax_graph = fig.add_subplot(gs[0, 0])
+        ax_log   = fig.add_subplot(gs[0, 1])
+        ax_map   = fig.add_subplot(gs[0, 2])
+        ax_tl    = fig.add_subplot(gs[1, :])
+        _draw_timeline(ax_tl, current_time)
+        _draw_log_panel(ax_log, current_time)
 
         # radio map panel
         _NODE_COLORS = ['dodgerblue', 'tomato', 'limegreen', 'darkorchid']
@@ -777,10 +1148,29 @@ def update_graph(frame):
 
 
 if __name__ == '__main__':
-    thread = threading.Thread(target=serial_reader_thread, args=(SERIAL_PORT,), daemon=True)
+    parser = argparse.ArgumentParser(description='Live DTN mesh visualizer (reads the BS serial port)')
+    parser.add_argument('--port', default=SERIAL_PORT, help='BS serial port')
+    parser.add_argument('--baud', type=int, default=BAUD_RATE)
+    parser.add_argument('--map-half', type=float, default=RADIO_MAP_HALF_M,
+                        help='Radio map half-width in metres')
+    parser.add_argument('--report-dir', default=REPORT_DIR,
+                        help='Parent folder for per-session report folders')
+    parser.add_argument('--timeline', type=int, default=TIMELINE_S,
+                        help='Seconds shown on the comms timeline')
+    args = parser.parse_args()
+    BAUD_RATE, RADIO_MAP_HALF_M, REPORT_DIR, TIMELINE_S = (
+        args.baud, args.map_half, args.report_dir, args.timeline)
+
+    # free up keys used by the visualizer from matplotlib's default bindings
+    for km, keys in (('keymap.save', ('s',)), ('keymap.home', ('r', 'h'))):
+        plt.rcParams[km] = [k for k in plt.rcParams[km] if k not in keys]
+
+    thread = threading.Thread(target=serial_reader_thread, args=(args.port,), daemon=True)
     try:
         thread.start()
-        fig = plt.figure(figsize=(21, 7))
+        fig = plt.figure(figsize=(21, 10))
+        fig.canvas.mpl_connect('key_press_event', _on_key)
+        print("[VISUALIZER] keys: m=marker  s=save summary  r=save+reset  h=help")
         ani = animation.FuncAnimation(fig, update_graph, interval=500, cache_frame_data=False)
         plt.show()
     except KeyboardInterrupt:

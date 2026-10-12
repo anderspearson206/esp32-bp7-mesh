@@ -229,29 +229,41 @@ pip install pyserial networkx matplotlib
 
 ### Mesh Visualizer
 
-Connects to the base station serial port and animates a three-panel live display updated every 500 ms.
+Connects to the base station serial port and animates a live display updated every 500 ms.
 
 ```bash
-SERIAL_PORT=COM13 python mesh_visualizer.py        # Windows
-SERIAL_PORT=/dev/ttyUSB0 python mesh_visualizer.py # Linux/macOS
-# or edit SERIAL_PORT at the top of the file
+python mesh_visualizer.py --port COM5            # Windows
+python mesh_visualizer.py --port /dev/ttyUSB0    # Linux/macOS
+# other options: --baud, --map-half <m>, --timeline <s>, --report-dir <dir>
 ```
 
 **Panels:**
 
-- **Mesh graph** — live topology with RSSI-labelled edges; active bundle transfers highlighted (red = direct, orange dashed = ferried).
-- **Bundle events / metrics** — scrolling delivery log, per-node packet count and average latency, current node positions with RSSI.
-- **Radio map** — metre-scale scatter plot built from `@LOCATION:` messages. Each point is coloured by RSSI (`RdYlGn` colormap: red = weak, green = strong). The current rover position is shown with a white-outlined marker that fades if no update has arrived recently. Map range is controlled by `RADIO_MAP_HALF_M` at the top of the file (default `25.0` = ±25 m).
+- **Mesh graph**: live topology with RSSI-labelled edges; active bundle transfers highlighted (red = direct, orange dashed = ferried).
+- **Comms status / bundle events**: per rover, link UP/DOWN to the BS and for how long, contact count, comms mode (bandwidth budget, periodic on/off with an estimate of the rover's current window), queue depth and gen/tx/retx/ack counters from `@ROVER_STATUS`. Below that: recent deliveries, per-node data vs telemetry counts and latency, node positions.
+- **Radio map**: metre-scale scatter plot built from `@LOCATION:` messages, coloured by RSSI. Range set by `--map-half` (default 75 m).
+- **Comms timeline** (bottom): last 180 s, with coloured bands where each rover's link to the BS was up, data throughput per rover (5 s bins), data-bundle latency dots, and markers.
 
-**Session management** — on serial reconnect or BS reboot detection (`"I am the Base Station"` in stream), the current session is saved to `bs_reports/` and state resets. On `@NODE_RESTART:`, only the named node's metrics reset, preserving data from other nodes. At exit (`Ctrl-C` or window close) a full summary is printed and saved.
+**Keys:** `m` drop a timestamped marker (logged and drawn on the timeline), `s` save a summary now, `r` save and start a fresh session, `h` help.
 
-**Output files** (all written to `bs_reports/`):
+**Data vs telemetry**: the BS prints `@METRIC` for every bundle, followed by `@DTN_RX` for data bundles or the payload text for telemetry. The visualizer uses that pairing to separate real data deliveries from ack/location/status traffic.
 
-| File                          | Contents                                                 |
-| ----------------------------- | -------------------------------------------------------- |
-| `dtn_summary_<timestamp>.txt` | Full session delivery/latency/RSSI report                |
-| `node_<id>_boot<n>.txt`       | Per-node per-boot summary saved on each `@NODE_RESTART:` |
-| `coverage_<timestamp>.csv`    | Every `(timestamp, node, x, y, z, rssi)` location sample |
+**Contacts**: a rover's link to the BS is "up" while its beacons arrive and closes after `CONTACT_GAP_S` (3 s) of silence. Each contact records its duration, data delivered and mean RSSI.
+
+**Session management**: each session gets its own folder `bs_reports/session_<timestamp>/`. On serial reconnect, BS reboot detection (`"I am the Base Station"`), or the `r` key, the current session is summarised and a new folder is started. On `@NODE_RESTART:`, only that node's metrics reset. At exit (`Ctrl-C` or window close) a full summary is printed and saved.
+
+**Output files** (in the session folder):
+
+| File                          | Contents                                                                      |
+| ----------------------------- | ----------------------------------------------------------------------------- |
+| `serial.log`                  | Every line from the BS with a wall-clock timestamp, plus `#CONTACT`/`#MARKER` |
+| `deliveries.csv`              | One row per delivered bundle: time, src, seq, data/tel, via, hops, latency    |
+| `contacts.csv`                | One row per rover-BS contact: start, end, duration, data delivered, avg RSSI  |
+| `rover_status_<id>.csv`       | Every `@ROVER_STATUS` report (queue, counters, comms config)                  |
+| `markers.csv`                 | Markers dropped with the `m` key                                              |
+| `coverage.csv`                | Every `(timestamp, node, x, y, z, rssi)` location sample                      |
+| `dtn_summary_<timestamp>.txt` | Session report: delivery, data vs telemetry, contacts, rover config, markers  |
+| `node_<id>_boot<n>.txt`       | Per-node per-boot summary saved on each `@NODE_RESTART:`                      |
 
 ### BS Ferry Monitor
 
@@ -264,22 +276,54 @@ python bs_ferry_monitor.py --port /dev/ttyUSB0 --baud 115200
 
 ### Rover Daemon
 
-Runs on the **Jetson Orin Nano** aboard each rover. Owns the bundle store and all DTN logic, driving the rover's ESP32 (which is a dumb relay) over UART. Only needs `pyserial`; compatible with Python 3.6+.
+Runs on the **Jetson Orin Nano** aboard each rover (`radio_daemon.py`). Owns the bundle store and all DTN logic, driving the rover's ESP32 (which is a dumb relay) over UART. Only needs `pyserial`; compatible with Python 3.6+. Run `python3 radio_daemon.py --help` for every option.
 
 ```bash
 # Auto-detect node ID from ESP32 STATUS_RESP on startup
-python rover_daemon.py --serial /dev/ttyUSB0
+python3 radio_daemon.py --serial /dev/ttyUSB0
 
-# Explicit options
-python rover_daemon.py --serial /dev/ttyTHS1 --baud 115200 --interval 1 --node-id 57936
+# Bandwidth-restricted: 2 data bundles/s generated, 1/s allowed over the air
+python3 radio_daemon.py --serial /dev/ttyUSB0 --interval 0.5 --bw-limit 1 --run-tag bw1_route3
+
+# Periodic comms: radio on 30 s, off 60 s (combinable with --bw-limit)
+python3 radio_daemon.py --serial /dev/ttyUSB0 --comms-on 30 --comms-off 60 --run-tag periodic_route3
 ```
 
-| Flag         | Default        | Notes                                                  |
-| ------------ | -------------- | ------------------------------------------------------ |
-| `--serial`   | `/dev/ttyUSB0` | Serial port connected to the ESP32                     |
-| `--baud`     | 115200         | Must match `HOST_UART_BAUD` in firmware                |
-| `--interval` | 1              | Seconds between generated sensor bundles (0 = disable) |
-| `--node-id`  | auto           | Override node ID (normally auto-detected from ESP32)   |
+| Flag                   | Default        | Notes                                                                    |
+| ---------------------- | -------------- | ------------------------------------------------------------------------ |
+| `--serial`             | `/dev/ttyUSB0` | Serial port connected to the ESP32                                       |
+| `--baud`               | 115200         | Must match `HOST_UART_BAUD` in firmware                                  |
+| `--interval`           | 1              | Seconds between generated data bundles (0 = disable)                     |
+| `--payload-bytes`      | 0              | Pad data payloads to N bytes (max 1024; 0 = natural ~60 B)               |
+| `--node-id`            | auto           | Override node ID (normally auto-detected from ESP32)                     |
+| `--routing`            | `epidemic`     | `epidemic` or `spray-wait` (`--spray-count`)                             |
+| `--retransmit-s`       | 5              | Re-send a bundle the BS has not acked after this long                    |
+| `--bw-limit`           | 0 (unlimited)  | Data bundles/s allowed over the air (token bucket)                       |
+| `--bw-burst`           | 1              | Bucket size: data bundles that may go back-to-back after idling          |
+| `--bw-order`           | `oldest`       | Which queued bundles get the budget first (`oldest` / `newest`)          |
+| `--bw-count-telemetry` | off            | Also count telemetry bundles (acks, location, status) against the budget |
+| `--comms-on/-off`      | 0 / 0          | Periodic mode: radio on N s, off M s. Both must be > 0 to enable         |
+| `--comms-phase`        | 0              | Shift this rover's schedule (windows align to wall-clock time)           |
+| `--log-dir`            | `rover_logs`   | Where the event log goes                                                 |
+| `--run-tag`            | none           | Label appended to the log filename                                       |
+| `--state-interval`     | 1              | Seconds between full state snapshots in the log                          |
+| `--status-interval`    | 5              | Seconds between `@ROVER_STATUS` telemetry bundles to the BS (0 = off)    |
+
+**Comms modes:**
+
+- **Bandwidth-restricted**: only *data* bundles are budgeted. Beacons, ackmaps, location broadcasts and (by default) telemetry bundles always go out, so discovery and acks are unaffected. Without a limit the daemon sends its whole backlog every forward tick. With one, the backlog drains at the budget rate, so queue depth and latency reflect how much contact time a route provides.
+- **Periodic**: in the off window the rover sends nothing (not even beacons) and drops everything it receives, while it keeps generating data. Windows are aligned to wall-clock time (`epoch mod (on+off)`, shifted by `--comms-phase`), so rovers with NTP-synced clocks share a schedule. When the radio switches off all peers are aged out, so the first beacon heard in the next window counts as a returned peer and re-arms forwarding, exactly like a real link outage. Location/status telemetry is not queued while off.
+
+**Logging**: every run writes `rover_logs/rover_<timestamp>[_<tag>].jsonl`, one JSON object per line with `t` (epoch s), `up_ms`, `node`, `ev` and event fields. Events include:
+
+- `tx`: every air frame, with kind, size, bundle ids, tx count and age
+- `rx_beacon`, `rx_bundle`, `rx_ackmap`, `rx_location`, `rx_dropped_off`
+- `bundle_gen`, `bundle_acked` (with generation-to-ack latency and tx count), `bundle_expired`, `bundle_rearm`
+- `bw_throttled`, `peer_up`/`peer_down`, `radio_on`/`radio_off`
+- `esp_restart`, `serial_reconnect`, `error`
+- a `state` snapshot every second: queue breakdown, tokens, window, peers with RSSI, location, all counters
+
+On shutdown (Ctrl-C or SIGTERM) a `<log>_summary.json` is written with counters, own-data delivery ratio and ack-latency percentiles. Load the log with `pandas.read_json(path, lines=True)`.
 
 > `jetson_daemon.py` is the **legacy** daemon for the old model where the ESP32 held the DTN logic (PULL/BUNDLE_PUSH). It is superseded by `rover_daemon.py` and kept only for reference.
 
