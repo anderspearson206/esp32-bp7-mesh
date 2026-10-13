@@ -11,6 +11,9 @@ Files per site (all optional except meta):
     <site>_drivable.npy     bool drivable mask
     <site>_tx.npy           1 at the transmitter (BS) cell
     <site>_rm58_<model>.npy predicted radio map [dB]  (nn, nn_pmnet, sionna_quick, ...)
+                            for the BS at the tx cell
+    <site>_rm58_<model>@<col>_<row>.npy   the same for a BS moved to another cell
+                            (written by rm_generate.py; see Site.set_bs)
     <site>_sat.png/.jpg     north-up image covering exactly the same square (optional)
 
 Alignment: each rover's odometry frame starts wherever the T265 started, so per rover
@@ -24,6 +27,9 @@ import os
 from typing import Dict, Optional, Tuple
 
 import numpy as np
+
+
+GENERATED_MODELS = ('nn_pmnet', 'nn')     # radio maps rm_generate.py can make for any BS cell
 
 
 def find_terrain_dir(explicit: Optional[str] = None) -> Optional[str]:
@@ -54,17 +60,67 @@ class Site:
         self.drivable = drv.astype(bool) if drv is not None else None
         tx = self._load('tx.npy')
         self.tx_xy = None
+        self.base_rc = None                   # (row, col) of the BS the site's own maps are for
         if tx is not None and tx.any():
             r, c = np.argwhere(tx)[0]
+            self.base_rc = (int(r), int(c))
             self.tx_xy = self.rc_to_xy(int(r), int(c))
-        self.radio_maps: Dict[str, np.ndarray] = {}
+        # radio_maps: model -> map for the current BS position, None if there is none (yet).
+        # The keys never change, so CSV columns stay fixed when the BS moves.
+        self.radio_maps: Dict[str, Optional[np.ndarray]] = {}
         prefix = f"{name}_rm58_"
         for p in sorted(glob.glob(os.path.join(terrain_dir, prefix + '*.npy'))):
+            if '@' in os.path.basename(p):
+                continue
             arr = np.load(p).astype(np.float32)
             if arr.shape == (self.size, self.size):
                 self.radio_maps[os.path.basename(p)[len(prefix):-4]] = arr
+        for m in GENERATED_MODELS:
+            self.radio_maps.setdefault(m, None)
+        self.base_maps = dict(self.radio_maps)
+        self.bs_rc = self.base_rc
         self.sat_path = next((p for ext in ('png', 'jpg', 'jpeg', 'tif')
                               for p in [self._path(f'sat.{ext}')] if os.path.exists(p)), None)
+
+    # BS position and the radio maps that go with it
+    @property
+    def bs_moved(self) -> bool:
+        return self.bs_rc != self.base_rc
+
+    def bs_map_path(self, model: str, c: int, r: int) -> str:
+        return self._path(f"rm58_{model}@{c}_{r}.npy")
+
+    def set_bs(self, x: float, y: float):
+        """Move the BS to the cell containing map point (x, y). The site's own maps are used
+        at its tx cell; elsewhere the generated nn / nn_pmnet maps if they exist (others None).
+        Returns (row, col, [models still missing]); row -1 if outside the site."""
+        r, c = (int(v) for v in self.xy_to_rc(x, y))
+        if r < 0:
+            return -1, -1, []
+        self.bs_rc = (r, c)
+        self.tx_xy = self.rc_to_xy(r, c)
+        if not self.bs_moved:
+            self.radio_maps = dict(self.base_maps)
+            return r, c, []
+        self.radio_maps = {m: None for m in self.base_maps}
+        return (r, c, self.reload_bs_maps())
+
+    def reload_bs_maps(self):
+        """Load generated maps for the current BS cell that have appeared; returns missing models."""
+        if not self.bs_moved:
+            return []
+        r, c = self.bs_rc
+        missing = []
+        for m in GENERATED_MODELS:
+            p = self.bs_map_path(m, c, r)
+            if os.path.exists(p):
+                if self.radio_maps.get(m) is None:
+                    arr = np.load(p).astype(np.float32)
+                    if arr.shape == (self.size, self.size):
+                        self.radio_maps[m] = arr
+            else:
+                missing.append(m)
+        return missing
 
     def _path(self, suffix: str) -> str:
         return os.path.join(self.dir, f"{self.name}_{suffix}")
@@ -120,7 +176,8 @@ class Site:
         if self.meta.get('crs'):
             parts.append(f"{self.meta['crs']} NW corner E{self.meta.get('west_E')} N{self.meta.get('north_N')}")
         if self.tx_xy:
-            parts.append(f"BS/tx at ({self.tx_xy[0]:+.1f}, {self.tx_xy[1]:+.1f}) m")
+            parts.append(f"BS/tx at ({self.tx_xy[0]:+.1f}, {self.tx_xy[1]:+.1f}) m"
+                         + (" (moved)" if self.bs_moved else ""))
         return ", ".join(parts)
 
 

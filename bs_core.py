@@ -19,6 +19,7 @@ Session folder (bs_reports/session_<time>[_<tag>]/):
                             x/y/z), yaw, RSSI, map position, and with --site the drivable flag,
                             elevation and each predicted radio map value at that point
     alignments.csv          every odometry -> map alignment change
+    bs_position.json        where the BS is on the site map (with --site; see move_bs)
     dtn_summary_<time>.txt  session report
     node_<id>_boot<n>.txt   per-boot report on @NODE_RESTART
 """
@@ -29,6 +30,7 @@ import json
 import math
 import os
 import struct
+import subprocess
 import threading
 import time
 from collections import defaultdict, deque
@@ -37,6 +39,7 @@ from typing import Dict, List, Optional
 
 import serial
 
+import rm_generate
 import site_map
 
 BS_NODE_ID       = 23768
@@ -93,7 +96,8 @@ def sanitize_name(raw: str) -> str:
 
 class BSCore:
     def __init__(self, port: str, baud: int = BAUD_RATE, report_dir: str = 'bs_reports',
-                 site: Optional[str] = None, terrain_dir: Optional[str] = None):
+                 site: Optional[str] = None, terrain_dir: Optional[str] = None,
+                 rm_env: Optional[str] = None):
         self.port = port
         self.baud = baud
         self.report_dir = report_dir
@@ -106,6 +110,19 @@ class BSCore:
             print(f"[CORE] site {self.site.describe()}")
         self.alignments = site_map.AlignmentStore(report_dir, site or '')
         self.lock = threading.RLock()
+        # BS position on the site map + radio maps generated for it (rm_generate.py)
+        self.rm_env = rm_env or rm_generate.DEFAULT_ENV
+        self.bs_store = os.path.join(report_dir, f"bs_position_{site}.json") if site else ''
+        self.rm_version = 0                   # bumped whenever the BS or its maps change
+        self.rm_job = {'status': 'idle', 'started': 0.0, 'missing': [], 'error': ''}
+        self._rm_proc = None
+        if self.site is not None and os.path.exists(self.bs_store):
+            try:
+                with open(self.bs_store) as f:
+                    pos = json.load(f)
+                self.site.set_bs(float(pos['x']), float(pos['y']))
+            except (OSError, ValueError, KeyError) as e:
+                print(f"[CORE] could not read {self.bs_store}: {e}")
         self._ser: Optional[serial.Serial] = None
         self._ser_write_lock = threading.Lock()
         self._stop = threading.Event()
@@ -124,6 +141,8 @@ class BSCore:
         self.events: deque = deque(maxlen=3000)   # (id, time, category, text)
         self._reset_state()
         self._new_session_files('')
+        if self.site is not None and self.site.reload_bs_maps():
+            self._start_rm_job()
 
     # state
     def _reset_state(self) -> None:
@@ -170,6 +189,7 @@ class BSCore:
             self._csv('alignments.csv', ALIGN_HEADER,
                       [_ts(time.time()), f"{time.time():.3f}", node, f"{al['x']:.3f}", f"{al['y']:.3f}",
                        f"{al['theta']:.2f}", 'loaded'])
+        self._write_bs_position(session_only=True)
         self._event('session', f"session folder {self.session_dir}")
         print(f"[CORE] session folder: {self.session_dir}")
 
@@ -207,6 +227,7 @@ class BSCore:
 
     def shutdown(self) -> None:
         self._stop.set()
+        self._kill_rm_proc()
         if self._thread:
             self._thread.join(timeout=2.0)
         self.save_summary()
@@ -515,6 +536,119 @@ class BSCore:
                 self._event('map', f"{node} aligned ({note}): offset ({a['x']:+.1f}, {a['y']:+.1f}) m, "
                                    f"rotation {a['theta']:+.1f} deg")
 
+    # BS position on the site map
+    def _bs_position(self) -> Optional[dict]:
+        site = self.site
+        if site is None or site.bs_rc is None:
+            return None
+        r, c = site.bs_rc
+        return {'site': site.name, 'x': site.tx_xy[0], 'y': site.tx_xy[1], 'row': r, 'col': c,
+                'moved': site.bs_moved, 'set_at': _ts(time.time())}
+
+    def _write_bs_position(self, session_only: bool = False) -> None:
+        pos = self._bs_position()
+        if pos is None:
+            return
+        targets = [os.path.join(self.session_dir, 'bs_position.json')]
+        if not session_only:
+            targets.append(self.bs_store)
+        for path in targets:
+            try:
+                with open(path, 'w') as f:
+                    json.dump(pos, f, indent=1)
+            except OSError as e:
+                self._event('warn', f"could not write {path}: {e}")
+
+    def move_bs(self, x: float, y: float) -> bool:
+        """Put the BS at map point (x, y) (snapped to the cell centre). Radio maps for that
+        cell are loaded if they were generated before, otherwise rm_generate.py is started in
+        the background; until they arrive the pred_* columns are blank."""
+        if self.site is None:
+            return False
+        with self.lock:
+            r, c, missing = self.site.set_bs(x, y)
+            if r < 0:
+                return False
+            bx, by = self.site.tx_xy
+            self._write_bs_position()
+            self._log_serial(f"#BS:{bx:.1f}:{by:.1f}:{c}:{r}")
+            self._event('map', f"BS {'moved to' if self.site.bs_moved else 'back at its survey cell'} "
+                               f"({bx:+.1f}, {by:+.1f}) m"
+                               + (f"; generating radio maps ({', '.join(missing)})" if missing else ""))
+            self.rm_version += 1
+            self._kill_rm_proc()
+            if missing:
+                self._start_rm_job()
+            else:
+                self.rm_job = {'status': 'ready', 'started': 0.0, 'missing': [], 'error': ''}
+        return True
+
+    def reset_bs(self) -> bool:
+        """BS back to the site's survey (tx) cell, with the site's own radio maps."""
+        if self.site is None or self.site.base_rc is None:
+            return False
+        return self.move_bs(*self.site.rc_to_xy(*self.site.base_rc))
+
+    def _kill_rm_proc(self) -> None:
+        proc, self._rm_proc = self._rm_proc, None
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    def _start_rm_job(self) -> None:
+        site = self.site
+        py = rm_generate.env_python(self.rm_env)
+        if not py:
+            self.rm_job = {'status': 'error', 'started': time.time(), 'missing': site.reload_bs_maps(),
+                           'error': f"no Python venv in {self.rm_env}/.venv (use --rm-env)"}
+            self._event('warn', f"radio maps: {self.rm_job['error']}")
+            return
+        bx, by = site.tx_xy
+        cmd = [py, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rm_generate.py'),
+               '--site', site.name, '--terrain-dir', site.dir, '--bs', f"{bx},{by}", '--rm-env', self.rm_env]
+        flags = 0x08000000 if os.name == 'nt' else 0          # CREATE_NO_WINDOW
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                    creationflags=flags)
+        except OSError as e:
+            self.rm_job = {'status': 'error', 'started': time.time(), 'missing': [], 'error': str(e)}
+            self._event('warn', f"radio maps: could not start rm_generate.py: {e}")
+            return
+        self._rm_proc = proc
+        self.rm_job = {'status': 'running', 'started': time.time(), 'missing': site.reload_bs_maps(), 'error': ''}
+        threading.Thread(target=self._rm_watch, args=(proc, site.bs_rc), daemon=True).start()
+
+    def _rm_watch(self, proc, rc) -> None:
+        """Follow one rm_generate.py run; load each map as it lands (if the BS hasn't moved since)."""
+        err = ''
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith('ERROR'):
+                err = line[6:]
+            if not line.startswith('READY'):
+                continue
+            with self.lock:
+                if self.site.bs_rc != rc:
+                    return
+                self.rm_job['missing'] = self.site.reload_bs_maps()
+                self.rm_version += 1
+                self._event('map', f"radio map {line.split()[1]} ready for the BS at "
+                                   f"({self.site.tx_xy[0]:+.1f}, {self.site.tx_xy[1]:+.1f})")
+        code = proc.wait()
+        with self.lock:
+            if self.site.bs_rc != rc or self._rm_proc is not proc:
+                return
+            self._rm_proc = None
+            missing = self.site.reload_bs_maps()
+            if missing or code != 0:
+                self.rm_job.update(status='error', missing=missing,
+                                   error=err or f"rm_generate.py exited with code {code}")
+                self._event('warn', f"radio maps failed: {self.rm_job['error']}")
+            else:
+                self.rm_job.update(status='ready', missing=[])
+
     def map_pose(self, node: str):
         """Latest map pose (x, y, heading or None) of a rover, or None."""
         loc = self.locations.get(node)
@@ -731,6 +865,7 @@ class BSCore:
                 'track_total': dict(self.track_total),
                 'locations': {n: dict(v) for n, v in self.locations.items()},
                 'alignments': {n: self.alignments.get(n) for n in self.locations},
+                'bs': dict(self._bs_position() or {}, rm_version=self.rm_version, rm_job=dict(self.rm_job)),
                 'events': [e for e in self.events if e[0] > since_event],
                 'n_delivered': len(self.delivered),
             }
@@ -845,6 +980,10 @@ class BSCore:
                                  f"({100 * st['on_drivable_1m']:.0f}% within 1 m)")
                 L.append(line)
             L += ["  (alignment history in alignments.csv)", ""]
+        if self.site is not None and self.site.bs_moved:
+            pos = self._bs_position()
+            L += [f"BS position: moved to ({pos['x']:+.1f}, {pos['y']:+.1f}) m (cell col {pos['col']}, "
+                  f"row {pos['row']}); predictions use maps generated for it (bs_position.json)", ""]
         if self.markers:
             L.append("Markers")
             L += [f"  {lab:<16} {_ts(t)}  (+{t - self.start_time:.0f}s)" for t, lab in self.markers]
@@ -866,8 +1005,10 @@ def main():
     ap.add_argument('--report-dir', default='bs_reports')
     ap.add_argument('--site', default=None, help='terrain site, e.g. fountain or range')
     ap.add_argument('--terrain-dir', default=None, help='default: ./terrain, then ../terrain')
+    ap.add_argument('--rm-env', default=None, help=f'lunar-mesh-env checkout for radio-map generation '
+                                                   f'(default {rm_generate.DEFAULT_ENV})')
     args = ap.parse_args()
-    core = BSCore(args.port, args.baud, args.report_dir, args.site, args.terrain_dir)
+    core = BSCore(args.port, args.baud, args.report_dir, args.site, args.terrain_dir, args.rm_env)
     core.start()
     print("[CORE] running headless, Ctrl-C to stop and write the summary")
     seen = 0

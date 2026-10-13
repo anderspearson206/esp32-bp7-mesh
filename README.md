@@ -261,6 +261,31 @@ Alignment test (remote control driving):
 6. Press Ctrl+M at landmarks: `markers.csv` records each rover's map position at that moment. Finish on the start mark: *distance to placed point* is the odometry drift over the loop.
 7. The panel and the session summary report how much of the track was on the drivable area, and how much was within 1 m of it.
 
+#### Moving the BS (new predicted radio maps)
+
+The site's own radio maps are for the BS at the surveyed `tx` cell. To put the BS somewhere else, press **Move BS…** in the Map tab's *Base station* box and click where it is. `bs_core` then runs `rm_generate.py` in the background with the RadioLunaDiff models from [lunar-mesh-env](https://github.com/anderspearson206/lunar-mesh-env) (default `~/Documents/lunar-mesh-env`, its `.venv`; change with `--rm-env`). The PMNet map appears after about 10 s and the full map (K2-UNet → PMNet → diffusion) after about 25 s on CPU. The layers and the `pred_*` columns of `coverage.csv` switch over as each one lands (blank until then). The maps are cached as `terrain/<site>_rm58_<model>@<col>_<row>.npy`, so returning to a spot is instant. `sionna_quick` exists only for the surveyed cell, so it is blank while the BS is elsewhere. **Reset BS** goes back to the surveyed cell and the site's own maps.
+
+The position is kept in `bs_reports/bs_position_<site>.json` (reloaded on the next start) and in each session folder as `bs_position.json`; every move is a `#BS:x:y:col:row` line in `serial.log` and an event. `fix_track.py` uses the session's `bs_position.json` for its predictions.
+
+Generate maps by hand (same cache):
+
+```bash
+~/Documents/lunar-mesh-env/.venv/Scripts/python.exe rm_generate.py --site fountain --bs 10,-20
+```
+
+#### Fixing odometry drift afterwards (`fix_track.py`)
+
+Wheel odometry drifts in heading on tight turns, reversing and wheel spin. When every run starts and ends parked at the BS, `fix_track.py` corrects a session's `coverage.csv` and writes `coverage_fixed[_pf].csv` plus plots next to it:
+
+```bash
+python fix_track.py bs_reports/<session> --site fountain                       # turn model: closes each out-and-back leg at its turnaround
+python fix_track.py bs_reports/<session> --site fountain --rotate -30          # turn the whole result about the BS
+python fix_track.py bs_reports/<session> --site fountain --model pf            # map-matching to the drivable paths (particle filter)
+python fix_track.py bs_reports/<session> --site fountain --model pf --follow 3:2   # hint: leg 3 drove leg 2's route
+```
+
+`--leg-heading LEG:DEG` sets the direction a leg set off in, and `fix_track_candidates.png` shows the likely ones. Map-matching assumes the rover stays on mapped paths.
+
 
 ### Mesh Visualizer (legacy)
 

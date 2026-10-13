@@ -68,7 +68,8 @@ def radio_rgba(arr: np.ndarray) -> np.ndarray:
 
 class MapViewBox(pg.ViewBox):
     """Normal pan/zoom, except in "Place on map" mode where a left click or drag aligns the
-    selected rover (see Dashboard.align_from_map)."""
+    selected rover (see Dashboard.align_from_map), and in "Move BS" mode where a left click
+    puts the BS there (Dashboard.move_bs_to)."""
 
     def __init__(self, dash):
         super().__init__()
@@ -86,6 +87,11 @@ class MapViewBox(pg.ViewBox):
         self.dash.align_from_map(p0.x(), p0.y(), p1.x(), p1.y(), ev.isFinish())
 
     def mouseClickEvent(self, ev):
+        if self.dash.bs_btn.isChecked() and ev.button() == QtCore.Qt.LeftButton:
+            ev.accept()
+            p = self.mapSceneToView(ev.scenePos())
+            self.dash.move_bs_to(p.x(), p.y())
+            return
         if not self._aligning(ev):
             return super().mouseClickEvent(ev)
         ev.accept()
@@ -359,7 +365,9 @@ class Dashboard(QtWidgets.QMainWindow):
             self.layer_drv = self._image_item(rgba, rect, z=-90)
         self.layer_rm = {}
         for name, arr in (site.radio_maps.items() if site else []):
-            self.layer_rm[name] = self._image_item(radio_rgba(arr), rect, z=-80)
+            self.layer_rm[name] = self._image_item(
+                radio_rgba(arr if arr is not None else np.full((site.size, site.size), np.nan)), rect, z=-80)
+        self.rm_version = 0
 
         self.track_lines = {}
         self.track_scatter = pg.ScatterPlotItem(size=7, pen=None)
@@ -371,13 +379,14 @@ class Dashboard(QtWidgets.QMainWindow):
         self.anchor_marks = pg.ScatterPlotItem(size=14, symbol='x', pen=pg.mkPen('k', width=2))
         self.p_map.addItem(self.anchor_marks)
         self.align_preview = self.p_map.plot([], [], pen=pg.mkPen('#d81b60', width=3))
+        self.bs_star = self.bs_text = None
         if site is not None and site.tx_xy:
-            bs = pg.ScatterPlotItem([site.tx_xy[0]], [site.tx_xy[1]], size=22, symbol='star',
-                                    brush=pg.mkBrush('#ffd54f'), pen=pg.mkPen('k', width=1.5))
-            self.p_map.addItem(bs)
-            t = pg.TextItem("BS", color='k', anchor=(-0.3, 1.0))
-            t.setPos(*site.tx_xy)
-            self.p_map.addItem(t)
+            self.bs_star = pg.ScatterPlotItem([site.tx_xy[0]], [site.tx_xy[1]], size=22, symbol='star',
+                                              brush=pg.mkBrush('#ffd54f'), pen=pg.mkPen('k', width=1.5))
+            self.p_map.addItem(self.bs_star)
+            self.bs_text = pg.TextItem("BS", color='k', anchor=(-0.3, 1.0))
+            self.bs_text.setPos(*site.tx_xy)
+            self.p_map.addItem(self.bs_text)
         self.hover_label = QtWidgets.QLabel(" ")
         self.p_map.scene().sigMouseMoved.connect(self._on_map_hover)
 
@@ -420,6 +429,29 @@ class Dashboard(QtWidgets.QMainWindow):
         row.addWidget(fit)
         lg.addRow(row)
         sl.addWidget(lb)
+
+        bb = QtWidgets.QGroupBox("Base station")
+        bl = QtWidgets.QVBoxLayout(bb)
+        brow = QtWidgets.QHBoxLayout()
+        self.bs_btn = QtWidgets.QPushButton("Move BS…")
+        self.bs_btn.setCheckable(True)
+        self.bs_btn.setStyleSheet("QPushButton:checked { background: #fff59d; font-weight: bold; }")
+        self.bs_btn.setToolTip("Then click where the BS is. New radio maps (PMNet, then the full "
+                               "RadioLunaDiff map) are generated for that spot in the background.")
+        self.bs_btn.toggled.connect(lambda on: self.map_vb.setCursor(
+            QtCore.Qt.CrossCursor if on else QtCore.Qt.ArrowCursor))
+        brow.addWidget(self.bs_btn)
+        bs_reset = QtWidgets.QPushButton("Reset BS")
+        bs_reset.setToolTip("Back to the surveyed BS cell and the site's own radio maps")
+        bs_reset.clicked.connect(self.on_reset_bs)
+        brow.addWidget(bs_reset)
+        bl.addLayout(brow)
+        self.bs_label = QtWidgets.QLabel()
+        self.bs_label.setWordWrap(True)
+        self.bs_label.setTextFormat(QtCore.Qt.RichText)
+        bl.addWidget(self.bs_label)
+        bb.setEnabled(site is not None and site.base_rc is not None)
+        sl.addWidget(bb)
 
         ab = QtWidgets.QGroupBox("Align rover to map")
         al = QtWidgets.QVBoxLayout(ab)
@@ -499,7 +531,7 @@ class Dashboard(QtWidgets.QMainWindow):
             self.layer_drv.setVisible(self.drv_check.isChecked())
             self.layer_drv.setOpacity(op)
         for name, item in self.layer_rm.items():
-            item.setVisible(self.rm_box.currentText() == name)
+            item.setVisible(self.rm_box.currentText() == name and self.site.radio_maps.get(name) is not None)
             item.setOpacity(min(1.0, op + 0.3))
 
     def color(self, nid: str) -> str:
@@ -820,12 +852,49 @@ class Dashboard(QtWidgets.QMainWindow):
                 arrow.setPos(mx, my)
         self.pose_dots.setData(xs, ys, brush=brushes)
         self.anchor_marks.setData([a[0] for a in anchors], [a[1] for a in anchors])
+        self._refresh_bs(snap.get('bs') or {}, now)
         sel = self.rover_box.currentText()
         if self.follow_check.isChecked() and sel in locs:
             i = list(locs).index(sel)
             r = self.map_vb.viewRect()
             self.map_vb.translateBy(x=xs[i] - r.center().x(), y=ys[i] - r.center().y())
         self._refresh_align_label(snap, locs, now)
+
+    def _refresh_bs(self, bs, now) -> None:
+        """BS star, radio-map layers (rebuilt when the BS or its maps change) and status."""
+        if not bs or self.site is None:
+            self.bs_label.setText("<i>No BS cell for this site.</i>" if self.site else "")
+            return
+        if bs['rm_version'] != self.rm_version:
+            self.rm_version = bs['rm_version']
+            for name, item in self.layer_rm.items():
+                arr = self.site.radio_maps.get(name)
+                if arr is not None:
+                    item.setImage(radio_rgba(arr)[::-1], levels=(0, 255))
+            self.bs_star.setData([bs['x']], [bs['y']])
+            self.bs_text.setPos(bs["x"], bs["y"])
+            self.p_map.setTitle(self.site.describe())
+            self._apply_layers()
+        job = bs['rm_job']
+        have = [m for m, a in self.site.radio_maps.items() if a is not None]
+        lines = [f"<b>({bs['x']:+.1f}, {bs['y']:+.1f}) m</b>"
+                 + (" - moved" if bs['moved'] else " - surveyed position")]
+        if job['status'] == 'running':
+            lines.append(f"<span style='color:#ef6c00'>generating {', '.join(job['missing'])}… "
+                         f"{now - job['started']:.0f} s</span>")
+        elif job['status'] == 'error':
+            lines.append(f"<span style='color:#c62828'>radio maps failed: {job['error']}</span>")
+        lines.append("maps: " + (", ".join(have) if have else "none"))
+        self.bs_label.setText("<br>".join(lines))
+
+    def move_bs_to(self, x, y) -> None:
+        self.bs_btn.setChecked(False)
+        if not self.core.move_bs(x, y):
+            QtWidgets.QMessageBox.information(self, "Move BS", "That point is outside the site map.")
+
+    def on_reset_bs(self) -> None:
+        self.bs_btn.setChecked(False)
+        self.core.reset_bs()
 
     def _refresh_align_label(self, snap, locs, now) -> None:
         n = self.rover_box.currentText()
@@ -944,7 +1013,7 @@ class Dashboard(QtWidgets.QMainWindow):
                 if site.drivable is not None:
                     text += "  drivable" if site.on_drivable(x, y) else "  not drivable"
                 rm = self.rm_box.currentText()
-                if rm in site.radio_maps:
+                if site.radio_maps.get(rm) is not None:
                     v = float(site.sample(site.radio_maps[rm], x, y))
                     text += f"  {rm} {v:.0f} dB" if not math.isnan(v) else ""
         self.hover_label.setText(text)
@@ -963,10 +1032,12 @@ def main():
     ap.add_argument('--map-half', type=float, default=75.0, help='Map half-width in metres without --site')
     ap.add_argument('--site', default=None, help='terrain site to show on the Map tab, e.g. fountain or range')
     ap.add_argument('--terrain-dir', default=None, help='default: ./terrain, then ../terrain')
+    ap.add_argument('--rm-env', default=None, help='lunar-mesh-env checkout used to generate radio maps '
+                                                   'when the BS is moved (default ~/Documents/lunar-mesh-env)')
     args = ap.parse_args()
 
     app = QtWidgets.QApplication(sys.argv)
-    core = BSCore(args.port, args.baud, args.report_dir, args.site, args.terrain_dir)
+    core = BSCore(args.port, args.baud, args.report_dir, args.site, args.terrain_dir, args.rm_env)
     core.start()
     win = Dashboard(core, args.map_half)
     win.show()
