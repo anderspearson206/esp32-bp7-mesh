@@ -103,7 +103,7 @@ def fmt_age(sec) -> str:
 
 
 class Dashboard(QtWidgets.QMainWindow):
-    TABLE_COLS = ['Node', 'Link', 'For', 'RSSI', 'State', 'Experiment', 'Ctrl', 'Radio window',
+    TABLE_COLS = ['Node', 'Link', 'For', 'RSSI', 'State', 'Experiment', 'Ctrl', 'Clock', 'ROS', 'Radio window',
                   'Queue own/ferr', 'Gen', 'Tx', 'Retx', 'Ack', 'Data 60s', 'Data total',
                   'Avg lat', 'Status age']
 
@@ -249,9 +249,21 @@ class Dashboard(QtWidgets.QMainWindow):
         self.table.setHorizontalHeaderLabels(self.TABLE_COLS)
         self.table.verticalHeader().hide()
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
         tbox = QtWidgets.QGroupBox("Rovers")
-        QtWidgets.QVBoxLayout(tbox).addWidget(self.table)
+        tlay = QtWidgets.QVBoxLayout(tbox)
+        tlay.addWidget(self.table)
+        rbtns = QtWidgets.QHBoxLayout()
+        rbtns.addWidget(QtWidgets.QLabel("ROS stack on selected rovers:"))
+        for text, on in (("Start ROS", True), ("Stop ROS", False)):
+            b = QtWidgets.QPushButton(text)
+            b.setToolTip("rovers need radio_daemon.py --ros-control; driving still needs the "
+                         "controller deadman")
+            b.clicked.connect(lambda _=False, on=on: self.on_ros(on))
+            rbtns.addWidget(b)
+        rbtns.addStretch()
+        tlay.addLayout(rbtns)
         lay.addWidget(tbox, 2)
 
         self.log = QtWidgets.QPlainTextEdit()
@@ -520,6 +532,23 @@ class Dashboard(QtWidgets.QMainWindow):
     def on_standby(self) -> None:
         self.core.standby(self._cfg())
 
+    def on_ros(self, on: bool) -> None:
+        rows = sorted({ix.row() for ix in self.table.selectionModel().selectedRows()})
+        nodes = [self.table.item(r, 0).text() for r in rows if self.table.item(r, 0)]
+        verb = "Start" if on else "Stop"
+        if not nodes:
+            nodes = [self.table.item(r, 0).text() for r in range(self.table.rowCount())
+                     if self.table.item(r, 0)]
+            if not nodes:
+                QtWidgets.QMessageBox.information(self, "ROS stack", "No rovers known yet.")
+                return
+            ans = QtWidgets.QMessageBox.question(
+                self, "ROS stack", f"No rover selected. {verb} the ROS stack on all rovers "
+                                   f"({', '.join(nodes)})?")
+            if ans != QtWidgets.QMessageBox.Yes:
+                return
+        self.core.set_ros(nodes, on)
+
     def on_marker(self) -> None:
         self.core.add_marker(self.marker_edit.text())
         self.marker_edit.clear()
@@ -562,13 +591,16 @@ class Dashboard(QtWidgets.QMainWindow):
         if msg is None:
             text = "No control sent yet: rovers keep their last state (they boot into standby)."
         else:
-            state = msg.get('state', '?').upper()
+            state = msg.get('state', 'no fleet state set').upper()
             exp = f" <b>'{msg['exp']}'</b>" if msg.get('exp') else ""
             starts = ""
             if msg.get('state') == 'active' and msg.get('start_at', 0) > now:
                 starts = f", starts in {msg['start_at'] - now:.0f} s"
             text = (f"Fleet state v{c['version']}: <b>{state}</b>{exp}{starts} "
                     f"(set {fmt_age(now - c['sent_at'])} ago, re-sent every {bs_core.CONTROL_PERIOD_S:g} s)")
+            if msg.get('ros'):
+                text += "<br>ROS requested: " + ', '.join(f"{n} {w}" for n, (w, _id) in
+                                                          sorted(msg['ros'].items()))
             pending = [r['node'] for r in snap['rovers']
                        if int(r['status'].get('cv', 0) or 0) < c['version']]
             if pending:
@@ -605,16 +637,24 @@ class Dashboard(QtWidgets.QMainWindow):
             self._cell(i, 5, st.get('exp', '-'))
             self._cell(i, 6, f"v{cv}" if cv else '-',
                        bg=None if not version else ('#c8e6c9' if cv >= version else '#ffe0b2'))
-            self._cell(i, 7, '-' if win is None else f"{'ON' if win[0] else 'OFF'} {win[1]:.0f}s left",
+            # rover clock vs BS: the rover corrects for it, this just shows how far off it was
+            ck = st.get('ck')
+            if isinstance(ck, float):
+                self._cell(i, 7, f"{ck:+.1f} s", bg='#fff9c4' if abs(ck) > 2 else None)
+            else:
+                self._cell(i, 7, 'unsynced' if ck == 'na' else '-', bg='#ffe0b2' if ck == 'na' else None)
+            ros = st.get('ros', '-')
+            self._cell(i, 8, ros, bg={'on': '#c8e6c9', 'stopping': '#fff9c4'}.get(ros))
+            self._cell(i, 9, '-' if win is None else f"{'ON' if win[0] else 'OFF'} {win[1]:.0f}s left",
                        bg=None if win is None else ('#c8e6c9' if win[0] else '#eeeeee'))
-            self._cell(i, 8, f"{num('q')}/{num('qf')}")
-            for col, k in ((9, 'gen'), (10, 'tx'), (11, 'retx'), (12, 'ack')):
+            self._cell(i, 10, f"{num('q')}/{num('qf')}")
+            for col, k in ((11, 'gen'), (12, 'tx'), (13, 'retx'), (14, 'ack')):
                 self._cell(i, col, num(k))
-            self._cell(i, 13, r['data_60s'])
-            self._cell(i, 14, r['data_total'])
-            self._cell(i, 15, f"{r['avg_lat']:.0f} ms" if r['avg_lat'] is not None else '-')
+            self._cell(i, 15, r['data_60s'])
+            self._cell(i, 16, r['data_total'])
+            self._cell(i, 17, f"{r['avg_lat']:.0f} ms" if r['avg_lat'] is not None else '-')
             age = r['status_age']
-            self._cell(i, 16, fmt_age(age), fg='#c62828' if age is not None and age > 15 else None)
+            self._cell(i, 18, fmt_age(age), fg='#c62828' if age is not None and age > 15 else None)
 
     def _refresh_events(self, snap) -> None:
         for eid, t, cat, text in snap['events']:

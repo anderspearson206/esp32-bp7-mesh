@@ -64,6 +64,7 @@ The dashboard reads the BS serial port, shows the fleet live, logs everything to
 | Epidemic store-and-forward                           | Done                        |
 | DTN ferrying (verified)                              | Done                        |
 | Clock sync / latency correction                      | Done                        |
+| Fleet runs on BS time (no NTP needed on the Jetsons) | Done                        |
 | Host UART interface (Jetson ↔ ESP32)                | Done                        |
 | Antipackets (suppress redelivery)                    | Done                        |
 | LCD / LED / button UI on BS                          | Done                        |
@@ -283,7 +284,7 @@ python mesh_visualizer.py --port /dev/ttyUSB0    # Linux/macOS
 
 **Fleet control** (bottom strip): run experiments from the BS without touching the rovers. Fill in the experiment name and settings, then:
 
-- **Start**: saves the current session, opens a new session folder named after the experiment, and tells every rover to start it 3 s from now (all rovers start together, given synced clocks).
+- **Start**: saves the current session, opens a new session folder named after the experiment, and tells every rover to start it 3 s from now (all rovers start together on BS time, see below).
 - **Apply live**: pushes changed settings into the running experiment.
 - **Standby**: ends the experiment on every rover.
 
@@ -348,7 +349,7 @@ python3 radio_daemon.py --serial /dev/ttyUSB0 --comms-on 30 --comms-off 60 --run
 | `--bw-order`           | `oldest`       | Which queued bundles get the budget first (`oldest` / `newest`)          |
 | `--bw-count-telemetry` | off            | Also count telemetry bundles (acks, location, status) against the budget |
 | `--comms-on/-off`      | 0 / 0          | Periodic mode: radio on N s, off M s. Both must be > 0 to enable         |
-| `--comms-phase`        | 0              | Shift this rover's schedule (windows align to wall-clock time)           |
+| `--comms-phase`        | 0              | Shift this rover's schedule (windows align to BS time)                   |
 | `--log-dir`            | `rover_logs`   | Where the event log goes                                                 |
 | `--run-tag`            | none           | Label appended to the log filename                                       |
 | `--state-interval`     | 1              | Seconds between full state snapshots in the log                          |
@@ -364,7 +365,8 @@ python3 radio_daemon.py --serial /dev/ttyUSB0 --comms-on 30 --comms-off 60 --run
 **Comms modes:**
 
 - **Bandwidth-restricted**: only *data* bundles are budgeted. Beacons, ackmaps, location broadcasts and (by default) telemetry bundles always go out, so discovery and acks are unaffected. Without a limit the daemon sends its whole backlog every forward tick. With one, the backlog drains at the budget rate, so queue depth and latency reflect how much contact time a route provides.
-- **Periodic**: in the off window the rover sends nothing (not even beacons) and drops everything it receives, while it keeps generating data. Windows are aligned to wall-clock time (`epoch mod (on+off)`, shifted by `--comms-phase`), so rovers with NTP-synced clocks share a schedule. When the radio switches off all peers are aged out, so the first beacon heard in the next window counts as a returned peer and re-arms forwarding, exactly like a real link outage. Location/status telemetry is not queued while off.
+- **Periodic**: in the off window the rover sends nothing (not even beacons) and drops everything it receives, while it keeps generating data. Windows are aligned to BS time (`epoch mod (on+off)`, shifted by `--comms-phase`), so all rovers share a schedule. When the radio switches off all peers are aged out, so the first beacon heard in the next window counts as a returned peer and re-arms forwarding, exactly like a real link outage. Location/status telemetry is not queued while off.
+- **BS time**: Jetsons without internet have no NTP and their clocks can be minutes off. The BS stamps every control message it sends (every 2 s) with its own time, and rovers re-stamp their relays with their estimate and a hop count. Each rover keeps the offset (`FleetClock` in `radio_daemon.py`) and uses BS time for experiment starts and radio windows. The rover log records the offset in each `state` line and every `clock_sync` step, and the dashboard's **Clock** column shows how far off each rover's own clock is. Before a rover has heard the BS it uses its own clock, which only matters for `--mode active`.
 
 **Logging**: every run writes `rover_logs/rover_<timestamp>[_<tag>].jsonl`, one JSON object per line with `t` (epoch s), `up_ms`, `node`, `ev` and event fields. Events include:
 

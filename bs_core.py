@@ -116,6 +116,7 @@ class BSCore:
         self.last_line_at = 0.0
         self.bs_rejects_control = False
         self.control = {'version': 0, 'msg': None, 'sent_at': 0.0, 'last_tx': 0.0}
+        self.ros_cmds: Dict[str, list] = {}   # node -> ["on"|"off", cmd_id], rides on every control msg
 
         self.session_dir = ''
         self._serial_log = None
@@ -570,8 +571,12 @@ class BSCore:
     # fleet control
     def _send_control_now(self) -> bool:
         msg, ser = self.control['msg'], self._ser
-        if msg is None or ser is None:
+        if ser is None:
             return False
+        # every copy carries the BS time: rovers run experiment starts and radio windows on it
+        # (FleetClock in radio_daemon.py), so their own clocks don't need NTP. Before any fleet
+        # state exists a time-only message goes out as version 0, which rovers never adopt.
+        msg = dict(msg or {}, t=round(time.time(), 3), hop=0)
         air = (struct.pack('<BHI', PKT_TYPE_CONTROL, BS_NODE_ID, self.control['version'] & 0xFFFFFFFF)
                + json.dumps(msg, separators=(',', ':')).encode())
         try:
@@ -585,13 +590,15 @@ class BSCore:
             return False
 
     def _maybe_send_control(self, now: float) -> None:
-        if self.control['msg'] is not None and now - self.control['last_tx'] >= CONTROL_PERIOD_S:
+        if now - self.control['last_tx'] >= CONTROL_PERIOD_S:
             self._send_control_now()
 
     def _set_control(self, msg: dict, note: str) -> None:
         """Publish a new desired fleet state. Version = epoch seconds, so it stays monotonic
         across restarts of this program and rovers never ignore a fresh BS."""
         with self.lock:
+            if self.ros_cmds:
+                msg = dict(msg, ros={n: list(c) for n, c in self.ros_cmds.items()})
             self.control['version'] = max(int(time.time()), self.control['version'] + 1)
             self.control['msg'] = msg
             self.control['sent_at'] = time.time()
@@ -600,7 +607,7 @@ class BSCore:
             self._log_serial(f"#CONTROL:v{v}:{json.dumps(msg, separators=(',', ':'))}")
             self._csv('controls.csv', ['time', 'epoch', 'version', 'state', 'exp', 'note', 'msg'],
                       [_ts(self.control['sent_at']), f"{self.control['sent_at']:.3f}", v,
-                       msg.get('state'), msg.get('exp', ''), note, json.dumps(msg)])
+                       msg.get('state', ''), msg.get('exp', ''), note, json.dumps(msg)])
         self._send_control_now()
         print(f"[CORE] control v{v} {note}: {msg}")
 
@@ -627,6 +634,21 @@ class BSCore:
         self.new_session('standby')
         self._set_control({'state': 'standby', 'cfg': dict(CONFIG_DEFAULTS, **(cfg or {}))}, "standby")
         self.add_marker("standby")
+
+    def set_ros(self, nodes: List[str], on: bool) -> None:
+        """Ask rovers to start/stop their ROS stack. Each press gets a new cmd_id (epoch ms) so
+        the rover acts on it exactly once; re-broadcasts and later control msgs carry it along.
+        Rovers need --ros-control. Without a fleet state yet, only the ROS field is sent."""
+        nodes = [n for n in nodes if n and n != str(BS_NODE_ID)]
+        if not nodes:
+            return
+        want = 'on' if on else 'off'
+        with self.lock:
+            cmd_id = max([int(time.time() * 1000)] + [c[1] + 1 for c in self.ros_cmds.values()])
+            for n in nodes:
+                self.ros_cmds[n] = [want, cmd_id]
+            base = {k: v for k, v in (self.control['msg'] or {}).items() if k != 'ros'}
+        self._set_control(base, f"ROS stack {want}: {', '.join(nodes)}")
 
     def add_marker(self, label: str = '') -> str:
         now = time.time()
@@ -797,11 +819,11 @@ class BSCore:
                          f"{f'periodic {on:g}s on/{off:g}s off' if on and off else 'always on'}, "
                          f"gen every {st.get('gi', 0):g}s | queue {st.get('q', 0):.0f} own/{st.get('qf', 0):.0f} "
                          f"ferried | gen {st.get('gen', 0):.0f} tx {st.get('tx', 0):.0f} "
-                         f"retx {st.get('retx', 0):.0f} ack {st.get('ack', 0):.0f}")
+                         f"retx {st.get('retx', 0):.0f} ack {st.get('ack', 0):.0f} | ros {st.get('ros', '-')}")
             L.append("")
         if self.control['msg'] is not None:
             msg = self.control['msg']
-            L += [f"Fleet control (last sent): v{self.control['version']} {msg.get('state')}"
+            L += [f"Fleet control (last sent): v{self.control['version']} {msg.get('state', '(no fleet state)')}"
                   + (f" '{msg['exp']}'" if msg.get('exp') else ""),
                   f"  cfg: {json.dumps(msg.get('cfg', {}), separators=(',', ':'))}",
                   "  (full history in controls.csv)", ""]

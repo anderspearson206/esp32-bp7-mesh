@@ -20,6 +20,8 @@ Usage:
 
     python3 radio_daemon.py --serial /dev/ttyUSB0 --ros-location-topic /car/t265/odom/sample
 
+    python3 radio_daemon.py ... --ros-control    # let the BS dashboard start/stop the ROS stack
+
 Comms restriction modes (combinable, see --help for all options):
     --bw-limit 1                     data bundles/s budget (beacons/ackmaps/location exempt)
     --comms-on 30 --comms-off 60     radio fully on (TX+RX) 30 s, then fully off 60 s;
@@ -38,6 +40,7 @@ import os
 import platform
 import signal
 import struct
+import subprocess
 import threading
 import time
 import traceback
@@ -119,6 +122,13 @@ ROVER_STATUS_INTERVAL_S    = 5.0    # how often to send @ROVER_STATUS telemetry 
 STATE_LOG_INTERVAL_S       = 1.0    # how often to write a full state snapshot to the event log
 BW_THROTTLE_LOG_S          = 1.0    # min spacing between bw_throttled log lines
 
+# ROS stack control (--ros-control). teleop.launch only: car_startup.launch (what the
+# controller's OPTIONS button runs) also includes astar_planner, which drives the goals
+# mission on its own - never start that remotely without a human able to override.
+ROS_STACK_CMD     = ['roslaunch', 'mushr_base', 'teleop.launch']
+ROS_STOP_GRACE_S  = 20.0   # SIGTERM a stack that hasn't exited this long after SIGINT
+ROS_CHECK_S       = 1.0    # how often to re-scan for running stacks
+
 RECONNECT_DELAY_S  = 5.0
 SERIAL_SETTLE_S    = 3.0
 WRITE_TIMEOUT_S    = 2.0
@@ -187,6 +197,49 @@ class EventLog:
 
 
 # artificial comms restrictions
+class FleetClock:
+    """BS (laptop) wall-clock time as seen by this rover.
+
+    Jetsons without internet have no NTP, so their clocks can be minutes off. The BS stamps
+    every control message it sends with its time ("t") and hop count 0; rovers re-stamp
+    their relays with their own estimate and hop + 1. Experiment starts and periodic radio
+    windows use now() so the whole fleet runs on BS time. Before the first control message
+    the local clock is used (offset 0).
+    """
+
+    JUMP_S     = 1.0     # an estimate this far from the current one replaces it outright
+    HOP_HOLD_S = 30.0    # prefer estimates from fewer hops if one arrived this recently
+
+    def __init__(self):
+        self.offset = 0.0              # BS time - local time [s]
+        self.synced = False
+        self.hop = 0
+        self._updated = 0.0            # monotonic time of the last accepted estimate
+
+    def now(self) -> float:
+        return time.time() + self.offset
+
+    def update(self, bs_time: float, hop: int) -> Optional[float]:
+        """Feed one stamped control message. Returns the step in seconds when the offset
+        jumped (first sync, or the BS / local clock was changed), else None."""
+        mono = time.monotonic()
+        if self.synced and hop > self.hop and mono - self._updated < self.HOP_HOLD_S:
+            return None
+        off = bs_time - time.time()
+        step = None
+        if not self.synced or abs(off - self.offset) > self.JUMP_S:
+            step = off - self.offset
+            self.offset = off
+        else:
+            # smooth out UART/air delay jitter (a few tens of ms)
+            self.offset += 0.2 * (off - self.offset)
+        self.synced, self.hop, self._updated = True, hop, mono
+        return step
+
+
+FLEET_CLOCK = FleetClock()
+
+
 class CommsPolicy:
     """Bandwidth budget + periodic radio windows.
 
@@ -194,8 +247,8 @@ class CommsPolicy:
               Telemetry bundles (acks, location, status) are exempt unless count_telemetry.
               Beacons, ackmaps and location broadcasts are never counted.
     on_s/off_s: radio fully on for on_s, fully off (no TX, RX dropped) for off_s. Either
-              0 = always on. Windows are aligned to wall-clock time (epoch + phase_s) so
-              rovers with synced clocks open their windows together.
+              0 = always on. Windows are aligned to BS time (FLEET_CLOCK, epoch + phase_s)
+              so all rovers open their windows together without NTP.
     """
 
     def __init__(self, bw_limit: float = 0.0, bw_burst: float = 1.0,
@@ -218,7 +271,7 @@ class CommsPolicy:
         """(radio_on, seconds left in the current window or None, cycle index)."""
         if not self.periodic:
             return True, None, 0
-        rel = time.time() - self.phase_s
+        rel = FLEET_CLOCK.now() - self.phase_s
         period = self.on_s + self.off_s
         t = rel % period
         cycle = int(rel // period)
@@ -538,6 +591,145 @@ class SprayAndWaitRouting(RoutingProtocol):
         self._copies.pop(self._key(bundle), None)
 
 
+# ROS stack control
+class RosStack:
+    """Starts/stops the MuSHR ROS stack when the BS asks (control msg field
+    "ros": {"<node>": ["on"|"off", cmd_id]}).
+
+    A stack counts as running whoever started it (controller OPTIONS, a manual roslaunch, or
+    us), so the radio never launches a second copy. Each cmd_id is acted on once; the last one
+    is saved to disk so the BS re-broadcasting an old command after a reboot does nothing.
+    """
+
+    def __init__(self, enabled: bool, state_path: str, log_dir: str):
+        self.enabled = enabled and os.path.isdir('/proc')
+        if enabled and not self.enabled:
+            print('[ROS] --ros-control needs Linux (/proc); ROS commands will be ignored')
+        self._state_path = state_path
+        self._log_dir = log_dir
+        self._proc: Optional[subprocess.Popen] = None   # the stack we launched, if any
+        self._proc_log = None
+        self._stopping: Dict[int, float] = {}           # pid -> monotonic time of SIGINT
+        self._stacks: List[int] = []
+        self._last_cmd = self._load_last_cmd()
+
+    def _load_last_cmd(self) -> int:
+        try:
+            with open(self._state_path) as f:
+                return int(json.load(f)['cmd_id'])
+        except (OSError, ValueError, KeyError, TypeError):
+            return 0
+
+    def _save_last_cmd(self, cmd_id: int) -> None:
+        self._last_cmd = cmd_id
+        try:
+            os.makedirs(os.path.dirname(self._state_path) or '.', exist_ok=True)
+            tmp = self._state_path + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump({'cmd_id': cmd_id, 'saved': time.time()}, f)
+            os.replace(tmp, self._state_path)
+        except OSError as e:
+            print(f"[ROS] could not save {self._state_path}: {e}")
+
+    @staticmethod
+    def find_stacks() -> List[int]:
+        """PIDs of every `roslaunch mushr_base ...` process (zombies have an empty cmdline)."""
+        pids = []
+        for d in os.listdir('/proc'):
+            if not d.isdigit():
+                continue
+            try:
+                with open(f'/proc/{d}/cmdline', 'rb') as f:
+                    argv = f.read().split(b'\0')
+            except OSError:
+                continue
+            if any(os.path.basename(a) == b'roslaunch' and b == b'mushr_base'
+                   for a, b in zip(argv, argv[1:])):
+                pids.append(int(d))
+        return pids
+
+    def on_command(self, want: str, cmd_id: int) -> Optional[str]:
+        """Returns a description of what was done, or None for an already-handled cmd_id."""
+        if cmd_id <= self._last_cmd:
+            return None
+        self._save_last_cmd(cmd_id)
+        if not self.enabled:
+            return 'ignored (--ros-control not enabled)'
+        return self._start() if want == 'on' else self._stop()
+
+    def _start(self) -> str:
+        running = self.find_stacks()
+        if running:
+            return f"already running (pid {running[0]})"
+        path = os.path.join(self._log_dir, f"ros_stack_{datetime.now():%Y%m%d_%H%M%S}.log")
+        try:
+            os.makedirs(self._log_dir, exist_ok=True)
+            self._proc_log = open(path, 'ab')
+            # own session: Ctrl-C / restarting the daemon must not take the stack down with it
+            self._proc = subprocess.Popen(ROS_STACK_CMD, stdin=subprocess.DEVNULL,
+                                          stdout=self._proc_log, stderr=subprocess.STDOUT,
+                                          start_new_session=True)
+        except OSError as e:
+            self._close_proc_log()
+            self._proc = None
+            return f"start failed: {e}"
+        return f"started pid {self._proc.pid}, output in {path}"
+
+    def _stop(self) -> str:
+        running = self.find_stacks()
+        if not running:
+            return 'not running'
+        for pid in running:
+            self._signal(pid, signal.SIGINT)    # same as SHARE: roslaunch shuts its nodes down
+            self._stopping[pid] = time.monotonic()
+        return f"SIGINT sent to pid {', '.join(map(str, running))}"
+
+    @staticmethod
+    def _signal(pid: int, sig: int) -> None:
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
+    def _close_proc_log(self) -> None:
+        if self._proc_log is not None:
+            self._proc_log.close()
+            self._proc_log = None
+
+    def tick(self) -> List[str]:
+        """Reap our child, escalate stuck stops, stop our stack if a second one appeared."""
+        if not self.enabled:
+            return []
+        notes = []
+        if self._proc is not None and self._proc.poll() is not None:
+            notes.append(f"stack pid {self._proc.pid} exited (rc {self._proc.returncode})")
+            self._proc = None
+            self._close_proc_log()
+        self._stacks = self.find_stacks()
+        now = time.monotonic()
+        for pid, t in list(self._stopping.items()):
+            if pid not in self._stacks:
+                del self._stopping[pid]
+            elif now - t > ROS_STOP_GRACE_S:
+                self._signal(pid, signal.SIGTERM)
+                del self._stopping[pid]
+                notes.append(f"pid {pid} ignored SIGINT for {ROS_STOP_GRACE_S:.0f}s, sent SIGTERM")
+        ours = self._proc.pid if self._proc is not None else None
+        if len(self._stacks) > 1 and ours in self._stacks and ours not in self._stopping:
+            # someone pressed OPTIONS (or ran roslaunch) while our stack was up: keep theirs
+            self._signal(ours, signal.SIGINT)
+            self._stopping[ours] = now
+            notes.append(f"duplicate stack detected, stopping ours (pid {ours})")
+        return notes
+
+    def status(self) -> str:
+        if not self.enabled:
+            return 'na'
+        if any(pid in self._stopping for pid in self._stacks):
+            return 'stopping'
+        return 'on' if self._stacks else 'off'
+
+
 # daemon
 class RoverDaemon:
     def __init__(self, serial_port: str, baud: int, gen_interval: float,
@@ -552,7 +744,8 @@ class RoverDaemon:
                  status_interval_s: float = ROVER_STATUS_INTERVAL_S,
                  state_interval_s: float = STATE_LOG_INTERVAL_S,
                  loc_interval_s: float = LOCATION_BUNDLE_INTERVAL_S,
-                 run_config: Optional[dict] = None):
+                 run_config: Optional[dict] = None,
+                 ros_stack: Optional[RosStack] = None):
         assert BUNDLE_SIZE == 1052, f"Bundle struct size mismatch: got {BUNDLE_SIZE}, expected 1052"
         assert ACKMAP_SIZE == 42,   f"Ackmap struct size mismatch: got {ACKMAP_SIZE}, expected 42"
 
@@ -573,6 +766,7 @@ class RoverDaemon:
         self._state_interval_s  = state_interval_s
         self._loc_interval_s    = loc_interval_s
         self._run_config    = run_config or {}
+        self._ros           = ros_stack or RosStack(False, os.devnull, '.')
         # forward loop ticks fast enough to pace the bandwidth budget smoothly
         self._forward_interval_s = (min(FORWARD_INTERVAL_S, 1.0 / self._policy.bw_limit)
                                     if self._policy.bw_limit > 0 else FORWARD_INTERVAL_S)
@@ -588,7 +782,7 @@ class RoverDaemon:
         self._exp_id = ''
         self._exp_start = time.time()
         self._ctrl_version = 0
-        self._ctrl_raw: Optional[bytes] = None     # last adopted control packet, re-broadcast
+        self._ctrl_msg: Optional[tuple] = None     # (origin, msg) last adopted control, re-broadcast
         self._pending_start: Optional[dict] = None # {'exp', 'start_at', 'cfg'}
         self._base_cfg = {k: self._run_config.get(k) for k in CONFIG_KEYS
                           if self._run_config.get(k) is not None}
@@ -1073,6 +1267,8 @@ class RoverDaemon:
             'up':   int(time.time() - self._wall_start),
             'st':   'pending' if self._pending_start else self._mode,
             'cv':   self._ctrl_version,
+            'ck':   round(FLEET_CLOCK.offset, 2) if FLEET_CLOCK.synced else 'na',
+            'ros':  self._ros.status(),
             'exp':  (self._pending_start or {}).get('exp') or
                     (self._exp_id if self._mode == 'active' else '') or '-',
         }
@@ -1329,12 +1525,21 @@ class RoverDaemon:
             return
         origin, version, msg = parsed
         self._counters['rx_control'] += 1
+        self._sync_clock(msg)                     # every copy, also repeats of a known version
+        msg.pop('t', None)
+        msg.pop('hop', None)
         if version <= self._ctrl_version:
             return                                # already have this one (or newer)
         self._log.log('rx_control', origin=origin, version=version, rssi=rssi, msg=msg)
         self._ctrl_version = version
-        self._ctrl_raw = rest
-        self._air_tx(rest, 'control', version=version)   # relay once immediately (multi-hop)
+        self._ctrl_msg = (origin, msg)
+        self._relay_control()                     # relay once immediately (multi-hop)
+
+        ros = (msg.get('ros') or {}).get(str(self._node_id))
+        if isinstance(ros, list) and len(ros) == 2 and ros[0] in ('on', 'off'):
+            self._on_ros_command(ros[0], int(ros[1]), version)
+        if 'state' not in msg:
+            return                                # ROS-only control: fleet state unchanged
 
         cfg = dict(msg.get('cfg') or {})
         cfg.update((msg.get('over') or {}).get(str(self._node_id), {}))   # per-rover overrides
@@ -1354,15 +1559,45 @@ class RoverDaemon:
             else:
                 start_at = float(msg.get('start_at') or 0)
                 self._pending_start = {'exp': exp or f"exp{version}", 'start_at': start_at, 'cfg': cfg}
-                wait = start_at - time.time()
+                wait = start_at - FLEET_CLOCK.now()
                 self._log.log('experiment_scheduled', exp=exp, start_at=start_at,
-                              wait_s=round(wait, 2), late_join=wait < 0)
+                              wait_s=round(wait, 2), late_join=wait < 0,
+                              clock_synced=FLEET_CLOCK.synced)
                 if wait > 0:
                     print(f"[EXP] '{exp}' starts in {wait:.1f}s")
 
+    def _on_ros_command(self, want: str, cmd_id: int, version: int) -> None:
+        result = self._ros.on_command(want, cmd_id)
+        if result is None:
+            return                                # already acted on this cmd_id
+        print(f"[ROS] v{version}: stack {want} (cmd {cmd_id}): {result}")
+        self._log.log('ros_command', want=want, cmd_id=cmd_id, ctrl_version=version, result=result)
+
+    def _sync_clock(self, msg: dict) -> None:
+        try:
+            t, hop = float(msg['t']), int(msg.get('hop', 0))
+        except (KeyError, TypeError, ValueError):
+            return                                # BS software without time stamps
+        step = FLEET_CLOCK.update(t, hop)
+        if step is not None:
+            print(f"[CLOCK] using BS time: local clock is {FLEET_CLOCK.offset:+.2f}s off "
+                  f"(step {step:+.2f}s, {hop} hop(s))")
+            self._log.log('clock_sync', offset_s=round(FLEET_CLOCK.offset, 3),
+                          step_s=round(step, 3), hop=hop)
+
+    def _relay_control(self) -> None:
+        """Re-broadcast the adopted control message, stamped with our BS-time estimate."""
+        if self._ctrl_msg is None:
+            return
+        origin, msg = self._ctrl_msg
+        if FLEET_CLOCK.synced:
+            msg = dict(msg, t=round(FLEET_CLOCK.now(), 3), hop=FLEET_CLOCK.hop + 1)
+        self._air_tx(pack_control(self._ctrl_version, msg, origin), 'control',
+                     version=self._ctrl_version)
+
     def _check_pending_start(self) -> None:
         p = self._pending_start
-        if p is not None and time.time() >= p['start_at']:
+        if p is not None and FLEET_CLOCK.now() >= p['start_at']:
             self._pending_start = None
             self._start_experiment(p['exp'], p['cfg'])
 
@@ -1414,6 +1649,7 @@ class RoverDaemon:
         self._log.log('state', mode=self._mode, exp=self._exp_id, ctrl_version=self._ctrl_version,
                       radio_on=self._radio_on, window_left_s=left, cycle=cycle,
                       tokens=self._policy.tokens(), peers=peers,
+                      bs_clock_offset=round(FLEET_CLOCK.offset, 3) if FLEET_CLOCK.synced else None,
                       loc=dict(self._own_location), counters=dict(self._counters),
                       **self._store_counts())
 
@@ -1432,6 +1668,7 @@ class RoverDaemon:
               f"tx:{self._counters['tx_bundle_data']} retx:{self._counters['retx_bundle_data']} "
               f"acked:{self._counters['acked_own_data']}"
               + (f" | tokens:{tok:.2f}" if tok is not None else "")
+              + (f" | ros:{self._ros.status()}" if self._ros.enabled else "")
               + f" | peers {peers}")
 
     def write_summary(self) -> dict:
@@ -1483,6 +1720,7 @@ class RoverDaemon:
         last_state_log       = 0.0
         last_console_status  = time.monotonic()
         last_ctrl_relay      = time.monotonic()
+        last_ros_check       = 0.0
 
         while True:
             self._check_pending_start()
@@ -1528,10 +1766,10 @@ class RoverDaemon:
             if (mono - last_forward) >= self._forward_interval_s:
                 last_forward = mono
                 self._forward()
-            if (self._ctrl_raw is not None and self._radio_on
+            if (self._ctrl_msg is not None and self._radio_on
                     and (mono - last_ctrl_relay) >= CONTROL_REPEAT_S):
                 last_ctrl_relay = mono
-                self._air_tx(self._ctrl_raw, 'control', version=self._ctrl_version)
+                self._relay_control()
             if self._mode == 'active' and self._interval > 0 and (mono - last_gen) >= self._interval:
                 last_gen = mono
                 self._generate_bundle()
@@ -1551,6 +1789,11 @@ class RoverDaemon:
                 last_state_log = mono
                 self._check_peers()
                 self._log_state()
+            if (mono - last_ros_check) >= ROS_CHECK_S:
+                last_ros_check = mono
+                for note in self._ros.tick():
+                    print(f"[ROS] {note}")
+                    self._log.log('ros_stack', note=note)
             if (mono - last_console_status) >= 5.0:
                 last_console_status = mono
                 self._print_status()
@@ -1771,6 +2014,9 @@ def main():
     parser.add_argument('--ros-location-topic', default=None, metavar='TOPIC',
                         help='ROS 1 nav_msgs/Odometry topic for live position '
                              '(e.g. /car/t265/odom/sample); overrides --lat/--lon/--alt')
+    parser.add_argument('--ros-control', action='store_true',
+                        help='Let the BS start/stop the ROS stack (' + ' '.join(ROS_STACK_CMD) + '). '
+                             'Linux only; needs the ROS environment sourced')
     args = parser.parse_args()
 
     if args.routing == 'spray-wait':
@@ -1818,6 +2064,9 @@ def main():
         state_interval_s=args.state_interval,
         loc_interval_s=max(0.2, args.loc_interval),
         run_config=dict(vars(args), **policy.describe()),
+        ros_stack=RosStack(args.ros_control,
+                           state_path=os.path.join(args.log_dir, 'ros_control_state.json'),
+                           log_dir=args.log_dir),
     )
     if args.mode == 'active':
         daemon.start_on_connect(args.run_tag or 'cli')
