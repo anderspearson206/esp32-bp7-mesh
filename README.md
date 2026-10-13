@@ -205,7 +205,7 @@ CRC-16/CCITT over `[CMD, LEN_LO, LEN_HI, PAYLOAD...]`.
 | `@NET:`          | `@NET:<node>:<parent>:<rssi>`                    | Topology heartbeat (BS emits self-heartbeat `@NET:<bs_id>:0:0` every 5 s)                                                          |
 | `@DTN_RX:`       | `@DTN_RX:<src>:<prev>:<seq>:<receiver>:<hops>`   | Bundle received at BS                                                                                                              |
 | `@METRIC:`       | `@METRIC:<src>:<seq>:<hops>:<latency_ms>`        | End-to-end latency (clock-corrected)                                                                                               |
-| `@LOCATION:`     | `@LOCATION:<node>:<x>:<y>:<z>:<rssi>`            | Rover position in metres (x/y/z) with BS RSSI at that point; emitted by the rover daemon every 5 s when location data is available |
+| `@LOCATION:`     | `@LOCATION:<node>:<x>:<y>:<z>:<rssi>:<yaw>`      | Rover odometry position in metres (x/y/z), BS RSSI at that point (empty if unknown) and heading in degrees; emitted by the rover daemon every `--loc-interval` s (default 1, settable from the dashboard) when location data is available |
 | `@ANTIPKT_FAIL:` | `@ANTIPKT_FAIL:<src>:<seq>:<prev>`               | Duplicate from same forwarder — antipacket didn't reach that node                                                                  |
 | `@FERRY_DUP:`    | `@FERRY_DUP:<src>:<seq>:<first_prev>:<dup_prev>` | Same bundle arrived via two different forwarders (expected epidemic behaviour)                                                     |
 | `@NODE_RESTART:` | `@NODE_RESTART:<node_id>`                        | BS detected a rover's `boot_id` changed; visualizer archives per-node metrics and resets counters for that node                    |
@@ -223,11 +223,11 @@ pip install pyserial networkx matplotlib
 `bs_dashboard.py` (PySide6 + pyqtgraph) is the live display and fleet controller. It sits on `bs_core.py`, which does all the serial reading, parsing, logging, contact tracking, reports and control sending without a GUI. The display only reads snapshots from the core, so a slow or closed window never affects logging or control.
 
 ```bash
-python bs_dashboard.py --port COM5 [--map-half 75] [--report-dir bs_reports]
+python bs_dashboard.py --port COM5 --site fountain [--terrain-dir ../terrain] [--report-dir bs_reports]
 python bs_core.py --port COM5          # headless: same logs and reports, Ctrl-C writes the summary
 ```
 
-- **Fleet control**: experiment name, data interval, bandwidth limit/burst/order, periodic radio on/off/phase, payload size.
+- **Fleet control**: experiment name, data interval, bandwidth limit/burst/order, periodic radio on/off/phase, payload size, location report interval.
   - **Start experiment** begins a run fleet-wide 3 s later in a new session folder.
   - **Apply live** changes the running experiment.
   - **Standby** stops it.
@@ -236,10 +236,30 @@ python bs_core.py --port COM5          # headless: same logs and reports, Ctrl-C
 - **Rovers table**: link UP/DOWN and for how long, RSSI, state, experiment, control version (green = applied), estimated radio window, queue, gen/tx/retx/ack, data in the last 60 s, total data and average latency, status age.
 - **Events**: deliveries, contacts, control changes, markers, restarts and warnings.
 - **Timeline** (1 min to 1 h): link-to-BS lanes, data throughput, data latency, markers.
-- **Topology** and **radio map**.
+- **Topology** (Comms tab).
+- **Map tab** (see [Map and rover alignment](#map-and-rover-alignment)).
 - **Toolbar**: Marker (Ctrl+M, with optional label), Save summary (Ctrl+S), New session.
 
-Session folder contents: `serial.log`, `deliveries.csv`, `contacts.csv`, `rover_status_<id>.csv`, `controls.csv`, `markers.csv`, `coverage.csv`, `dtn_summary_<time>.txt`, `node_<id>_boot<n>.txt` (see the docstring in `bs_core.py`).
+Session folder contents: `serial.log`, `deliveries.csv`, `contacts.csv`, `rover_status_<id>.csv`, `controls.csv`, `markers.csv`, `coverage.csv`, `alignments.csv`, `dtn_summary_<time>.txt`, `node_<id>_boot<n>.txt` (see the docstring in `bs_core.py`).
+
+#### Map and rover alignment
+
+With `--site <name>` the Map tab loads the terrain grid from `terrain/` (`./terrain` or `../terrain`, or `--terrain-dir`), handled by `site_map.py`. Map coordinates are x = east, y = north, metres from the grid centre.
+
+- **Layers**: shaded elevation (or `<site>_sat.png` if present, a north-up image of the same square), the drivable mask, one predicted radio map (`<site>_rm58_*.npy`), and the BS at the `tx` cell. Hovering shows position, elevation, drivable and the predicted value.
+- **Rovers**: the track (coloured by RSSI to the BS), the current position, and a heading arrow. A grey dot means no location for 5 s, usually because the rover is out of range.
+- **Alignment**: each rover's T265 odometry starts at (0, 0) wherever it was switched on, so each rover gets its own offset and rotation onto the map. These are saved in `bs_reports/alignment_<site>.json` and every change is logged to `alignments.csv`. `coverage.csv` keeps the raw odometry, so a run can be realigned afterwards.
+
+Alignment test (remote control driving):
+
+1. Put the rover on a spot you can find on the map, pointing along something with a clear direction. Mark the spot.
+2. On the rover: `python3 radio_daemon.py --serial /dev/ttyUSB0 --ros-location-topic /car/t265/odom/sample`. Standby is fine, because location is still sent.
+3. On the BS laptop: `python bs_dashboard.py --port COM5 --site fountain` (it opens on the Map tab).
+4. Choose the rover and press **Place on map…**. Then press on the rover's spot and drag the way it faces. A plain click sets only the position.
+5. Drive with the remote. The track should follow the blue drivable paths. Use the arrows to nudge the position and ↺ ↻ to rotate about the placed point (x). Press **Clear trail** to restart the statistics.
+6. Press Ctrl+M at landmarks: `markers.csv` records each rover's map position at that moment. Finish on the start mark: *distance to placed point* is the odometry drift over the loop.
+7. The panel and the session summary report how much of the track was on the drivable area, and how much was within 1 m of it.
+
 
 ### Mesh Visualizer (legacy)
 

@@ -6,6 +6,7 @@ bs_dashboard.py is the live display on top of this. The core can also run on its
 logging and reports never depend on the display:
 
     python bs_core.py --port COM5              # headless: log everything, Ctrl-C writes the summary
+    python bs_core.py --port COM5 --site fountain   # + terrain lookups (site_map.py)
 
 Session folder (bs_reports/session_<time>[_<tag>]/):
     serial.log              every BS line with a wall-clock timestamp (+ #CONTACT/#MARKER/#CONTROL)
@@ -13,8 +14,11 @@ Session folder (bs_reports/session_<time>[_<tag>]/):
     contacts.csv            one row per rover <-> BS contact (start, end, data delivered, RSSI)
     rover_status_<id>.csv   every @ROVER_STATUS report
     controls.csv            every fleet control change
-    markers.csv             markers
-    coverage.csv            every @LOCATION sample
+    markers.csv             markers (+ every rover's map position at that moment)
+    coverage.csv            every @LOCATION sample: raw odometry (lat/lon/alt_m columns = odom
+                            x/y/z), yaw, RSSI, map position, and with --site the drivable flag,
+                            elevation and each predicted radio map value at that point
+    alignments.csv          every odometry -> map alignment change
     dtn_summary_<time>.txt  session report
     node_<id>_boot<n>.txt   per-boot report on @NODE_RESTART
 """
@@ -22,6 +26,7 @@ Session folder (bs_reports/session_<time>[_<tag>]/):
 import argparse
 import csv
 import json
+import math
 import os
 import struct
 import threading
@@ -31,6 +36,8 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 import serial
+
+import site_map
 
 BS_NODE_ID       = 23768
 BAUD_RATE        = 115200
@@ -48,7 +55,10 @@ START_DELAY_S     = 3.0    # experiments start this long after Start, fleet-wide
 CONFIG_DEFAULTS = {        # same keys/meaning as the radio_daemon.py CLI options
     'interval': 1.0, 'bw_limit': 0.0, 'bw_burst': 1.0, 'bw_order': 'oldest',
     'comms_on': 0.0, 'comms_off': 0.0, 'comms_phase': 0.0, 'payload_bytes': 0,
+    'loc_interval': 1.0,
 }
+TRACK_MAX        = 20000   # location samples kept per rover for the map
+ALIGN_HEADER     = ['time', 'epoch', 'node', 'x', 'y', 'theta_deg', 'note']
 
 
 def _ts(t: float) -> str:
@@ -82,10 +92,19 @@ def sanitize_name(raw: str) -> str:
 
 
 class BSCore:
-    def __init__(self, port: str, baud: int = BAUD_RATE, report_dir: str = 'bs_reports'):
+    def __init__(self, port: str, baud: int = BAUD_RATE, report_dir: str = 'bs_reports',
+                 site: Optional[str] = None, terrain_dir: Optional[str] = None):
         self.port = port
         self.baud = baud
         self.report_dir = report_dir
+        self.site: Optional[site_map.Site] = None
+        if site:
+            tdir = site_map.find_terrain_dir(terrain_dir)
+            if tdir is None:
+                raise SystemExit(f"--site {site}: no terrain directory found (use --terrain-dir)")
+            self.site = site_map.Site(tdir, site)
+            print(f"[CORE] site {self.site.describe()}")
+        self.alignments = site_map.AlignmentStore(report_dir, site or '')
         self.lock = threading.RLock()
         self._ser: Optional[serial.Serial] = None
         self._ser_write_lock = threading.Lock()
@@ -121,7 +140,8 @@ class BSCore:
         self.boot_history = defaultdict(list)
         self.boot_start: Dict[str, float] = {}
         self.locations: Dict[str, dict] = {}
-        self.map_samples = defaultdict(lambda: deque(maxlen=5000))   # (x, y, rssi)
+        self.tracks = defaultdict(lambda: deque(maxlen=TRACK_MAX))   # (t, x, y, yaw, rssi), odometry
+        self.track_total = defaultdict(int)                          # samples ever added, per rover
         self.link: Dict[str, dict] = {}                      # node -> {up, since, last, data, tel, rssi[]}
         self.contacts = defaultdict(list)                    # node -> [{start, end, data, tel, avg_rssi}]
         self.rover_status: Dict[str, dict] = {}
@@ -144,7 +164,11 @@ class BSCore:
             except OSError:
                 pass
         self._serial_log = open(os.path.join(self.session_dir, 'serial.log'), 'a', buffering=1)
-        self._csv('coverage.csv', ['timestamp', 'node_id', 'lat', 'lon', 'alt_m', 'rssi_to_bs_dBm'], None)
+        self._csv('coverage.csv', self._coverage_header(), None)
+        for node, al in self.alignments.data.items():
+            self._csv('alignments.csv', ALIGN_HEADER,
+                      [_ts(time.time()), f"{time.time():.3f}", node, f"{al['x']:.3f}", f"{al['y']:.3f}",
+                       f"{al['theta']:.2f}", 'loaded'])
         self._event('session', f"session folder {self.session_dir}")
         print(f"[CORE] session folder: {self.session_dir}")
 
@@ -448,15 +472,79 @@ class BSCore:
         except OSError:
             pass
 
+    def _coverage_header(self) -> list:
+        h = ['timestamp', 'node_id', 'lat', 'lon', 'alt_m', 'rssi_to_bs_dBm', 'yaw_deg',
+             'map_x', 'map_y', 'map_heading_deg']
+        if self.site is not None:
+            h += ['on_drivable', 'elev_m'] + [f"pred_{m}_dB" for m in self.site.radio_maps]
+        return h
+
     def _on_location(self, parts: list, now: float) -> None:
+        # @LOCATION:<node>:<x>:<y>:<z>[:<rssi>[:<yaw_deg>]]  (x/y/z = rover odometry)
         node, x, y, z = parts[1], float(parts[2]), float(parts[3]), float(parts[4])
         rssi = int(parts[5]) if len(parts) >= 6 and parts[5] else None
-        self.locations[node] = {'x': x, 'y': y, 'z': z, 'rssi': rssi, 'updated_at': now}
-        if rssi is not None:
-            self.map_samples[node].append((x, y, rssi))
-        if x != 0.0 or y != 0.0:
-            self._csv('coverage.csv', ['timestamp', 'node_id', 'lat', 'lon', 'alt_m', 'rssi_to_bs_dBm'],
-                      [_ts(now), node, f"{x:.6f}", f"{y:.6f}", f"{z:.1f}", rssi if rssi is not None else ''])
+        yaw = float(parts[6]) if len(parts) >= 7 and parts[6] else None
+        self.locations[node] = {'x': x, 'y': y, 'z': z, 'yaw': yaw, 'rssi': rssi, 'updated_at': now}
+        if x == 0.0 and y == 0.0:
+            return                                # no location source on that rover
+        self.tracks[node].append((now, x, y, yaw, rssi))
+        self.track_total[node] += 1
+        mx, my, myaw = site_map.to_map(self.alignments.get(node), x, y, yaw)
+        row = [_ts(now), node, f"{x:.6f}", f"{y:.6f}", f"{z:.1f}", rssi if rssi is not None else '',
+               f"{yaw:.1f}" if yaw is not None else '', f"{float(mx):.2f}", f"{float(my):.2f}",
+               f"{float(myaw):.1f}" if myaw is not None else '']
+        if self.site is not None:
+            row += [int(self.site.on_drivable(mx, my)),
+                    f"{float(self.site.sample(self.site.terrain, mx, my)):.2f}"]
+            row += [f"{float(self.site.sample(a, mx, my)):.1f}" for a in self.site.radio_maps.values()]
+        self._csv('coverage.csv', self._coverage_header(), row)
+
+    # map alignment
+    def set_alignment(self, node: str, al: dict, note: str = '') -> None:
+        """Store a rover's odometry -> map alignment (see site_map.py) and log the change."""
+        now = time.time()
+        with self.lock:
+            self.alignments.set(node, al)
+            a = self.alignments.get(node)
+            self._log_serial(f"#ALIGN:{node}:{a['x']:.3f}:{a['y']:.3f}:{a['theta']:.2f}:{note}")
+            self._csv('alignments.csv', ALIGN_HEADER,
+                      [_ts(now), f"{now:.3f}", node, f"{a['x']:.3f}", f"{a['y']:.3f}",
+                       f"{a['theta']:.2f}", note])
+            if note:
+                self._event('map', f"{node} aligned ({note}): offset ({a['x']:+.1f}, {a['y']:+.1f}) m, "
+                                   f"rotation {a['theta']:+.1f} deg")
+
+    def map_pose(self, node: str):
+        """Latest map pose (x, y, heading or None) of a rover, or None."""
+        loc = self.locations.get(node)
+        if not loc or (loc['x'] == 0.0 and loc['y'] == 0.0):
+            return None
+        mx, my, myaw = site_map.to_map(self.alignments.get(node), loc['x'], loc['y'], loc['yaw'])
+        return float(mx), float(my), (float(myaw) if myaw is not None else None)
+
+    def get_tracks(self) -> Dict[str, list]:
+        with self.lock:
+            return {n: list(v) for n, v in self.tracks.items()}
+
+    def track_stats(self, node: str, since: float = 0.0) -> Optional[dict]:
+        """Length, on-drivable share and closure gaps of a rover's track in map coordinates."""
+        with self.lock:
+            tr = [p for p in self.tracks.get(node, []) if p[0] >= since]
+            al = self.alignments.get(node)
+        if len(tr) < 2:
+            return None
+        xs, ys = [p[1] for p in tr], [p[2] for p in tr]
+        mx, my, _ = site_map.to_map(al, xs, ys)
+        dx, dy = mx[1:] - mx[:-1], my[1:] - my[:-1]
+        st = {'n': len(tr), 'length_m': float(sum(math.hypot(a, b) for a, b in zip(dx, dy))),
+              'start_end_m': float(math.hypot(mx[-1] - mx[0], my[-1] - my[0]))}
+        if self.site is not None and self.site.drivable is not None:
+            st['on_drivable'] = float(self.site.on_drivable(mx, my).mean())
+            st['on_drivable_1m'] = float(self.site.on_drivable(mx, my, 1.0).mean())
+        anchor = al.get('anchor')
+        if anchor:
+            st['to_anchor_m'] = float(math.hypot(mx[-1] - anchor[0], my[-1] - anchor[1]))
+        return st
 
     def _on_rover_status(self, line: str, now: float) -> None:
         parts = line.split(':', 2)
@@ -545,9 +633,12 @@ class BSCore:
         with self.lock:
             label = sanitize_name(label.replace(':', '-')) or f"M{len(self.markers) + 1}"
             self.markers.append((now, label))
-            self._event('marker', label)
+            poses = {n: self.map_pose(n) for n in self.locations}
+            where = ' '.join(f"{n}@({p[0]:.1f},{p[1]:.1f})" for n, p in poses.items() if p)
+            self._event('marker', label + (f"  {where}" if where else ''))
             self._log_serial(f"#MARKER:{label}")
-            self._csv('markers.csv', ['time', 'epoch', 'label'], [_ts(now), f"{now:.3f}", label])
+            self._csv('markers.csv', ['time', 'epoch', 'label', 'rover_map_positions'],
+                      [_ts(now), f"{now:.3f}", label, where])
         return label
 
     # display snapshot
@@ -615,8 +706,9 @@ class BSCore:
                 'timeline': [x for x in self.timeline if x[0] >= t0],
                 'spans': spans,
                 'markers': [m for m in self.markers if m[0] >= t0],
-                'map_samples': {n: list(v) for n, v in self.map_samples.items()},
+                'track_total': dict(self.track_total),
                 'locations': {n: dict(v) for n, v in self.locations.items()},
+                'alignments': {n: self.alignments.get(n) for n in self.locations},
                 'events': [e for e in self.events if e[0] > since_event],
                 'n_delivered': len(self.delivered),
             }
@@ -715,6 +807,22 @@ class BSCore:
                   "  (full history in controls.csv)", ""]
         if self.bs_rejects_control:
             L += ["WARNING: the BS firmware rejected control frames (unknown cmd 0x30) - reflash it.", ""]
+        if self.tracks:
+            L.append("Map" + (f"  ({self.site.describe()})" if self.site else "  (no --site)"))
+            for n in sorted(self.tracks):
+                al, st = self.alignments.get(n), self.track_stats(n)
+                line = (f"  {n}: alignment offset ({al['x']:+.2f}, {al['y']:+.2f}) m rotation "
+                        f"{al['theta']:+.1f} deg")
+                if st:
+                    line += (f" | {st['n']} samples, {st['length_m']:.0f} m driven, "
+                             f"start-end {st['start_end_m']:.1f} m")
+                    if 'to_anchor_m' in st:
+                        line += f", end-to-alignment point {st['to_anchor_m']:.1f} m"
+                    if 'on_drivable' in st:
+                        line += (f", on drivable {100 * st['on_drivable']:.0f}% "
+                                 f"({100 * st['on_drivable_1m']:.0f}% within 1 m)")
+                L.append(line)
+            L += ["  (alignment history in alignments.csv)", ""]
         if self.markers:
             L.append("Markers")
             L += [f"  {lab:<16} {_ts(t)}  (+{t - self.start_time:.0f}s)" for t, lab in self.markers]
@@ -734,8 +842,10 @@ def main():
     ap.add_argument('--port', default='COM5')
     ap.add_argument('--baud', type=int, default=BAUD_RATE)
     ap.add_argument('--report-dir', default='bs_reports')
+    ap.add_argument('--site', default=None, help='terrain site, e.g. fountain or range')
+    ap.add_argument('--terrain-dir', default=None, help='default: ./terrain, then ../terrain')
     args = ap.parse_args()
-    core = BSCore(args.port, args.baud, args.report_dir)
+    core = BSCore(args.port, args.baud, args.report_dir, args.site, args.terrain_dir)
     core.start()
     print("[CORE] running headless, Ctrl-C to stop and write the summary")
     seen = 0

@@ -33,6 +33,7 @@ store change, peer change, window transition and a 1 s state snapshot, plus a
 
 import argparse
 import json
+import math
 import os
 import platform
 import signal
@@ -75,7 +76,8 @@ CONTROL_HDR_SIZE   = struct.calcsize(CONTROL_HDR_FMT)   # 7
 CONTROL_REPEAT_S   = 5.0    # rovers re-broadcast their current control so out-of-range rovers get it
 # config keys the BS may set at runtime (same names as the CLI options)
 CONFIG_KEYS = ('interval', 'bw_limit', 'bw_burst', 'bw_order', 'bw_count_telemetry',
-               'comms_on', 'comms_off', 'comms_phase', 'payload_bytes', 'retransmit_s')
+               'comms_on', 'comms_off', 'comms_phase', 'payload_bytes', 'retransmit_s',
+               'loc_interval')
 
 # dtn_bundle_t layout (packed, little-endian, matches ESP32 C struct)
 # Fields: creation_time, sequence_number, lifetime, source_node, dest_node,
@@ -112,7 +114,7 @@ FORWARD_INTERVAL_S         = 1.0
 PEER_TIMEOUT_S             = 10.0
 BUNDLE_RETRANSMIT_S        = 5.0    # re-send a forwarded-but-unacked bundle to the BS after 5s
 LOCATION_INTERVAL_S        = 5.0    # how often to broadcast own location to neighbors
-LOCATION_BUNDLE_INTERVAL_S = 5.0    # how often to send location as a telemetry bundle toward BS
+LOCATION_BUNDLE_INTERVAL_S = 1.0    # default for how often own location goes to the BS (--loc-interval)
 ROVER_STATUS_INTERVAL_S    = 5.0    # how often to send @ROVER_STATUS telemetry toward BS
 STATE_LOG_INTERVAL_S       = 1.0    # how often to write a full state snapshot to the event log
 BW_THROTTLE_LOG_S          = 1.0    # min spacing between bw_throttled log lines
@@ -452,6 +454,11 @@ LOCATION_FMT  = '<BHfff'
 LOCATION_SIZE = struct.calcsize(LOCATION_FMT)   # 15
 
 
+def _yaw_deg(qx: float, qy: float, qz: float, qw: float) -> float:
+    """Heading (rotation about z) of a quaternion, degrees counter-clockwise from +x."""
+    return math.degrees(math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)))
+
+
 def pack_location(node_id: int, lat: float, lon: float, alt: float) -> bytes:
     return struct.pack(LOCATION_FMT, PKT_TYPE_LOCATION, node_id, lat, lon, alt)
 
@@ -544,6 +551,7 @@ class RoverDaemon:
                  retransmit_s: float = BUNDLE_RETRANSMIT_S,
                  status_interval_s: float = ROVER_STATUS_INTERVAL_S,
                  state_interval_s: float = STATE_LOG_INTERVAL_S,
+                 loc_interval_s: float = LOCATION_BUNDLE_INTERVAL_S,
                  run_config: Optional[dict] = None):
         assert BUNDLE_SIZE == 1052, f"Bundle struct size mismatch: got {BUNDLE_SIZE}, expected 1052"
         assert ACKMAP_SIZE == 42,   f"Ackmap struct size mismatch: got {ACKMAP_SIZE}, expected 42"
@@ -563,6 +571,7 @@ class RoverDaemon:
         self._retransmit_ms = int(retransmit_s * 1000)
         self._status_interval_s = status_interval_s
         self._state_interval_s  = state_interval_s
+        self._loc_interval_s    = loc_interval_s
         self._run_config    = run_config or {}
         # forward loop ticks fast enough to pace the bandwidth budget smoothly
         self._forward_interval_s = (min(FORWARD_INTERVAL_S, 1.0 / self._policy.bw_limit)
@@ -594,7 +603,9 @@ class RoverDaemon:
         self._peers: Dict[int, dict] = {}                    # node_id -> {last_seen, boot_id, rssi}
         self._ack: Dict[int, dict] = {}                      # source_node -> {seq_base, bitmap, dirty}
 
-        self._own_location    = {'lat': lat, 'lon': lon, 'alt': alt}
+        # lat/lon/alt carry odometry x/y/z when a ROS topic is used; yaw is degrees
+        # (counter-clockwise from the odometry x axis), None without a ROS topic
+        self._own_location    = {'lat': lat, 'lon': lon, 'alt': alt, 'yaw': None}
         self._ros_location_topic = ros_location_topic
         self._locations: Dict[int, dict] = {}                # node_id -> {lat, lon, alt, updated_ms}
 
@@ -1074,9 +1085,14 @@ class RoverDaemon:
             return
         loc = self._own_location
         bs_rssi = self._peers.get(BASE_STATION_NODE_ID, {}).get('rssi')
-        rssi_field = f":{bs_rssi}" if bs_rssi is not None else ""
+        # @LOCATION:<node>:<x>:<y>:<z>[:<rssi>[:<yaw_deg>]]  (rssi left empty when unknown)
+        tail = f":{bs_rssi if bs_rssi is not None else ''}"
+        if loc.get('yaw') is not None:
+            tail += f":{loc['yaw']:.1f}"
+        elif bs_rssi is None:
+            tail = ""
         self._queue_telemetry(f"@LOCATION:{self._node_id}:"
-                              f"{loc['lat']:.6f}:{loc['lon']:.6f}:{loc['alt']:.1f}{rssi_field}")
+                              f"{loc['lat']:.6f}:{loc['lon']:.6f}:{loc['alt']:.1f}{tail}")
 
     # bundle generation
     def _generate_bundle(self) -> None:
@@ -1247,6 +1263,8 @@ class RoverDaemon:
         self._payload_bytes = applied.get('payload_bytes', self._payload_bytes)
         if 'retransmit_s' in applied:
             self._retransmit_ms = int(applied['retransmit_s'] * 1000)
+        if 'loc_interval' in applied and applied['loc_interval'] > 0:
+            self._loc_interval_s = max(0.2, applied['loc_interval'])
         self._policy = CommsPolicy(
             bw_limit=applied.get('bw_limit', p.bw_limit),
             bw_burst=applied.get('bw_burst', p.bw_burst),
@@ -1258,7 +1276,8 @@ class RoverDaemon:
                                     if self._policy.bw_limit > 0 else FORWARD_INTERVAL_S)
         self._log.log('config_applied', applied=applied, policy=self._policy.describe(),
                       interval=self._interval, bw_order=self._bw_order,
-                      payload_bytes=self._payload_bytes, retransmit_ms=self._retransmit_ms)
+                      payload_bytes=self._payload_bytes, retransmit_ms=self._retransmit_ms,
+                      loc_interval=self._loc_interval_s)
         return applied
 
     def _current_config(self) -> dict:
@@ -1267,7 +1286,7 @@ class RoverDaemon:
                 'bw_order': self._bw_order, 'bw_count_telemetry': d['bw_count_telemetry'],
                 'comms_on': d['comms_on_s'], 'comms_off': d['comms_off_s'],
                 'comms_phase': d['comms_phase_s'], 'payload_bytes': self._payload_bytes,
-                'retransmit_s': self._retransmit_ms / 1000.0}
+                'retransmit_s': self._retransmit_ms / 1000.0, 'loc_interval': self._loc_interval_s}
 
     def _end_experiment(self, reason: str) -> None:
         if self._mode != 'active':
@@ -1522,7 +1541,7 @@ class RoverDaemon:
             if (mono - last_location) >= LOCATION_INTERVAL_S:
                 last_location = mono
                 self._send_location()
-            if (mono - last_location_bundle) >= LOCATION_BUNDLE_INTERVAL_S:
+            if (mono - last_location_bundle) >= self._loc_interval_s:
                 last_location_bundle = mono
                 self._send_location_bundle()
             if self._status_interval_s > 0 and (mono - last_rover_status) >= self._status_interval_s:
@@ -1595,8 +1614,10 @@ class RoverDaemon:
 
                 def _cb(msg: _Odometry) -> None:
                     p = msg.pose.pose.position
+                    q = msg.pose.pose.orientation
+                    yaw = _yaw_deg(q.x, q.y, q.z, q.w)
                     with self._lock:
-                        self._own_location = {'lat': p.x, 'lon': p.y, 'alt': p.z}
+                        self._own_location = {'lat': p.x, 'lon': p.y, 'alt': p.z, 'yaw': yaw}
 
                 rospy.Subscriber(topic, _Odometry, _cb)
                 print(f"[LOC] Subscribed to {topic} via rospy")
@@ -1607,11 +1628,12 @@ class RoverDaemon:
         threading.Thread(target=_thread, daemon=True, name='ros-loc').start()
 
     def _start_ros_location_subprocess(self, topic: str) -> None:
-        """Parse `rostopic echo` YAML output to extract pose.pose.position x/y/z."""
+        """Parse `rostopic echo` YAML output for pose.pose.position and pose.pose.orientation."""
         import subprocess, re
         print(f"[LOC] rospy unavailable - falling back to rostopic echo for {topic}")
 
         def _thread() -> None:
+            key_re = re.compile(r'^(\s*)(\w+)\s*:\s*(.*)')
             while True:
                 try:
                     proc = subprocess.Popen(
@@ -1619,63 +1641,39 @@ class RoverDaemon:
                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                         universal_newlines=True,
                     )
-                    # nav_msgs/Odometry YAML structure:
-                    #   pose:          indent 0  -> pose_depth = 1
-                    #     pose:        indent 2  -> pose_depth = 2
-                    #       position:  indent 4  -> in_position = True, position_indent = 4
-                    #         x: 1.2  indent 6  -> collect (indent > position_indent)
-                    #         y: -0.5
-                    #         z: 0.08
-                    buf: dict = {}
-                    pose_depth   = 0
-                    in_position  = False
-                    position_indent = -1
-                    key_re = re.compile(r'^(\s*)(\w+)\s*:\s*(.*)')
+                    # nav_msgs/Odometry YAML: track the key path by indentation and keep
+                    # pose/pose/position/{x,y,z} and pose/pose/orientation/{x,y,z,w};
+                    # '---' ends each message.
+                    stack: list = []          # [(indent, key)]
+                    vals: dict = {}
                     for line in proc.stdout:
                         if line.rstrip() == '---':
-                            pose_depth = 0
-                            in_position = False
-                            position_indent = -1
-                            buf = {}
+                            pos = [vals.get(('position', k)) for k in 'xyz']
+                            ori = [vals.get(('orientation', k)) for k in 'xyzw']
+                            if None not in pos:
+                                yaw = _yaw_deg(*ori) if None not in ori else None
+                                with self._lock:
+                                    self._own_location = {'lat': pos[0], 'lon': pos[1],
+                                                          'alt': pos[2], 'yaw': yaw}
+                            stack, vals = [], {}
                             continue
                         m = key_re.match(line)
                         if not m:
                             continue
-                        indent = len(m.group(1))
-                        key    = m.group(2)
-                        val    = m.group(3).strip()
-
-                        if in_position:
-                            if indent <= position_indent:
-                                # exited the position block
-                                in_position = False
-                            elif key in ('x', 'y', 'z') and val:
-                                try:
-                                    buf[key] = float(val)
-                                except ValueError:
-                                    pass
-                            if len(buf) == 3:
-                                with self._lock:
-                                    self._own_location = {
-                                        'lat': buf['x'],
-                                        'lon': buf['y'],
-                                        'alt': buf['z'],
-                                    }
-                                buf = {}
-                            continue
-
-                        # state machine to find pose > pose > position
-                        if key == 'pose' and indent == 0:
-                            pose_depth = 1
-                        elif key == 'pose' and pose_depth == 1:
-                            pose_depth = 2
-                        elif key == 'position' and pose_depth == 2:
-                            in_position = True
-                            position_indent = indent
-                        elif indent == 0:
-                            # top-level key other than 'pose' resets pose tracking
-                            pose_depth = 0
-
+                        indent, key, val = len(m.group(1)), m.group(2), m.group(3).strip()
+                        while stack and stack[-1][0] >= indent:
+                            stack.pop()
+                        path = [k for _i, k in stack]
+                        if not val:
+                            stack.append((indent, key))
+                        elif path[:2] == ['pose', 'pose'] and len(path) == 3:
+                            try:
+                                vals[(path[2], key)] = float(val)
+                            except ValueError:
+                                pass
+                    proc.wait()
+                    print("[LOC] rostopic echo exited; restarting in 2s")
+                    time.sleep(2)
                 except Exception as exc:
                     print(f"[LOC] rostopic echo failed: {exc}; retrying in 5s")
                     time.sleep(5)
@@ -1767,6 +1765,9 @@ def main():
     parser.add_argument('--lat',         type=float, default=0.0, help='Own latitude (static fallback)')
     parser.add_argument('--lon',         type=float, default=0.0, help='Own longitude (static fallback)')
     parser.add_argument('--alt',         type=float, default=0.0, help='Own altitude in metres (static fallback)')
+    parser.add_argument('--loc-interval', type=float, default=LOCATION_BUNDLE_INTERVAL_S,
+                        help='Seconds between @LOCATION telemetry bundles to the BS '
+                             '(the dashboard can change it)')
     parser.add_argument('--ros-location-topic', default=None, metavar='TOPIC',
                         help='ROS 1 nav_msgs/Odometry topic for live position '
                              '(e.g. /car/t265/odom/sample); overrides --lat/--lon/--alt')
@@ -1815,6 +1816,7 @@ def main():
         retransmit_s=args.retransmit_s,
         status_interval_s=args.status_interval,
         state_interval_s=args.state_interval,
+        loc_interval_s=max(0.2, args.loc_interval),
         run_config=dict(vars(args), **policy.describe()),
     )
     if args.mode == 'active':
