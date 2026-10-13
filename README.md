@@ -36,32 +36,23 @@ python rover_daemon.py --serial COM14           # Windows bench
 
 The daemon owns all DTN logic for that rover: it sends beacons, generates data bundles, stores and forwards received bundles, and applies ACK maps. Nothing happens over the air until the daemon is running. If the rover tracks its own position (e.g. from a VIO or GPS source), the daemon reads that location and sends it to the base station automatically — no extra configuration needed.
 
-### 3 — Start the visualizer on the base station laptop
+### 3 — Start the BS dashboard on the base station laptop
 
 ```bash
-pip install pyserial networkx matplotlib
-python mesh_visualizer.py # you may need to adjust the serial port
+pip install pyserial pyqtgraph PySide6
+python bs_dashboard.py --port COM5
 ```
 
-The window shows three panels updated every 500 ms:
-
-| Panel                       | Contents                                                                                                                                                      |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Mesh graph**              | Live topology — nodes, RSSI-labelled links, active bundle transfers (orange = ferried)                                                                        |
-| **Bundle events / metrics** | Recent deliveries, per-node packet counts, avg latency, node positions                                                                                        |
-| **Radio map**               | Scatter plot of every `@LOCATION:` sample received, coloured by RSSI (red = weak → green = strong); current rover position shown with a white-outlined marker |
-
-Radio map range is set by `RADIO_MAP_HALF_M` at the top of `mesh_visualizer.py` (default `25.0` → ±25 m, i.e. a 50×50 m map).
+The dashboard reads the BS serial port, shows the fleet live, logs everything to `bs_reports/session_<time>[_<experiment>]/`, and controls the rovers' experiments (see [BS Dashboard](#bs-dashboard)). `python bs_core.py --port COM5` runs the same logging without any GUI.
 
 ### Running an experiment
 
-1. Ensure `rover_daemon.py` is running on each rover.
-2. Reboot all ESP32s (power-cycle or `idf.py -p <PORT> monitor` → `Ctrl-T Ctrl-R`). The visualizer detects each node's new `boot_id` and saves the previous session's metrics automatically — this gives you a clean slate for each run.
-3. Start `mesh_visualizer.py` on the BS laptop.
-4. Move rovers through their trajectories.
-5. **End the experiment**: press `Ctrl-C` or close the visualizer window. All delivery metrics and coverage data are saved automatically to `bs_reports/`.
-
-Per-session CSV coverage logs (`bs_reports/coverage_<timestamp>.csv`) contain every `(node, x, y, z, rssi)` sample received — useful for post-processing radio maps offline.
+1. Start `radio_daemon.py` once on each rover and leave it running; rovers boot into **standby** (no data bundles).
+2. Start `bs_dashboard.py` on the BS laptop.
+3. Enter an experiment name and settings in **Fleet control** and press **Start experiment**. Every rover starts 3 s later, and a new session folder named after the experiment is opened.
+4. Use **Marker** (Ctrl+M, optional label) for waypoints and other events, and **Apply live** to change settings mid-run.
+5. Press **Standby** to end the run: rovers write their experiment summaries and the BS writes the session summary.
+6. Afterwards, collect `rover_logs/exp_<name>_*` from each Jetson (`scp`) to pair with the BS session folder.
 
 ---
 
@@ -202,7 +193,7 @@ CRC-16/CCITT over `[CMD, LEN_LO, LEN_HI, PAYLOAD...]`.
 | `ACK`            | `0x20` | ESP32 → Jetson | 1 byte (0=ok, 1=error)                                            |
 | `STATUS_RESP`    | `0x21` | ESP32 → Jetson | `host_status_t` (6 bytes)                                         |
 | `PEERS_RESP`     | `0x22` | ESP32 → Jetson | n × `host_peer_entry_t` (4 bytes each)                            |
-| `WIFI_TX`        | `0x30` | Jetson → ESP32 | raw over-air bytes, broadcast verbatim (rover relay)              |
+| `WIFI_TX`        | `0x30` | Host → ESP32   | raw over-air bytes, broadcast verbatim (rover relay; BS: fleet control) |
 | `WIFI_RX`        | `0x31` | ESP32 → Jetson | `[src_mac:6][rssi:1][air bytes]` per received frame (rover relay) |
 
 **Rover relay mode** (`rover_daemon.py`) uses only `WIFI_TX` / `WIFI_RX`, plus `QUERY_STATUS` / `STATUS_RESP` for node-ID detection. The bundle-centric commands (`TX_BUNDLE`, `PULL_REQ`, `BUNDLE_DATA`, `NO_BUNDLES`, `ANTIPKT_NOTIFY`, `BUNDLE_PUSH`) belong to the legacy `jetson_daemon.py` model. `HOST_MAX_PAYLOAD` is 1100 bytes (a relayed bundle is up to 6 + 1 + 1053 bytes).
@@ -227,7 +218,33 @@ Install dependencies once:
 pip install pyserial networkx matplotlib
 ```
 
-### Mesh Visualizer
+### BS Dashboard
+
+`bs_dashboard.py` (PySide6 + pyqtgraph) is the live display and fleet controller. It sits on `bs_core.py`, which does all the serial reading, parsing, logging, contact tracking, reports and control sending without a GUI. The display only reads snapshots from the core, so a slow or closed window never affects logging or control.
+
+```bash
+python bs_dashboard.py --port COM5 [--map-half 75] [--report-dir bs_reports]
+python bs_core.py --port COM5          # headless: same logs and reports, Ctrl-C writes the summary
+```
+
+- **Fleet control**: experiment name, data interval, bandwidth limit/burst/order, periodic radio on/off/phase, payload size.
+  - **Start experiment** begins a run fleet-wide 3 s later in a new session folder.
+  - **Apply live** changes the running experiment.
+  - **Standby** stops it.
+  - The status line shows the desired fleet state and which rovers have not applied it yet. Rovers out of range or in an off window pick it up when they hear the BS again.
+  - A red banner appears if the BS firmware is too old to forward control.
+- **Rovers table**: link UP/DOWN and for how long, RSSI, state, experiment, control version (green = applied), estimated radio window, queue, gen/tx/retx/ack, data in the last 60 s, total data and average latency, status age.
+- **Events**: deliveries, contacts, control changes, markers, restarts and warnings.
+- **Timeline** (1 min to 1 h): link-to-BS lanes, data throughput, data latency, markers.
+- **Topology** and **radio map**.
+- **Toolbar**: Marker (Ctrl+M, with optional label), Save summary (Ctrl+S), New session.
+
+Session folder contents: `serial.log`, `deliveries.csv`, `contacts.csv`, `rover_status_<id>.csv`, `controls.csv`, `markers.csv`, `coverage.csv`, `dtn_summary_<time>.txt`, `node_<id>_boot<n>.txt` (see the docstring in `bs_core.py`).
+
+### Mesh Visualizer (legacy)
+
+> Superseded by `bs_dashboard.py`. The matplotlib visualizer still works but redraws everything every frame and is slow with the control panel.
+
 
 Connects to the base station serial port and animates a live display updated every 500 ms.
 
@@ -243,6 +260,14 @@ python mesh_visualizer.py --port /dev/ttyUSB0    # Linux/macOS
 - **Comms status / bundle events**: per rover, link UP/DOWN to the BS and for how long, contact count, comms mode (bandwidth budget, periodic on/off with an estimate of the rover's current window), queue depth and gen/tx/retx/ack counters from `@ROVER_STATUS`. Below that: recent deliveries, per-node data vs telemetry counts and latency, node positions.
 - **Radio map**: metre-scale scatter plot built from `@LOCATION:` messages, coloured by RSSI. Range set by `--map-half` (default 75 m).
 - **Comms timeline** (bottom): last 180 s, with coloured bands where each rover's link to the BS was up, data throughput per rover (5 s bins), data-bundle latency dots, and markers.
+
+**Fleet control** (bottom strip): run experiments from the BS without touching the rovers. Fill in the experiment name and settings, then:
+
+- **Start**: saves the current session, opens a new session folder named after the experiment, and tells every rover to start it 3 s from now (all rovers start together, given synced clocks).
+- **Apply live**: pushes changed settings into the running experiment.
+- **Standby**: ends the experiment on every rover.
+
+The visualizer keeps re-broadcasting the desired fleet state every 2 s (through the BS ESP32, `PKT_TYPE_CONTROL`), and rovers relay it every 5 s so out-of-range rovers get it multi-hop. A rover in a periodic off-window hears nothing and applies the latest state when its radio comes back on. The status line under the controls shows each rover's state, experiment and the control version it is running, so you can see who has picked up a change. Every control change is logged to `controls.csv`, `serial.log` and as a timeline marker.
 
 **Keys:** `m` drop a timestamped marker (logged and drawn on the timeline), `s` save a summary now, `r` save and start a fresh session, `h` help.
 
@@ -308,6 +333,13 @@ python3 radio_daemon.py --serial /dev/ttyUSB0 --comms-on 30 --comms-off 60 --run
 | `--run-tag`            | none           | Label appended to the log filename                                       |
 | `--state-interval`     | 1              | Seconds between full state snapshots in the log                          |
 | `--status-interval`    | 5              | Seconds between `@ROVER_STATUS` telemetry bundles to the BS (0 = off)    |
+| `--mode`               | `standby`      | `standby`: wait for the BS. `active`: run an experiment with the CLI settings immediately |
+
+**Normal use**: start the daemon once on each rover (`python3 radio_daemon.py --serial /dev/ttyUSB0`, ideally in `tmux`) and leave it. It boots into **standby** and everything else is driven from the visualizer's control strip. The CLI comms flags only set the defaults that BS commands override.
+
+**Standby**: no data bundles are generated or sent (any held data waits), comms restrictions are off, and the radio stays on so the rover can always hear the BS. Beacons, ackmaps, location and `@ROVER_STATUS` keep flowing, so the visualizer still shows the rover and its link.
+
+**Experiments**: when the BS starts an experiment, the rover drops queued data from the previous run, resets its counters, applies the settings, and mirrors its event log into `rover_logs/exp_<name>_<node>_<time>.jsonl`. When the experiment ends (Standby, a new Start, or daemon shutdown) it writes `exp_..._summary.json`. Sequence numbers keep counting across experiments so the BS ack window stays valid. The daemon-lifetime log `rover_<time>.jsonl` always gets every event too.
 
 **Comms modes:**
 

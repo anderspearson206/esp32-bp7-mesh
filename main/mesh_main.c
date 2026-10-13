@@ -34,6 +34,8 @@
 #define PKT_TYPE_BEACON  0x01
 #define PKT_TYPE_BUNDLE  0x02
 #define PKT_TYPE_ACKMAP  0x04   // bitmap ACK: one packet ACKs up to 256 bundles per source
+// 0x05 = location, 0x06 = fleet control: both are handled by the rover daemons only and
+// ignored by this firmware (the BS just broadcasts control frames the laptop hands it)
 
 #define ACKMAP_BITMAP_BYTES  32                  // 256 sequence numbers per ackmap packet
 #define ACKMAP_BITMAP_BITS   (ACKMAP_BITMAP_BYTES * 8)
@@ -1216,6 +1218,10 @@ static void host_uart_task(void *arg) {
                                 (uint16_t)(n * sizeof(host_peer_entry_t)));
                 break;
             }
+            case HOST_CMD_WIFI_TX:
+                // BS laptop -> fleet control packets (PKT_TYPE_CONTROL), broadcast verbatim
+                if (plen > 0) esp_now_send(BROADCAST_MAC, host_rx_payload, plen);
+                break;
             default:
                 ESP_LOGW(TAG, "Host: unknown cmd 0x%02x len=%u", cmd, plen);
                 break;

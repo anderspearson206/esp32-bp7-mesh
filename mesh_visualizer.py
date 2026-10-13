@@ -1,6 +1,8 @@
 import argparse
 import csv
+import json
 import os
+import struct
 import serial
 import threading
 import time
@@ -77,11 +79,12 @@ def _log_serial(line: str) -> None:
             pass
 
 
-def _init_session_files() -> None:
+def _init_session_files(tag: str = "") -> None:
     """Each session (visualizer start, BS reboot, reset key) gets its own folder holding
     the raw serial log, CSVs and summaries, so runs never mix."""
     global _coverage_csv_path, session_dir, _serial_log
-    session_dir = os.path.join(REPORT_DIR, f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    session_dir = os.path.join(REPORT_DIR, f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                                           + (f"_{tag}" if tag else ""))
     os.makedirs(session_dir, exist_ok=True)
     _coverage_csv_path = os.path.join(session_dir, "coverage.csv")
     with open(_coverage_csv_path, 'w', newline='') as f:
@@ -213,7 +216,7 @@ def read_line_or_frame(ser):
             return buf.decode('utf-8', errors='ignore').strip() or None
 
 
-def reset_session_state():
+def reset_session_state(tag: str = ""):
     """Wipe all per-session tracking state and restart the session clock.
     Always save the current summary before calling this."""
     global start_time
@@ -238,7 +241,7 @@ def reset_session_state():
         rover_status.clear()
         markers.clear()
         start_time = time.time()
-    _init_session_files()
+    _init_session_files(tag)
     print("[VISUALIZER] Session state cleared - starting fresh.")
 
 
@@ -316,7 +319,7 @@ def save_boot_summary(node_id: str, boot_num: int, boot_record: dict) -> None:
 
 def serial_reader_thread(port):
     """Read serial data from the BS port and update shared state."""
-    global _pending_metric
+    global _pending_metric, _ser
     first_connect = True
     _init_session_files()
     while True:
@@ -324,6 +327,7 @@ def serial_reader_thread(port):
             ser = serial.Serial(port, BAUD_RATE, timeout=1)
             ser.dtr = False
             ser.rts = False
+            _ser = ser
             if not first_connect:
                 # BS came back after a disconnect, save old session and reset
                 print(f"[VISUALIZER] Reconnected to {port} - saving session and resetting state.")
@@ -335,9 +339,14 @@ def serial_reader_thread(port):
             while True:
                 line = read_line_or_frame(ser)
                 _check_contacts(time.time())
+                _maybe_send_control()
                 if not line:
                     continue
                 _log_serial(line)
+                if "unknown cmd 0x30" in line and not control['bs_rejects']:
+                    control['bs_rejects'] = True
+                    print("[CONTROL] *** The BS firmware rejected a control frame (unknown cmd 0x30). "
+                          "It is running old firmware: close the visualizer, build and flash the BS. ***")
 
                 # Detect BS reboot via its boot-time log line (covers software resets
                 # where the serial connection stays open and no SerialException fires).
@@ -752,6 +761,14 @@ def generate_summary():
                                  f" retx {st.get('retx', 0):.0f} acked {st.get('ack', 0):.0f}")
                 lines.append("")
 
+        if control['msg'] is not None:
+            m = control['msg']
+            lines.append(f"Fleet control (last sent): v{control['version']} {m.get('state')}"
+                         + (f" '{m['exp']}'" if m.get('exp') else ""))
+            lines.append(f"  cfg: {json.dumps(m.get('cfg', {}), separators=(',', ':'))}")
+            lines.append("  (full history in controls.csv)")
+            lines.append("")
+
         if markers:
             lines.append("Markers")
             for t, label in markers:
@@ -965,13 +982,16 @@ def _draw_timeline(ax, now: float) -> None:
     lat_pts = [(t - now, lat / 1000.0, _node_color(s)) for t, s, k, lat in delivery_timeline
                if k == 'data' and t >= t0]
     if lat_pts:
-        ax2 = ax.twinx()
+        ax2 = AX['tl2']
         ax2.scatter([p[0] for p in lat_pts], [p[1] for p in lat_pts],
                     c=[p[2] for p in lat_pts], s=8, alpha=0.6, marker='o', linewidths=0)
         ax2.set_ylabel("latency (s)", fontsize=8)
         ax2.tick_params(labelsize=7)
         ax2.set_ylim(bottom=0)
-        ax2.set_xlim(-TIMELINE_S, 0)
+    ax2 = AX['tl2']
+    ax2.set_xlim(-TIMELINE_S, 0)
+    ax2.yaxis.set_label_position('right')
+    ax2.yaxis.tick_right()
 
     for t, label in markers:
         if t >= t0:
@@ -983,6 +1003,8 @@ def _draw_timeline(ax, now: float) -> None:
 
 
 def _on_key(event) -> None:
+    if _typing():
+        return                                   # keys go to the text box being edited
     if event.key == 'm':
         add_marker()
     elif event.key == 's':
@@ -996,8 +1018,210 @@ def _on_key(event) -> None:
               "s = save summary now, r = save summary and reset session, h = this help")
 
 
+# fleet control (BS laptop -> BS ESP32 -> rovers)
+# The visualizer holds one desired fleet state and re-broadcasts it every CONTROL_PERIOD_S.
+# Rovers adopt any version newer than theirs and report the version they run in
+# @ROVER_STATUS (cv=...), so the panel shows who has applied what. Rovers in a periodic
+# off-window can't hear it and pick it up when their radio comes back on.
+HOST_SOF           = 0xAA
+HOST_CMD_WIFI_TX   = 0x30
+PKT_TYPE_CONTROL   = 0x06
+BS_NODE_ID         = 23768
+CONTROL_PERIOD_S   = 2.0
+START_DELAY_S      = 3.0     # experiments start this long after Start is pressed, fleet-wide
+CONTROL_FIELDS = [           # (config key, label, default)
+    ('interval',      'gen s',     '1'),
+    ('bw_limit',      'bw/s',      '0'),
+    ('bw_burst',      'burst',     '1'),
+    ('bw_order',      'order',     'oldest'),
+    ('comms_on',      'on s',      '0'),
+    ('comms_off',     'off s',     '0'),
+    ('comms_phase',   'phase s',   '0'),
+    ('payload_bytes', 'payload B', '0'),
+]
+
+AX: dict = {}
+_widgets: list = []
+_textboxes: dict = {}
+_ser = None
+_ser_write_lock = threading.Lock()
+control = {'version': 0, 'msg': None, 'sent_at': 0.0, 'last_tx': 0.0, 'bs_rejects': False}
+
+
+def _crc16(data: bytes) -> int:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if (crc & 0x8000) else (crc << 1)
+            crc &= 0xFFFF
+    return crc
+
+
+def _encode_frame(cmd: int, payload: bytes) -> bytes:
+    n = len(payload)
+    body = bytes([cmd, n & 0xFF, n >> 8]) + payload
+    crc = _crc16(body)
+    return bytes([HOST_SOF]) + body + bytes([crc & 0xFF, crc >> 8])
+
+
+def _send_control_now() -> bool:
+    msg = control['msg']
+    if msg is None or _ser is None:
+        return False
+    air = (struct.pack('<BHI', PKT_TYPE_CONTROL, BS_NODE_ID, control['version'] & 0xFFFFFFFF)
+           + json.dumps(msg, separators=(',', ':')).encode())
+    try:
+        with _ser_write_lock:
+            _ser.write(_encode_frame(HOST_CMD_WIFI_TX, air))
+        control['last_tx'] = time.time()
+        return True
+    except Exception as e:   # serial hiccup: the reader thread handles reconnects
+        print(f"[CONTROL] send failed: {e}")
+        return False
+
+
+def _maybe_send_control() -> None:
+    if control['msg'] is not None and time.time() - control['last_tx'] >= CONTROL_PERIOD_S:
+        _send_control_now()
+
+
+def _set_control(msg: dict, note: str) -> None:
+    """Publish a new desired fleet state. Version = epoch seconds (monotonic across
+    visualizer restarts, so rovers never ignore a fresh visualizer)."""
+    control['version'] = max(int(time.time()), control['version'] + 1)
+    control['msg'] = msg
+    control['sent_at'] = time.time()
+    _send_control_now()
+    _log_serial(f"#CONTROL:v{control['version']}:{json.dumps(msg, separators=(',', ':'))}")
+    _csv_append("controls.csv", ['time', 'epoch', 'version', 'state', 'exp', 'note', 'msg'],
+                [_ts(control['sent_at']), f"{control['sent_at']:.3f}", control['version'],
+                 msg.get('state'), msg.get('exp', ''), note, json.dumps(msg)])
+    print(f"[CONTROL] v{control['version']} {note}: {msg}")
+
+
+def _read_config_fields() -> dict:
+    cfg = {}
+    for key, _label, default in CONTROL_FIELDS:
+        raw = (_textboxes[key].text if key in _textboxes else default).strip()
+        if key == 'bw_order':
+            cfg[key] = 'newest' if raw.lower().startswith('n') else 'oldest'
+            continue
+        try:
+            cfg[key] = int(raw) if key == 'payload_bytes' else float(raw)
+        except ValueError:
+            print(f"[CONTROL] bad value for {key!r}: {raw!r}, using {default}")
+            cfg[key] = float(default) if key != 'payload_bytes' else int(default)
+    return cfg
+
+
+def _exp_name() -> str:
+    raw = _textboxes['exp'].text if 'exp' in _textboxes else ''
+    name = ''.join(ch for ch in raw.strip().replace(' ', '_') if ch.isalnum() or ch in '-_')[:40]
+    return name or f"exp_{datetime.now().strftime('%H%M%S')}"
+
+
+def start_experiment(_event=None) -> None:
+    exp = _exp_name()
+    cfg = _read_config_fields()
+    start_at = time.time() + START_DELAY_S
+    generate_summary()
+    reset_session_state(tag=exp)
+    _set_control({'state': 'active', 'exp': exp, 'start_at': round(start_at, 2), 'cfg': cfg},
+                 f"start experiment '{exp}'")
+    add_marker(f"start:{exp}")
+
+
+def apply_live(_event=None) -> None:
+    msg = control['msg']
+    if not msg or msg.get('state') != 'active':
+        print("[CONTROL] no experiment running - use Start (or Standby) instead")
+        return
+    cfg = _read_config_fields()
+    _set_control(dict(msg, cfg=cfg), "live config change")
+    add_marker("cfg")
+
+
+def go_standby(_event=None) -> None:
+    generate_summary()
+    reset_session_state(tag='standby')
+    _set_control({'state': 'standby', 'cfg': _read_config_fields()}, "standby")
+    add_marker("standby")
+
+
+def _draw_control_status(ax, now: float) -> None:
+    """One line under the controls: desired fleet state and which rovers have applied it.
+    Caller holds lock."""
+    ax.axis('off')
+    msg = control['msg']
+    if control['bs_rejects']:
+        ax.text(0.0, 0.5, "BS FIRMWARE DOES NOT FORWARD CONTROL (unknown cmd 0x30) - "
+                          "close the visualizer, then: idf.py build && idf.py -p <BS port> flash",
+                transform=ax.transAxes, fontsize=9, va='center', color='white', fontweight='bold',
+                bbox=dict(facecolor='firebrick', edgecolor='none', pad=3))
+        return
+    if msg is None:
+        head = "Fleet control: nothing sent yet (rovers keep whatever they last heard)"
+    else:
+        state = msg.get('state', '?').upper()
+        exp = f" '{msg['exp']}'" if msg.get('exp') else ""
+        starts = ""
+        if msg.get('state') == 'active' and msg.get('start_at', 0) > now:
+            starts = f", starts in {msg['start_at'] - now:.0f}s"
+        head = (f"Fleet control v{control['version']}: {state}{exp}{starts} "
+                f"(set {_fmt_age(now - control['sent_at'])} ago, re-sent every {CONTROL_PERIOD_S:g}s)")
+    parts = []
+    for nid, st in sorted(rover_status.items()):
+        cv = int(st.get('cv', 0) or 0)
+        ok = msg is not None and cv >= control['version']
+        mark = "OK" if ok else ("waiting" if msg is not None else "")
+        parts.append(f"{nid}: {st.get('st', '?')} '{st.get('exp', '-')}' v{cv} {mark}".rstrip())
+    ax.text(0.0, 0.5, head + ("   |   " + "   ".join(parts) if parts else ""),
+            transform=ax.transAxes, fontsize=8, va='center', fontfamily='monospace',
+            color='navy' if msg is None or all('OK' in p for p in parts) else 'darkorange')
+
+
+def build_figure():
+    """Create the figure and all axes/widgets once; update_graph only redraws data axes
+    (clearing the whole figure every frame would destroy the control widgets)."""
+    from matplotlib.widgets import Button, TextBox
+    fig = plt.figure(figsize=(21, 11))
+    gs = fig.add_gridspec(3, 4, height_ratios=[3, 1.3, 0.42], width_ratios=[1, 1, 1, 0.03],
+                          hspace=0.34, wspace=0.22, left=0.03, right=0.96, top=0.92, bottom=0.03)
+    AX['graph'] = fig.add_subplot(gs[0, 0])
+    AX['log']   = fig.add_subplot(gs[0, 1])
+    AX['map']   = fig.add_subplot(gs[0, 2])
+    AX['cax']   = fig.add_subplot(gs[0, 3])
+    AX['tl']    = fig.add_subplot(gs[1, :3])
+    AX['tl2']   = AX['tl'].twinx()
+
+    ctrl = gs[2, :].subgridspec(2, 13, height_ratios=[1, 0.7], wspace=0.55, hspace=0.25)
+    tb = TextBox(fig.add_subplot(ctrl[0, 0:2]), 'exp ', initial='')
+    _textboxes['exp'] = tb
+    _widgets.append(tb)
+    for i, (key, label, default) in enumerate(CONTROL_FIELDS):
+        t = TextBox(fig.add_subplot(ctrl[0, 2 + i]), label + ' ', initial=default)
+        t.label.set_fontsize(8)
+        _textboxes[key] = t
+        _widgets.append(t)
+    for col, (label, cb, color) in enumerate((("Start", start_experiment, 'palegreen'),
+                                              ("Apply live", apply_live, 'lightyellow'),
+                                              ("Standby", go_standby, 'lightcoral'))):
+        b = Button(fig.add_subplot(ctrl[0, 10 + col]), label, color=color)
+        b.on_clicked(cb)
+        _widgets.append(b)
+    AX['ctrl_status'] = fig.add_subplot(ctrl[1, :])
+    fig.canvas.mpl_connect('key_press_event', _on_key)
+    return fig
+
+
+def _typing() -> bool:
+    return any(getattr(t, 'capturekeystrokes', False) for t in _textboxes.values())
+
+
 def update_graph(frame):
-    plt.clf()
+    for key in ('graph', 'log', 'map', 'cax', 'tl', 'tl2', 'ctrl_status'):
+        AX[key].clear()
     with lock:
         current_time = time.time()
 
@@ -1009,15 +1233,10 @@ def update_graph(frame):
             print(f"Node {n} timed out. Removing from visualizer.")
             G.remove_node(n)
 
-        fig = plt.gcf()
-        gs = fig.add_gridspec(2, 3, height_ratios=[3, 1.3], hspace=0.32, wspace=0.22,
-                              left=0.03, right=0.97, top=0.9, bottom=0.07)
-        ax_graph = fig.add_subplot(gs[0, 0])
-        ax_log   = fig.add_subplot(gs[0, 1])
-        ax_map   = fig.add_subplot(gs[0, 2])
-        ax_tl    = fig.add_subplot(gs[1, :])
+        ax_graph, ax_log, ax_map, ax_tl = AX['graph'], AX['log'], AX['map'], AX['tl']
         _draw_timeline(ax_tl, current_time)
         _draw_log_panel(ax_log, current_time)
+        _draw_control_status(AX['ctrl_status'], current_time)
 
         # radio map panel
         _NODE_COLORS = ['dodgerblue', 'tomato', 'limegreen', 'darkorchid']
@@ -1049,8 +1268,9 @@ def update_graph(frame):
                 label=f"Node {nid}",
             )
 
+        AX['cax'].set_visible(_rssi_sc is not None)
         if _rssi_sc is not None:
-            cb = plt.colorbar(_rssi_sc, ax=ax_map, fraction=0.046, pad=0.04)
+            cb = plt.gcf().colorbar(_rssi_sc, cax=AX['cax'])
             cb.set_label("RSSI (dBm)", fontsize=7)
             cb.ax.tick_params(labelsize=7)
             if len(sorted_map_nodes) > 1:
@@ -1168,8 +1388,7 @@ if __name__ == '__main__':
     thread = threading.Thread(target=serial_reader_thread, args=(args.port,), daemon=True)
     try:
         thread.start()
-        fig = plt.figure(figsize=(21, 10))
-        fig.canvas.mpl_connect('key_press_event', _on_key)
+        fig = build_figure()
         print("[VISUALIZER] keys: m=marker  s=save summary  r=save+reset  h=help")
         ani = animation.FuncAnimation(fig, update_graph, interval=500, cache_frame_data=False)
         plt.show()

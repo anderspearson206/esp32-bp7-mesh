@@ -68,6 +68,14 @@ PKT_TYPE_BEACON   = 0x01
 PKT_TYPE_BUNDLE   = 0x02
 PKT_TYPE_ACKMAP   = 0x04
 PKT_TYPE_LOCATION = 0x05
+PKT_TYPE_CONTROL  = 0x06   # fleet control from the BS laptop: [type][origin u16][version u32][json]
+
+CONTROL_HDR_FMT    = '<BHI'
+CONTROL_HDR_SIZE   = struct.calcsize(CONTROL_HDR_FMT)   # 7
+CONTROL_REPEAT_S   = 5.0    # rovers re-broadcast their current control so out-of-range rovers get it
+# config keys the BS may set at runtime (same names as the CLI options)
+CONFIG_KEYS = ('interval', 'bw_limit', 'bw_burst', 'bw_order', 'bw_count_telemetry',
+               'comms_on', 'comms_off', 'comms_phase', 'payload_bytes', 'retransmit_s')
 
 # dtn_bundle_t layout (packed, little-endian, matches ESP32 C struct)
 # Fields: creation_time, sequence_number, lifetime, source_node, dest_node,
@@ -122,13 +130,35 @@ class EventLog:
 
     def __init__(self, path: Optional[str]):
         self.path = path
+        self.exp_path: Optional[str] = None
         self.node_id: Optional[int] = None
         self._lock = threading.Lock()
         self._t0 = time.monotonic()
         self._f = None
+        self._exp_f = None
         if path:
             os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
             self._f = open(path, 'a', buffering=1)
+
+    def start_experiment(self, exp_id: str) -> Optional[str]:
+        """Mirror every event into a per-experiment file as well (the daemon-lifetime log
+        keeps everything). Returns the experiment log path."""
+        self.end_experiment()
+        if not self.path:
+            return None
+        d = os.path.dirname(self.path) or '.'
+        path = os.path.join(d, f"exp_{exp_id}_{self.node_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl")
+        with self._lock:
+            self._exp_f = open(path, 'a', buffering=1)
+            self.exp_path = path
+        return path
+
+    def end_experiment(self) -> None:
+        with self._lock:
+            if self._exp_f is not None:
+                self._exp_f.close()
+            self._exp_f = None
+            self.exp_path = None
 
     def log(self, ev: str, **fields) -> None:
         if self._f is None:
@@ -141,10 +171,13 @@ class EventLog:
         with self._lock:
             try:
                 self._f.write(line + '\n')
+                if self._exp_f is not None:
+                    self._exp_f.write(line + '\n')
             except (OSError, ValueError):
                 pass
 
     def close(self) -> None:
+        self.end_experiment()
         with self._lock:
             if self._f is not None:
                 self._f.close()
@@ -219,6 +252,23 @@ class CommsPolicy:
                 'bw_count_telemetry': self.count_telemetry,
                 'comms_on_s': self.on_s, 'comms_off_s': self.off_s,
                 'comms_phase_s': self.phase_s, 'periodic': self.periodic}
+
+
+def pack_control(version: int, msg: dict, origin: int = BASE_STATION_NODE_ID) -> bytes:
+    return (struct.pack(CONTROL_HDR_FMT, PKT_TYPE_CONTROL, origin, version & 0xFFFFFFFF)
+            + json.dumps(msg, separators=(',', ':')).encode())
+
+
+def unpack_control(rest: bytes) -> Optional[Tuple[int, int, dict]]:
+    """Returns (origin, version, msg) or None if malformed."""
+    if len(rest) <= CONTROL_HDR_SIZE:
+        return None
+    _t, origin, version = struct.unpack_from(CONTROL_HDR_FMT, rest)
+    try:
+        msg = json.loads(rest[CONTROL_HDR_SIZE:].decode())
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return (origin, version, msg) if isinstance(msg, dict) else None
 
 
 def _percentile(vals: List[float], p: float) -> Optional[float]:
@@ -523,6 +573,16 @@ class RoverDaemon:
         self._last_active: Set[int] = set()
         self._last_throttle_log = 0.0
         self._wall_start = time.time()
+
+        # fleet control / experiment state
+        self._mode = 'standby'                     # 'standby' | 'active'
+        self._exp_id = ''
+        self._exp_start = time.time()
+        self._ctrl_version = 0
+        self._ctrl_raw: Optional[bytes] = None     # last adopted control packet, re-broadcast
+        self._pending_start: Optional[dict] = None # {'exp', 'start_at', 'cfg'}
+        self._base_cfg = {k: self._run_config.get(k) for k in CONFIG_KEYS
+                          if self._run_config.get(k) is not None}
 
         self._store: List[dict] = []        # each: dtn fields + added_at_ms, forwarded, forwarded_ms
         self._lock = threading.Lock()
@@ -846,6 +906,8 @@ class RoverDaemon:
                 continue
             if not self._protocol.should_forward(b, active, self._node_id, self._peers):
                 continue
+            if self._mode != 'active' and not b.get('is_telemetry'):
+                continue                          # standby: hold data, only telemetry flows
             if self._policy.counts(b) and not self._policy.try_take():
                 throttled += 1
                 continue
@@ -987,7 +1049,7 @@ class RoverDaemon:
         if self._node_id is None or not self._radio_on:
             return
         c = self._store_counts()
-        _on, left, cycle = self._policy.window()
+        _on, left, cycle = self._window()
         fields = {
             'q':    c['q_own_data'], 'qf': c['q_ferried_data'], 'qt': c['q_telemetry'],
             'gen':  self._counters['gen_data'],
@@ -998,6 +1060,10 @@ class RoverDaemon:
             'on':   self._policy.on_s, 'off': self._policy.off_s,
             'win':  round(left, 1) if left is not None else -1, 'cyc': cycle,
             'up':   int(time.time() - self._wall_start),
+            'st':   'pending' if self._pending_start else self._mode,
+            'cv':   self._ctrl_version,
+            'exp':  (self._pending_start or {}).get('exp') or
+                    (self._exp_id if self._mode == 'active' else '') or '-',
         }
         self._queue_telemetry(f"@ROVER_STATUS:{self._node_id}:"
                               + ','.join(f"{k}={v}" for k, v in fields.items()))
@@ -1074,6 +1140,8 @@ class RoverDaemon:
                 self._on_ackmap(rest)
             elif ptype == PKT_TYPE_LOCATION:
                 self._on_location(rest)
+            elif ptype == PKT_TYPE_CONTROL:
+                self._on_control(rest, rssi)
             else:
                 self._counters['rx_unknown'] += 1
                 self._log.log('rx_unknown', ptype=ptype, rssi=rssi, bytes=len(rest))
@@ -1141,10 +1209,148 @@ class RoverDaemon:
             time.sleep(1)
         raise RuntimeError("Could not auto-detect node_id from ESP32. Use --node-id to override.")
 
+    # fleet control / experiments
+    def start_on_connect(self, exp_id: str) -> None:
+        """--mode active: run an experiment with the CLI settings as soon as we're connected."""
+        self._pending_start = {'exp': exp_id, 'start_at': 0, 'cfg': {}}
+
+    def _window(self) -> Tuple[bool, Optional[float], int]:
+        """Comms restrictions only apply while an experiment is running; in standby the
+        radio stays on so the rover can always hear control from the BS."""
+        if self._mode != 'active':
+            return True, None, 0
+        return self._policy.window()
+
+    def _apply_config(self, cfg: dict) -> dict:
+        """Apply runtime settings (CONFIG_KEYS). Returns the values actually applied."""
+        applied = {}
+        for k in CONFIG_KEYS:
+            if k not in cfg or cfg[k] is None:
+                continue
+            v = cfg[k]
+            try:
+                if k == 'bw_order':
+                    v = 'newest' if str(v) == 'newest' else 'oldest'
+                elif k == 'bw_count_telemetry':
+                    v = bool(v)
+                elif k == 'payload_bytes':
+                    v = max(0, min(int(v), 1024))
+                else:
+                    v = max(0.0, float(v)) if k != 'comms_phase' else float(v)
+            except (TypeError, ValueError):
+                self._log.log('config_bad_value', key=k, value=cfg[k])
+                continue
+            applied[k] = v
+        p = self._policy
+        self._interval      = applied.get('interval', self._interval)
+        self._bw_order      = applied.get('bw_order', self._bw_order)
+        self._payload_bytes = applied.get('payload_bytes', self._payload_bytes)
+        if 'retransmit_s' in applied:
+            self._retransmit_ms = int(applied['retransmit_s'] * 1000)
+        self._policy = CommsPolicy(
+            bw_limit=applied.get('bw_limit', p.bw_limit),
+            bw_burst=applied.get('bw_burst', p.bw_burst),
+            count_telemetry=applied.get('bw_count_telemetry', p.count_telemetry),
+            on_s=applied.get('comms_on', p.on_s),
+            off_s=applied.get('comms_off', p.off_s),
+            phase_s=applied.get('comms_phase', p.phase_s))
+        self._forward_interval_s = (min(FORWARD_INTERVAL_S, 1.0 / self._policy.bw_limit)
+                                    if self._policy.bw_limit > 0 else FORWARD_INTERVAL_S)
+        self._log.log('config_applied', applied=applied, policy=self._policy.describe(),
+                      interval=self._interval, bw_order=self._bw_order,
+                      payload_bytes=self._payload_bytes, retransmit_ms=self._retransmit_ms)
+        return applied
+
+    def _current_config(self) -> dict:
+        d = self._policy.describe()
+        return {'interval': self._interval, 'bw_limit': d['bw_limit'], 'bw_burst': d['bw_burst'],
+                'bw_order': self._bw_order, 'bw_count_telemetry': d['bw_count_telemetry'],
+                'comms_on': d['comms_on_s'], 'comms_off': d['comms_off_s'],
+                'comms_phase': d['comms_phase_s'], 'payload_bytes': self._payload_bytes,
+                'retransmit_s': self._retransmit_ms / 1000.0}
+
+    def _end_experiment(self, reason: str) -> None:
+        if self._mode != 'active':
+            return
+        print(f"[EXP] experiment '{self._exp_id}' ended ({reason})")
+        self._log.log('experiment_stop', exp=self._exp_id, reason=reason)
+        self.write_summary()
+        self._log.end_experiment()
+        self._mode = 'standby'
+
+    def _start_experiment(self, exp_id: str, cfg: dict) -> None:
+        self._end_experiment('superseded')
+        prev_counters = dict(self._counters)
+        # fresh slate: drop queued data so the new run only measures its own bundles.
+        # sequence numbers keep counting (the BS ack window per source must stay valid).
+        with self._lock:
+            dropped = [b for b in self._store if not b.get('is_telemetry')]
+            self._store = [b for b in self._store if b.get('is_telemetry')]
+        for b in dropped:
+            self._protocol.on_bundle_removed(b)
+        self._apply_config(dict(self._base_cfg, **cfg))
+        self._counters = defaultdict(int)
+        self._ack_latencies_ms = []
+        self._exp_id = exp_id
+        self._exp_start = time.time()
+        self._mode = 'active'
+        self._radio_on = None                    # re-evaluate the window from scratch
+        exp_log = self._log.start_experiment(exp_id)
+        self._log.log('experiment_start', exp=exp_id, config=self._current_config(),
+                      dropped_data=len(dropped), prev_counters=prev_counters,
+                      ctrl_version=self._ctrl_version, exp_log=exp_log)
+        print(f"[EXP] experiment '{exp_id}' started: {self._current_config()}"
+              + (f" (log {exp_log})" if exp_log else ""))
+        self._update_comms_window()
+
+    def _on_control(self, rest: bytes, rssi: int) -> None:
+        parsed = unpack_control(rest)
+        if parsed is None:
+            self._log.log('rx_control_bad', bytes=len(rest))
+            return
+        origin, version, msg = parsed
+        self._counters['rx_control'] += 1
+        if version <= self._ctrl_version:
+            return                                # already have this one (or newer)
+        self._log.log('rx_control', origin=origin, version=version, rssi=rssi, msg=msg)
+        self._ctrl_version = version
+        self._ctrl_raw = rest
+        self._air_tx(rest, 'control', version=version)   # relay once immediately (multi-hop)
+
+        cfg = dict(msg.get('cfg') or {})
+        cfg.update((msg.get('over') or {}).get(str(self._node_id), {}))   # per-rover overrides
+        state = msg.get('state', 'standby')
+        exp = ''.join(ch for ch in str(msg.get('exp', '')) if ch.isalnum() or ch in '-_')[:40]
+        print(f"[CTRL] v{version}: state={state} exp={exp or '-'} cfg={cfg}")
+
+        if state == 'standby':
+            self._pending_start = None
+            self._end_experiment('standby command')
+            self._apply_config(dict(self._base_cfg, **cfg))
+            self._log.log('standby', ctrl_version=version)
+        elif state == 'active':
+            if self._mode == 'active' and exp == self._exp_id:
+                self._apply_config(cfg)           # live change within the running experiment
+                self._log.log('config_live_change', exp=exp, ctrl_version=version)
+            else:
+                start_at = float(msg.get('start_at') or 0)
+                self._pending_start = {'exp': exp or f"exp{version}", 'start_at': start_at, 'cfg': cfg}
+                wait = start_at - time.time()
+                self._log.log('experiment_scheduled', exp=exp, start_at=start_at,
+                              wait_s=round(wait, 2), late_join=wait < 0)
+                if wait > 0:
+                    print(f"[EXP] '{exp}' starts in {wait:.1f}s")
+
+    def _check_pending_start(self) -> None:
+        p = self._pending_start
+        if p is not None and time.time() >= p['start_at']:
+            self._pending_start = None
+            self._start_experiment(p['exp'], p['cfg'])
+
     # comms window / state logging
     def _update_comms_window(self) -> bool:
         """Apply the periodic on/off schedule. Returns True on an off->on transition."""
-        on, left, cycle = self._policy.window()
+        on, left, cycle = self._window()
         if on == self._radio_on:
             return False
         first = self._radio_on is None
@@ -1182,24 +1388,27 @@ class RoverDaemon:
 
     def _log_state(self) -> None:
         now = int(time.monotonic() * 1000)
-        _on, left, cycle = self._policy.window()
+        _on, left, cycle = self._window()
         peers = {str(pid): {'rssi': p['rssi'], 'age_ms': now - p['last_seen']}
                  for pid, p in self._peers.items()
                  if (now - p['last_seen']) < PEER_TIMEOUT_S * 1000}
-        self._log.log('state', radio_on=self._radio_on, window_left_s=left, cycle=cycle,
+        self._log.log('state', mode=self._mode, exp=self._exp_id, ctrl_version=self._ctrl_version,
+                      radio_on=self._radio_on, window_left_s=left, cycle=cycle,
                       tokens=self._policy.tokens(), peers=peers,
                       loc=dict(self._own_location), counters=dict(self._counters),
                       **self._store_counts())
 
     def _print_status(self) -> None:
         c = self._store_counts()
-        _on, left, _cycle = self._policy.window()
+        _on, left, _cycle = self._window()
         radio = 'ON ' if self._radio_on else 'OFF'
         win = f" {left:4.0f}s left" if left is not None else ""
         peers = ' '.join(f"{pid}({p['rssi']})" for pid, p in self._peers.items()
                          if pid in self._last_active) or '-'
         tok = self._policy.tokens()
-        print(f"[STATUS] radio {radio}{win} | queue own:{c['q_own_data']} ferried:{c['q_ferried_data']} "
+        mode = (f"ACTIVE '{self._exp_id}'" if self._mode == 'active'
+                else ('PENDING' if self._pending_start else 'STANDBY'))
+        print(f"[STATUS] {mode} v{self._ctrl_version} | radio {radio}{win} | queue own:{c['q_own_data']} ferried:{c['q_ferried_data']} "
               f"tel:{c['q_telemetry']} | gen:{self._counters['gen_data']} "
               f"tx:{self._counters['tx_bundle_data']} retx:{self._counters['retx_bundle_data']} "
               f"acked:{self._counters['acked_own_data']}"
@@ -1208,12 +1417,17 @@ class RoverDaemon:
 
     def write_summary(self) -> dict:
         lats = self._ack_latencies_ms
+        in_exp = self._mode == 'active'
+        since = self._exp_start if in_exp else self._wall_start
         summary = {
             'node_id':   self._node_id,
-            'started':   datetime.fromtimestamp(self._wall_start).isoformat(timespec='seconds'),
+            'experiment': self._exp_id if in_exp else None,
+            'ctrl_version': self._ctrl_version,
+            'started':   datetime.fromtimestamp(since).isoformat(timespec='seconds'),
             'ended':     datetime.now().isoformat(timespec='seconds'),
-            'duration_s': round(time.time() - self._wall_start, 1),
-            'config':    self._run_config,
+            'duration_s': round(time.time() - since, 1),
+            'config':    self._current_config(),
+            'launch_args': self._run_config,
             'counters':  dict(self._counters),
             'store_at_exit': self._store_counts(),
             'own_data_ack_latency_ms': {
@@ -1227,8 +1441,9 @@ class RoverDaemon:
         summary['own_data_delivery_ratio'] = (round(self._counters['acked_own_data'] / gen, 4)
                                               if gen else None)
         self._log.log('summary', **summary)
-        if self._log.path:
-            path = os.path.splitext(self._log.path)[0] + '_summary.json'
+        base = self._log.exp_path if in_exp else self._log.path
+        if base:
+            path = os.path.splitext(base)[0] + '_summary.json'
             try:
                 with open(path, 'w') as f:
                     json.dump(summary, f, indent=2, default=str)
@@ -1248,8 +1463,10 @@ class RoverDaemon:
         last_rover_status    = 0.0
         last_state_log       = 0.0
         last_console_status  = time.monotonic()
+        last_ctrl_relay      = time.monotonic()
 
         while True:
+            self._check_pending_start()
             if self._update_comms_window():
                 last_beacon = 0.0    # announce ourselves immediately when the window opens
                 last_forward = 0.0
@@ -1292,7 +1509,11 @@ class RoverDaemon:
             if (mono - last_forward) >= self._forward_interval_s:
                 last_forward = mono
                 self._forward()
-            if self._interval > 0 and (mono - last_gen) >= self._interval:
+            if (self._ctrl_raw is not None and self._radio_on
+                    and (mono - last_ctrl_relay) >= CONTROL_REPEAT_S):
+                last_ctrl_relay = mono
+                self._air_tx(self._ctrl_raw, 'control', version=self._ctrl_version)
+            if self._mode == 'active' and self._interval > 0 and (mono - last_gen) >= self._interval:
                 last_gen = mono
                 self._generate_bundle()
             if (mono - last_status) >= STATUS_INTERVAL_S:
@@ -1482,6 +1703,7 @@ class RoverDaemon:
             print('\n[INIT] Shutting down.')
         finally:
             self._close_serial()
+            self._end_experiment('daemon shutdown')
             self.write_summary()
             self._log.log('daemon_stop')
             self._log.close()
@@ -1529,6 +1751,10 @@ def main():
     pc.add_argument('--comms-phase', type=float, default=0.0,
                     help="Shift this rover's schedule by N seconds (windows are aligned to wall clock)")
 
+    parser.add_argument('--mode', choices=['standby', 'active'], default='standby',
+                        help='standby: wait for the BS to start an experiment (no data bundles). '
+                             'active: start an experiment immediately with the CLI settings')
+
     lg = parser.add_argument_group('logging')
     lg.add_argument('--log-dir', default='rover_logs', help='Directory for the JSON-lines event log')
     lg.add_argument('--run-tag', default='', help='Label added to the log filename, e.g. bw1_route3')
@@ -1572,7 +1798,7 @@ def main():
 
     signal.signal(signal.SIGTERM, _sigterm)
 
-    RoverDaemon(
+    daemon = RoverDaemon(
         serial_port=args.serial,
         baud=args.baud,
         gen_interval=args.interval,
@@ -1590,7 +1816,10 @@ def main():
         status_interval_s=args.status_interval,
         state_interval_s=args.state_interval,
         run_config=dict(vars(args), **policy.describe()),
-    ).run()
+    )
+    if args.mode == 'active':
+        daemon.start_on_connect(args.run_tag or 'cli')
+    daemon.run()
 
 
 if __name__ == '__main__':
