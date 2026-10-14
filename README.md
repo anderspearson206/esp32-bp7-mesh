@@ -254,7 +254,7 @@ With `--site <name>` the Map tab loads the terrain grid from `terrain/` (`./terr
 Alignment test (remote control driving):
 
 1. Put the rover on a spot you can find on the map, pointing along something with a clear direction. Mark the spot.
-2. On the rover: `python3 radio_daemon.py --serial /dev/ttyUSB0 --ros-location-topic /car/t265/odom/sample`. Standby is fine, because location is still sent.
+2. On the rover: `python3 radio_daemon.py --serial /dev/ttyUSB0 --ros-location-topic /camera/odom/sample` (the T265, started by the ROS stack; on `goose` this already runs as `radio_daemon.service`). Standby is fine, because location is still sent.
 3. On the BS laptop: `python bs_dashboard.py --port COM5 --site fountain` (it opens on the Map tab).
 4. Choose the rover and press **Place on map…**. Then press on the rover's spot and drag the way it faces. A plain click sets only the position.
 5. Drive with the remote. The track should follow the blue drivable paths. Use the arrows to nudge the position and ↺ ↻ to rotate about the placed point (x). Press **Clear trail** to restart the statistics.
@@ -275,7 +275,7 @@ Generate maps by hand (same cache):
 
 #### Fixing odometry drift afterwards (`fix_track.py`)
 
-Wheel odometry drifts in heading on tight turns, reversing and wheel spin. When every run starts and ends parked at the BS, `fix_track.py` corrects a session's `coverage.csv` and writes `coverage_fixed[_pf].csv` plus plots next to it:
+Odometry drifts: wheel odometry (used for runs before 2026-10-14) badly in heading on tight turns, reversing and wheel spin, and the T265 much less. When every run starts and ends parked at the BS, `fix_track.py` corrects a session's `coverage.csv` and writes `coverage_fixed[_pf].csv` plus plots next to it:
 
 ```bash
 python fix_track.py bs_reports/<session> --site fountain                       # turn model: closes each out-and-back leg at its turnaround

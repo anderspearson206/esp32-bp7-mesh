@@ -18,7 +18,7 @@ Usage:
     --interval Seconds between generated sensor bundles (default: 1, 0 = disable)
     --node-id  Override node ID (default: auto-detected from ESP32 STATUS_RESP on startup)
 
-    python3 radio_daemon.py --serial /dev/ttyUSB0 --ros-location-topic /car/t265/odom/sample
+    python3 radio_daemon.py --serial /dev/ttyUSB0 --ros-location-topic /camera/odom/sample
 
     python3 radio_daemon.py ... --ros-control    # let the BS dashboard start/stop the ROS stack
 
@@ -125,7 +125,10 @@ BW_THROTTLE_LOG_S          = 1.0    # min spacing between bw_throttled log lines
 # ROS stack control (--ros-control). teleop.launch only: car_startup.launch (what the
 # controller's OPTIONS button runs) also includes astar_planner, which drives the goals
 # mission on its own - never start that remotely without a human able to override.
-ROS_STACK_CMD     = ['roslaunch', 'mushr_base', 'teleop.launch']
+# use_t265:=true matches car_startup.launch (teleop.launch defaults it to false), so a
+# radio start also brings up the T265 driver for --ros-location-topic.
+ROS_STACK_CMD     = ['roslaunch', 'mushr_base', 'teleop.launch', 'use_t265:=true']
+ROS_LOC_STALE_S   = 10.0   # restart `rostopic echo` after this long with no location message
 ROS_STOP_GRACE_S  = 20.0   # SIGTERM a stack that hasn't exited this long after SIGINT
 ROS_CHECK_S       = 1.0    # how often to re-scan for running stacks
 
@@ -1880,10 +1883,25 @@ class RoverDaemon:
             while True:
                 try:
                     proc = subprocess.Popen(
-                        ['rostopic', 'echo', topic],
+                        ['rostopic', 'echo', '--noarr', topic],
                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                         universal_newlines=True,
                     )
+                    # A Stop/Start ROS restarts roscore, and rostopic echo stays attached
+                    # to the dead master forever without exiting: kill it once it has been
+                    # silent for ROS_LOC_STALE_S so the loop below starts a fresh one.
+                    last_msg = [time.monotonic()]
+
+                    def _watchdog(p=proc, last=last_msg) -> None:
+                        while p.poll() is None:
+                            time.sleep(1.0)
+                            if time.monotonic() - last[0] > ROS_LOC_STALE_S:
+                                print(f"[LOC] no {topic} messages for {ROS_LOC_STALE_S:.0f}s; "
+                                      "restarting rostopic echo")
+                                p.kill()
+                                return
+
+                    threading.Thread(target=_watchdog, daemon=True, name='ros-loc-wd').start()
                     # nav_msgs/Odometry YAML: track the key path by indentation and keep
                     # pose/pose/position/{x,y,z} and pose/pose/orientation/{x,y,z,w};
                     # '---' ends each message.
@@ -1891,7 +1909,8 @@ class RoverDaemon:
                     vals: dict = {}
                     for line in proc.stdout:
                         if line.rstrip() == '---':
-                            pos = [vals.get(('position', k)) for k in 'xyz']
+                            last_msg[0] = time.monotonic()
+                            pos =[vals.get(('position', k)) for k in 'xyz']
                             ori = [vals.get(('orientation', k)) for k in 'xyzw']
                             if None not in pos:
                                 yaw = _yaw_deg(*ori) if None not in ori else None
@@ -2013,7 +2032,7 @@ def main():
                              '(the dashboard can change it)')
     parser.add_argument('--ros-location-topic', default=None, metavar='TOPIC',
                         help='ROS 1 nav_msgs/Odometry topic for live position '
-                             '(e.g. /car/t265/odom/sample); overrides --lat/--lon/--alt')
+                             '(e.g. /camera/odom/sample for the T265); overrides --lat/--lon/--alt')
     parser.add_argument('--ros-control', action='store_true',
                         help='Let the BS start/stop the ROS stack (' + ' '.join(ROS_STACK_CMD) + '). '
                              'Linux only; needs the ROS environment sourced')

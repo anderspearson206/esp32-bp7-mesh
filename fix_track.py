@@ -100,10 +100,23 @@ def find_legs(x, y, min_leg):
     return legs
 
 
-def find_turnaround(x, y, yaw, a, b, w=4):
-    """End of the sharpest heading change in the middle half of the leg (by distance).
-    Not simply the farthest point: with bad drift the logged end can be farther out."""
-    s = np.r_[0.0, np.cumsum(np.hypot(np.diff(x[a:b + 1]), np.diff(y[a:b + 1])))]
+def find_turnaround(x, y, yaw, a, b, w=4, spike_factor=2.5):
+    """Where the heading error goes in: the end of a wheel-spin stretch (odometry steps far
+    above the leg's typical step) in the middle of the leg if there is one, else the end of
+    the sharpest heading change in the middle half (by distance). Not simply the farthest
+    point: with bad drift the logged end can be farther out."""
+    step = np.hypot(np.diff(x[a:b + 1]), np.diff(y[a:b + 1]))
+    s = np.r_[0.0, np.cumsum(step)]
+    moving = step[step > STOP_STEP_M]
+    if len(moving) >= 5:
+        typ = float(np.median(moving))
+        spikes = np.where((step > spike_factor * typ) & (s[1:] > 0.2 * s[-1]) & (s[1:] < 0.8 * s[-1]))[0]
+        if len(spikes):
+            # the spike cluster nearest the middle of the leg; turnaround = just after it
+            gaps = np.split(spikes, np.where(np.diff(spikes) > 3)[0] + 1)
+            mid_i = int(np.searchsorted(s, s[-1] / 2))
+            cl = min(gaps, key=lambda g: abs((g[0] + g[-1]) / 2 - mid_i))
+            return min(a + int(cl[-1]) + 2, b - 1)
     mid = np.where((s > 0.25 * s[-1]) & (s < 0.75 * s[-1]))[0] + a
     if np.isnan(yaw[a:b + 1]).any() or len(mid) == 0:
         return a + int(np.searchsorted(s, s[-1] / 2))
@@ -113,20 +126,36 @@ def find_turnaround(x, y, yaw, a, b, w=4):
     return int(hi[i])
 
 
-def fit_turn(x, y, yaw, a, b):
-    """Out-and-back: keep the way out, turn + stretch the way back about the turnaround
-    so it ends where it started. Returns per-increment rotation [rad] and scale."""
+def fit_turn(x, y, yaw, a, b, k_max_deg=8.0):
+    """Out-and-back: keep the way out; the way back is turned by delta at the turnaround,
+    bent by a steady k deg/m (a heading bias that kept running after a bad turnaround) and
+    stretched by scale so it ends exactly where it started. k is kept as small as gives a
+    sensible stretch (k = 0 when a plain turn closes it with a stretch near 1).
+    Returns per-increment rotation [rad] and scale."""
     d = np.hypot(x[a:b + 1] - x[a], y[a:b + 1] - y[a])
     m = find_turnaround(x, y, yaw, a, b)
     want = np.array([x[a] - x[m], y[a] - y[m]])           # turnaround -> start
-    got = np.array([x[b] - x[m], y[b] - y[m]])            # turnaround -> logged end
-    delta = wrap(math.atan2(want[1], want[0]) - math.atan2(got[1], got[0]))
-    scale = float(np.hypot(*want) / max(np.hypot(*got), 1e-6))
-    nseg = b - a
-    rot = np.where(np.arange(a + 1, b + 1) > m, delta, 0.0)
-    sc = np.where(np.arange(a + 1, b + 1) > m, scale, 1.0)
-    return dict(rot=rot, scale=sc, turn_idx=m, delta=delta, scale_back=scale,
-                out_m=float(d[m - a]), end_rot=delta if nseg else 0.0, leftover=0.0)
+    bdx, bdy = np.diff(x[m:b + 1]), np.diff(y[m:b + 1])    # way back increments
+    sb = np.cumsum(np.hypot(bdx, bdy))
+    ks = np.radians(np.linspace(-k_max_deg, k_max_deg, 641))
+    th = ks[:, None] * sb
+    gx = np.sum(np.cos(th) * bdx - np.sin(th) * bdy, axis=1)
+    gy = np.sum(np.sin(th) * bdx + np.cos(th) * bdy, axis=1)
+    stretch = np.hypot(*want) / np.maximum(np.hypot(gx, gy), 1e-6)
+    # no bend while a plain turn needs < 25 % stretch; beyond that the smallest bend that gets there
+    cost = 10 * np.maximum(0.0, np.abs(np.log(stretch)) - math.log(1.25)) + 0.03 * np.abs(np.degrees(ks))
+    i = int(np.argmin(cost))
+    k = float(ks[i])
+    delta = wrap(math.atan2(want[1], want[0]) - math.atan2(gy[i], gx[i]))
+    scale = float(stretch[i])
+    idx = np.arange(a + 1, b + 1)
+    back = idx > m
+    s_back = np.zeros(len(idx))
+    s_back[back] = sb
+    rot = np.where(back, delta + k * s_back, 0.0)
+    sc = np.where(back, scale, 1.0)
+    return dict(rot=rot, scale=sc, turn_idx=m, delta=delta, scale_back=scale, k_back=k,
+                out_m=float(d[m - a]), end_rot=float(rot[-1]) if len(rot) else 0.0, leftover=0.0)
 
 
 def fit_bend(x, y, a, b, k_max_deg):
@@ -266,7 +295,8 @@ def run_pf(site, x, y, yaw, legs, home, theta0, P=PF, guides=None):
                 dg = dist_to_polyline(px, py, guides[i])
                 w = w * (0.01 + np.exp(-(dg / P['follow_sigma']) ** 2))
         else:                                             # parked at / shuffling near the BS
-            w = w * np.exp(-((px - home[0]) ** 2 + (py - home[1]) ** 2) / (2 * P['home_sigma'] ** 2))
+            lw = -((px - home[0]) ** 2 + (py - home[1]) ** 2) / (2 * P['home_sigma'] ** 2)
+            w = w * np.exp(lw - lw.max())                 # relative, so far-off clouds still get pulled
         tot = w.sum()
         w = w / tot if tot > 0 and np.isfinite(tot) else np.full(N, 1.0 / N)
         ess[i] = 1.0 / np.sum(w ** 2)
@@ -300,6 +330,26 @@ def place_leg(x, y, a, b, fit, theta0, home):
     return px, py
 
 
+def place_bs(site, x, y):
+    """Move the site's BS to (x, y) for the predictions; generate missing maps (rm_generate.py,
+    lunar-mesh-env venv) and wait for them."""
+    import subprocess
+    import rm_generate
+    missing = site.set_bs(x, y)[2]
+    if missing:
+        py = rm_generate.env_python(rm_generate.DEFAULT_ENV)
+        if not py:
+            print(f"no maps for the BS at ({x:+.1f}, {y:+.1f}) and no lunar-mesh-env venv; predictions blank")
+        else:
+            print(f"generating radio maps for the BS at ({site.tx_xy[0]:+.1f}, {site.tx_xy[1]:+.1f}) (~30 s)...")
+            subprocess.run([py, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rm_generate.py'),
+                            '--site', site.name, '--terrain-dir', site.dir, '--bs', f"{x},{y}"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            missing = site.reload_bs_maps()
+    print(f"BS for the predictions at ({site.tx_xy[0]:+.1f}, {site.tx_xy[1]:+.1f})"
+          + (f"; still missing {', '.join(missing)}" if missing else ""))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('session', help='session folder or its coverage.csv')
@@ -307,6 +357,10 @@ def main():
     ap.add_argument('--terrain-dir')
     ap.add_argument('--node')
     ap.add_argument('--model', choices=['turn', 'bend', 'pf'], default='turn')
+    ap.add_argument('--bs', help='x,y: BS position for the predictions (overrides bs_position.json); '
+                                 'maps for a new spot are generated with rm_generate.py')
+    ap.add_argument('--bs-at-start', action='store_true',
+                    help='put the BS where the rover started (home) for the predictions')
     ap.add_argument('--home', help='map x,y where the rover parks at the BS '
                                    '(default: first sample under the logged alignment)')
     ap.add_argument('--heading', type=float,
@@ -346,6 +400,9 @@ def main():
     x, y, yaw = num(rows, 'lat'), num(rows, 'lon'), num(rows, 'yaw_deg')
     raw_mx, raw_my, raw_mh = num(rows, 'map_x'), num(rows, 'map_y'), num(rows, 'map_heading_deg')
     home = tuple(float(v) for v in args.home.split(',')) if args.home else (raw_mx[0], raw_my[0])
+    if args.bs or args.bs_at_start:
+        bx, by = home if args.bs_at_start else (float(v) for v in args.bs.split(','))
+        place_bs(site, bx, by)
     # odometry -> map rotation at the start (what the logged alignment used)
     if args.heading is not None:
         theta = math.radians(args.heading - (yaw[0] if not np.isnan(yaw[0]) else 0.0))
@@ -409,7 +466,9 @@ def main():
                 f"odometry ended {raw_close:.1f} m from where it started | ")
         if args.model == 'turn':
             line += (f"turnaround {fit['out_m']:.0f} m out at {rows[fit['turn_idx']]['timestamp'][11:19]}: "
-                     f"way back turned {math.degrees(fit['delta']):+.0f} deg, stretched x{fit['scale_back']:.2f}")
+                     f"way back turned {math.degrees(fit['delta']):+.0f} deg"
+                     + (f", bent {math.degrees(fit['k_back']):+.2f} deg/m" if fit['k_back'] else "")
+                     + f", stretched x{fit['scale_back']:.2f}")
         else:
             line += (f"bend {math.degrees(fit['k']):+.3f} deg/m ({math.degrees(fit['end_rot']):+.0f} deg), "
                      f"leftover {fit['leftover']:.1f} m spread")
@@ -480,6 +539,7 @@ def main():
                     print(f"leg {li} vs {ref[2]}: mean {dd.mean():.1f} m, max {dd.max():.1f} m apart")
     if not args.no_plot:
         plot(site, out_dir, rows, raw_mx, raw_my, fx, fy, rs, preds, leg_id, home, node, args.model, suffix)
+        plot_rm(site, out_dir, rows, raw_mx, raw_my, fx, fy, rs, leg_id, node, args.model, suffix)
         if args.model != 'pf':
             plot_candidates(site, out_dir, x, y, info, home)
         elif ref is not None:
@@ -559,6 +619,111 @@ def plot(site, out_dir, rows, raw_mx, raw_my, fx, fy, rs, preds, leg_id, home, n
     fig.tight_layout()
     out = os.path.join(out_dir, f'fix_track{suffix}.png')
     save_fig(fig, out, 80)
+
+
+def plot_rm(site, out_dir, rows, raw_mx, raw_my, fx, fy, rs, leg_id, node, model, suffix=''):
+    """The predicted radio maps against the drive: each map with the fixed track on it (same
+    colour scale, so a point that blends in agrees), measured - predicted along the track,
+    a profile over distance driven (raw vs fixed track), and measured vs predicted."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+
+    maps = {m: a for m, a in site.radio_maps.items() if a is not None}
+    if not maps:
+        return
+    h = site.half
+    ext = [-h, h, -h, h]
+    drive = leg_id > 0
+    span = max(np.nanmax(fx) - np.nanmin(fx), np.nanmax(fy) - np.nanmin(fy)) / 2 + 25
+    cx, cy = (np.nanmin(fx) + np.nanmax(fx)) / 2, (np.nanmin(fy) + np.nanmax(fy)) / 2
+    vmin, vmax = -95, -25
+    names = list(maps)
+    main = 'nn_pmnet' if 'nn_pmnet' in maps else names[0]
+    pred = {m: site.sample(a, fx, fy) for m, a in maps.items()}
+    pred_raw = {m: site.sample(a, raw_mx, raw_my) for m, a in maps.items()}
+    ok = ~np.isnan(rs) & ~np.isnan(pred[main])
+    bias = float(np.mean(rs[ok] - pred[main][ok])) if ok.any() else 0.0
+
+    ncol = max(2, len(names))
+    fig = plt.figure(figsize=(6.2 * ncol, 17))
+    gs = fig.add_gridspec(3, ncol, height_ratios=[1.15, 1.15, 0.9])
+
+    def base(ax):
+        ax.set_xlim(cx - span, cx + span)
+        ax.set_ylim(cy - span, cy + span)
+        if site.tx_xy:
+            ax.plot(*site.tx_xy, '*', color='r', mec='k', ms=18, zorder=5)
+
+    # row 1: each predicted map with the track coloured by measured RSSI (same scale)
+    for k, m in enumerate(names):
+        ax = fig.add_subplot(gs[0, k])
+        im = ax.imshow(maps[m], extent=ext, cmap='viridis', vmin=vmin, vmax=vmax)
+        ax.plot(fx, fy, '-', color='w', lw=0.8, alpha=0.8)
+        ax.scatter(fx, fy, c=rs, cmap='viridis', vmin=vmin, vmax=vmax, s=22, edgecolors='k', linewidths=0.4, zorder=4)
+        base(ax)
+        ax.set_title(f"predicted {m} (background) vs measured RSSI (dots)")
+        fig.colorbar(im, ax=ax, shrink=0.8, label='dBm')
+
+    # row 2 left: residual along the track on the main map
+    ax = fig.add_subplot(gs[1, 0])
+    if site.terrain is not None:
+        ax.imshow(site.terrain, extent=ext, cmap='gray')
+    if site.drivable is not None:
+        ax.imshow(np.ma.masked_where(~site.drivable, site.drivable), extent=ext, cmap='Blues', alpha=0.3, vmin=0, vmax=1.5)
+    res = rs - pred[main] - bias
+    lim = max(5.0, float(np.nanpercentile(np.abs(res), 95)))
+    sc = ax.scatter(fx, fy, c=res, cmap='RdBu', norm=TwoSlopeNorm(0, -lim, lim), s=24, edgecolors='k',
+                    linewidths=0.3, zorder=4)
+    base(ax)
+    ax.set_title(f"measured - {main} - ({bias:+.1f} dB mean offset)\nred = weaker than predicted, blue = stronger")
+    fig.colorbar(sc, ax=ax, shrink=0.8, label='dB')
+
+    # row 2 right: measured vs predicted scatter
+    ax = fig.add_subplot(gs[1, 1])
+    lo, hi = -100, -20
+    for k, m in enumerate(names):
+        okm = ~np.isnan(rs) & ~np.isnan(pred[m]) & drive
+        if okm.sum() < 3:
+            continue
+        r = np.corrcoef(rs[okm], pred[m][okm])[0, 1]
+        b = float(np.mean(rs[okm] - pred[m][okm]))
+        rms = float(np.sqrt(np.mean((rs[okm] - pred[m][okm] - b) ** 2)))
+        ax.scatter(pred[m][okm], rs[okm], s=10, color=f'C{k}', alpha=0.7,
+                   label=f"{m}: r {r:+.2f}, offset {b:+.1f} dB, rms after offset {rms:.1f} dB")
+    ax.plot([lo, hi], [lo, hi], 'k--', lw=1, label='1:1')
+    ax.plot([lo, hi], [lo + bias, hi + bias], 'k:', lw=1, label=f'1:1 {bias:+.1f} dB')
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_xlabel('predicted [dB]')
+    ax.set_ylabel('measured RSSI [dBm]')
+    ax.legend(fontsize=8, loc='upper left')
+    ax.set_title('measured vs predicted (while driving)')
+    if ncol > 2:
+        for k in range(2, ncol):
+            fig.add_subplot(gs[1, k]).axis('off')
+
+    # row 3: profile over distance driven
+    ax = fig.add_subplot(gs[2, :])
+    dist = np.r_[0.0, np.cumsum(np.nan_to_num(np.hypot(np.diff(fx), np.diff(fy))))]
+    ax.plot(dist, rs, 'k.', ms=5, label='measured RSSI')
+    for k, m in enumerate(names):
+        ax.plot(dist, pred[m], '-', color=f'C{k}', lw=1.5, label=f'pred {m}, fixed track')
+        ax.plot(dist, pred_raw[m], ':', color=f'C{k}', lw=1.2, label=f'pred {m}, raw track')
+    ax.plot(dist, pred[main] + bias, '-', color='0.5', lw=1, label=f'pred {main} {bias:+.1f} dB')
+    for li in range(1, leg_id.max() + 1):
+        idx = np.where(leg_id == li)[0]
+        ax.axvspan(dist[idx[0]], dist[idx[-1]], color=f'C{li}', alpha=0.06)
+    ax.set_xlabel('distance driven [m] (fixed track)')
+    ax.set_ylabel('dB')
+    ax.legend(fontsize=8, ncol=3, loc='lower right')
+    ax.grid(alpha=0.3)
+    ax.set_title('along the drive: measured vs predicted on the fixed track (solid) and on the raw track (dotted)')
+    fig.suptitle(f"{os.path.basename(out_dir)}  node {node}  -  predicted radio maps on the {model}-fixed track"
+                 + (f"  (BS moved to {site.tx_xy[0]:+.1f}, {site.tx_xy[1]:+.1f})" if site.bs_moved else ""))
+    fig.tight_layout()
+    save_fig(fig, os.path.join(out_dir, f'fix_track_rm{suffix}.png'), 70)
 
 
 def plot_candidates(site, out_dir, x, y, info, home):
