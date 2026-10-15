@@ -20,7 +20,15 @@ Usage:
 
     python3 radio_daemon.py --serial /dev/ttyUSB0 --ros-location-topic /camera/odom/sample
 
+    # T265 heading + wheel distance (the T265 under-reports distance outdoors)
+    python3 radio_daemon.py ... --ros-location-topic /camera/odom/sample --ros-wheel-topic /car/vesc/odom
+
     python3 radio_daemon.py ... --ros-control    # let the BS dashboard start/stop the ROS stack
+
+Routes from the BS dashboard ("nav" in the control message) are handed to rover_nav.py (the
+ROS node that follows them) through files in --nav-dir; its progress goes back in
+@ROVER_STATUS (nav=, ni=/np= metres, xte=). With rover_nav.py running, use its fused pose:
+    --ros-location-topic /car/fused_odom   (and no --ros-wheel-topic)
 
 Comms restriction modes (combinable, see --help for all options):
     --bw-limit 1                     data bundles/s budget (beacons/ackmaps/location exempt)
@@ -49,6 +57,8 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Set, Tuple
+
+from odom_fusion import OdomFusion   # --ros-wheel-topic: wheel distance + T265 heading (shared with rover_nav.py)
 
 try:
     import rospy
@@ -526,6 +536,91 @@ def unpack_location(data: bytes) -> Optional[Tuple[int, float, float, float]]:
     return node_id, lat, lon, alt
 
 
+# routes for rover_nav.py
+NAV_DIR_DEFAULT  = '/tmp/rover_nav'   # route.json (daemon -> node), status.json (node -> daemon)
+NAV_STATUS_FRESH_S = 3.0              # older status.json = rover_nav.py not running
+
+
+class NavBridge:
+    """Hands BS route commands ("nav": {"<node>": [cmd_id, speed, [x0, y0, ...] odom dm] or
+    [cmd_id, "stop"]}) to rover_nav.py and reads its progress back. Also passes on the pose
+    source setting ("pose": {"<node>": "fused"|"camera"}) as pose.json; that one is a
+    setting, not a command, so rover_nav.py keeps applying it across stack restarts.
+
+    Each cmd_id is acted on once; the last one is saved to disk (like RosStack) so a reboot
+    never replays an old route. /tmp is cleared on reboot, so a stale route.json can't either.
+    """
+
+    def __init__(self, nav_dir: str, state_path: str):
+        self.nav_dir = nav_dir
+        self._state_path = state_path
+        self.last_cmd = 0
+        self._pose_mode: Optional[str] = None
+        try:
+            with open(state_path) as f:
+                self.last_cmd = int(json.load(f)['cmd_id'])
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+
+    def _write_json(self, path: str, obj: dict) -> None:
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        tmp = path + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(obj, f)
+        os.replace(tmp, path)
+
+    def on_command(self, cmd: list) -> Optional[str]:
+        """Returns what was done, or None for an already-handled / malformed command."""
+        try:
+            cmd_id = int(cmd[0])
+        except (TypeError, ValueError, IndexError):
+            return None
+        if cmd_id <= self.last_cmd or len(cmd) < 2 or cmd[1] == 'ok':
+            return None
+        if cmd[1] == 'stop':
+            out, what = {'cmd': cmd_id, 'stop': True}, 'stop'
+        else:
+            try:
+                speed, flat = float(cmd[1]), [float(v) / 10.0 for v in cmd[2]]
+            except (TypeError, ValueError, IndexError):
+                return None
+            pts = [[flat[i], flat[i + 1]] for i in range(0, len(flat) - 1, 2)]
+            if len(pts) < 2:
+                return None
+            out = {'cmd': cmd_id, 'speed': speed, 'pts': pts}
+            what = f"route {len(pts)} pts at {speed:g} m/s"
+        out['received'] = time.time()
+        try:
+            self._write_json(os.path.join(self.nav_dir, 'route.json'), out)
+            self.last_cmd = cmd_id
+            self._write_json(self._state_path, {'cmd_id': cmd_id, 'saved': time.time()})
+        except OSError as e:
+            return f"could not hand to rover_nav.py: {e}"
+        return what
+
+    def set_pose_mode(self, mode: str) -> Optional[str]:
+        """Write pose.json when the BS setting changes. Returns what was done or None."""
+        if mode not in ('fused', 'camera') or mode == self._pose_mode:
+            return None
+        try:
+            self._write_json(os.path.join(self.nav_dir, 'pose.json'), {'mode': mode, 'set': time.time()})
+        except OSError as e:
+            return f"could not hand pose mode to rover_nav.py: {e}"
+        self._pose_mode = mode
+        return f"pose source {mode}"
+
+    def status(self) -> dict:
+        """rover_nav.py's status.json if it is fresh, else {}."""
+        try:
+            with open(os.path.join(self.nav_dir, 'status.json')) as f:
+                st = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        if time.time() - float(st.get('t', 0)) > NAV_STATUS_FRESH_S:
+            return {}
+        return st
+
+
 # routing protocols
 
 class RoutingProtocol(ABC):
@@ -739,6 +834,7 @@ class RoverDaemon:
                  node_id_override: Optional[int], protocol: RoutingProtocol,
                  lat: float = 0.0, lon: float = 0.0, alt: float = 0.0,
                  ros_location_topic: Optional[str] = None,
+                 ros_wheel_topic: Optional[str] = None,
                  policy: Optional[CommsPolicy] = None,
                  event_log: Optional[EventLog] = None,
                  bw_order: str = 'oldest',
@@ -748,7 +844,8 @@ class RoverDaemon:
                  state_interval_s: float = STATE_LOG_INTERVAL_S,
                  loc_interval_s: float = LOCATION_BUNDLE_INTERVAL_S,
                  run_config: Optional[dict] = None,
-                 ros_stack: Optional[RosStack] = None):
+                 ros_stack: Optional[RosStack] = None,
+                 nav: Optional[NavBridge] = None):
         assert BUNDLE_SIZE == 1052, f"Bundle struct size mismatch: got {BUNDLE_SIZE}, expected 1052"
         assert ACKMAP_SIZE == 42,   f"Ackmap struct size mismatch: got {ACKMAP_SIZE}, expected 42"
 
@@ -770,6 +867,7 @@ class RoverDaemon:
         self._loc_interval_s    = loc_interval_s
         self._run_config    = run_config or {}
         self._ros           = ros_stack or RosStack(False, os.devnull, '.')
+        self._nav           = nav
         # forward loop ticks fast enough to pace the bandwidth budget smoothly
         self._forward_interval_s = (min(FORWARD_INTERVAL_S, 1.0 / self._policy.bw_limit)
                                     if self._policy.bw_limit > 0 else FORWARD_INTERVAL_S)
@@ -804,6 +902,9 @@ class RoverDaemon:
         # (counter-clockwise from the odometry x axis), None without a ROS topic
         self._own_location    = {'lat': lat, 'lon': lon, 'alt': alt, 'yaw': None}
         self._ros_location_topic = ros_location_topic
+        self._ros_wheel_topic = ros_wheel_topic
+        # with a wheel topic, position = wheel distance along the location topic's heading
+        self._fusion = OdomFusion() if ros_wheel_topic else None
         self._locations: Dict[int, dict] = {}                # node_id -> {lat, lon, alt, updated_ms}
 
         self._detected_node_id: Optional[int] = None
@@ -1275,6 +1376,19 @@ class RoverDaemon:
             'exp':  (self._pending_start or {}).get('exp') or
                     (self._exp_id if self._mode == 'active' else '') or '-',
         }
+        if self._fusion is not None:
+            fields['loc'] = self._fusion.source(time.monotonic())   # fused | wheel | wait
+        if self._nav is not None:
+            fields['nc'] = self._nav.last_cmd                    # BS stops re-sending route points
+            nst = self._nav.status()
+            fields['nav'] = nst.get('nav', 'no_node')
+            for k in ('ni', 'np', 'xte'):
+                if isinstance(nst.get(k), (int, float)):
+                    fields[k] = round(float(nst[k]), 1)
+            if self._fusion is None and nst.get('loc'):
+                fields['loc'] = nst['loc']                       # rover_nav.py does the fusion
+            if nst.get('mode'):
+                fields['pm'] = nst['mode']                       # pose source in use: fused | camera
         self._queue_telemetry(f"@ROVER_STATUS:{self._node_id}:"
                               + ','.join(f"{k}={v}" for k, v in fields.items()))
 
@@ -1541,6 +1655,19 @@ class RoverDaemon:
         ros = (msg.get('ros') or {}).get(str(self._node_id))
         if isinstance(ros, list) and len(ros) == 2 and ros[0] in ('on', 'off'):
             self._on_ros_command(ros[0], int(ros[1]), version)
+        pose_mode = (msg.get('pose') or {}).get(str(self._node_id))
+        if isinstance(pose_mode, str) and self._nav is not None:
+            result = self._nav.set_pose_mode(pose_mode)
+            if result is not None:
+                print(f"[NAV] v{version}: {result}")
+                self._log.log('pose_mode', mode=pose_mode, ctrl_version=version, result=result)
+        nav = (msg.get('nav') or {}).get(str(self._node_id))
+        if isinstance(nav, list) and self._nav is not None:
+            result = self._nav.on_command(nav)
+            if result is not None:
+                print(f"[NAV] v{version}: {result} (cmd {nav[0]})")
+                self._log.log('nav_command', cmd_id=nav[0], ctrl_version=version, result=result,
+                              route=nav[2] if len(nav) > 2 else None)
         if 'state' not in msg:
             return                                # ROS-only control: fleet state unchanged
 
@@ -1672,7 +1799,27 @@ class RoverDaemon:
               f"acked:{self._counters['acked_own_data']}"
               + (f" | tokens:{tok:.2f}" if tok is not None else "")
               + (f" | ros:{self._ros.status()}" if self._ros.enabled else "")
+              + (self._fusion_status() if self._fusion is not None else "")
+              + (self._nav_status() if self._nav is not None else "")
               + f" | peers {peers}")
+
+    def _nav_status(self) -> str:
+        st = self._nav.status()
+        if not st:
+            return ""
+        out = f" | nav:{st.get('nav')}"
+        if st.get('np'):
+            out += f" {st.get('ni', 0):.0f}/{st['np']:.0f}m"
+        if st.get('loc'):
+            out += f" loc:{st['loc']}"
+        return out
+
+    def _fusion_status(self) -> str:
+        """' | loc:fused (x, y) hdg, driven m' for the [STATUS] line (bench checks)."""
+        f, loc = self._fusion, self._fusion.location()
+        hdg = f"{loc['yaw']:.0f}deg" if loc['yaw'] is not None else '-'
+        return (f" | loc:{f.source(time.monotonic())} ({loc['lat']:.2f}, {loc['lon']:.2f}) {hdg}"
+                f" driven {f.distance:.1f}m")
 
     def write_summary(self) -> dict:
         lats = self._ack_latencies_ms
@@ -1839,42 +1986,71 @@ class RoverDaemon:
         print(f"[INIT] Running as rover node {self._node_id}")
         self._main_loop()
 
-    def _start_ros_location(self, topic: str) -> None:
-        """Keep self._own_location current from a ROS nav_msgs/Odometry topic.
+    def _start_ros_location(self) -> None:
+        """Keep self._own_location current from ROS nav_msgs/Odometry topics.
 
-        Tries rospy first; if rospy is not importable (ROS Melodic ships Python 2
-        rospy only) falls back to parsing `rostopic echo --noarr -n 0` output so
-        the daemon works under plain python3 without any extra packages.
+        Without --ros-wheel-topic the location topic's pose is used as-is. With it, the
+        pose comes from OdomFusion: distance from the wheel topic, heading from the
+        location topic. Tries rospy first; if rospy is not importable (ROS Melodic ships
+        Python 2 rospy only) falls back to parsing `rostopic echo --noarr` output so the
+        daemon works under plain python3 without any extra packages.
         """
-        if _ROS_AVAILABLE:
-            self._start_ros_location_rospy(topic)
+        loc_topic, wheel_topic, fusion = self._ros_location_topic, self._ros_wheel_topic, self._fusion
+        handlers = {}
+        if fusion is None:
+            def _on_loc(pos, yaw) -> None:
+                with self._lock:
+                    self._own_location = {'lat': pos[0], 'lon': pos[1], 'alt': pos[2], 'yaw': yaw}
+            handlers[loc_topic] = _on_loc
         else:
-            self._start_ros_location_subprocess(topic)
+            print(f"[LOC] Fusing: distance from {wheel_topic}, heading from {loc_topic}")
 
-    def _start_ros_location_rospy(self, topic: str) -> None:
+            def _publish() -> None:
+                loc = fusion.location()
+                with self._lock:
+                    self._own_location = loc
+
+            def _on_head(pos, yaw) -> None:
+                fusion.on_heading(yaw, pos[2], time.monotonic())
+                _publish()
+
+            def _on_wheel(pos, yaw) -> None:
+                fusion.on_wheel(pos[0], pos[1], yaw, time.monotonic())
+                _publish()
+            handlers[loc_topic] = _on_head
+            handlers[wheel_topic] = _on_wheel
+        if _ROS_AVAILABLE:
+            self._start_odom_rospy(handlers)
+        else:
+            for topic, on_msg in handlers.items():
+                self._start_odom_subprocess(topic, on_msg)
+
+    def _start_odom_rospy(self, handlers: dict) -> None:
         def _thread() -> None:
             try:
                 # disable_signals=True required when init_node is called from a
                 # non-main thread (signal handlers must stay on the main thread).
                 rospy.init_node('rover_daemon_loc', anonymous=True, disable_signals=True)
 
-                def _cb(msg: _Odometry) -> None:
-                    p = msg.pose.pose.position
-                    q = msg.pose.pose.orientation
-                    yaw = _yaw_deg(q.x, q.y, q.z, q.w)
-                    with self._lock:
-                        self._own_location = {'lat': p.x, 'lon': p.y, 'alt': p.z, 'yaw': yaw}
+                def _make_cb(on_msg):
+                    def _cb(msg: _Odometry) -> None:
+                        p = msg.pose.pose.position
+                        q = msg.pose.pose.orientation
+                        on_msg((p.x, p.y, p.z), _yaw_deg(q.x, q.y, q.z, q.w))
+                    return _cb
 
-                rospy.Subscriber(topic, _Odometry, _cb)
-                print(f"[LOC] Subscribed to {topic} via rospy")
+                for topic, on_msg in handlers.items():
+                    rospy.Subscriber(topic, _Odometry, _make_cb(on_msg))
+                    print(f"[LOC] Subscribed to {topic} via rospy")
                 rospy.spin()
             except Exception as exc:
                 print(f"[LOC] rospy location thread failed: {exc}")
 
         threading.Thread(target=_thread, daemon=True, name='ros-loc').start()
 
-    def _start_ros_location_subprocess(self, topic: str) -> None:
-        """Parse `rostopic echo` YAML output for pose.pose.position and pose.pose.orientation."""
+    def _start_odom_subprocess(self, topic: str, on_msg) -> None:
+        """Parse `rostopic echo` YAML output for pose.pose.position and pose.pose.orientation;
+        calls on_msg((x, y, z), yaw_deg or None) for every message."""
         import subprocess, re
         print(f"[LOC] rospy unavailable - falling back to rostopic echo for {topic}")
 
@@ -1913,10 +2089,7 @@ class RoverDaemon:
                             pos =[vals.get(('position', k)) for k in 'xyz']
                             ori = [vals.get(('orientation', k)) for k in 'xyzw']
                             if None not in pos:
-                                yaw = _yaw_deg(*ori) if None not in ori else None
-                                with self._lock:
-                                    self._own_location = {'lat': pos[0], 'lon': pos[1],
-                                                          'alt': pos[2], 'yaw': yaw}
+                                on_msg(tuple(pos), _yaw_deg(*ori) if None not in ori else None)
                             stack, vals = [], {}
                             continue
                         m = key_re.match(line)
@@ -1934,18 +2107,18 @@ class RoverDaemon:
                             except ValueError:
                                 pass
                     proc.wait()
-                    print("[LOC] rostopic echo exited; restarting in 2s")
+                    print(f"[LOC] rostopic echo {topic} exited; restarting in 2s")
                     time.sleep(2)
                 except Exception as exc:
-                    print(f"[LOC] rostopic echo failed: {exc}; retrying in 5s")
+                    print(f"[LOC] rostopic echo {topic} failed: {exc}; retrying in 5s")
                     time.sleep(5)
 
-        threading.Thread(target=_thread, daemon=True, name='ros-loc').start()
+        threading.Thread(target=_thread, daemon=True, name='ros-loc ' + topic).start()
 
     def run(self) -> None:
         self._log.log('daemon_start', config=self._run_config, boot_id=self._boot_id)
         if self._ros_location_topic:
-            self._start_ros_location(self._ros_location_topic)
+            self._start_ros_location()
         try:
             while True:
                 try:
@@ -2033,6 +2206,13 @@ def main():
     parser.add_argument('--ros-location-topic', default=None, metavar='TOPIC',
                         help='ROS 1 nav_msgs/Odometry topic for live position '
                              '(e.g. /camera/odom/sample for the T265); overrides --lat/--lon/--alt')
+    parser.add_argument('--ros-wheel-topic', default=None, metavar='TOPIC',
+                        help='ROS 1 nav_msgs/Odometry wheel odometry (e.g. /car/vesc/odom). With it, '
+                             'position = distance driven from this topic along the heading of '
+                             '--ros-location-topic (wheel distance, T265 heading)')
+    parser.add_argument('--nav-dir', default=NAV_DIR_DEFAULT,
+                        help='Folder shared with rover_nav.py: route.json (routes from the BS) and '
+                             'status.json (its progress)')
     parser.add_argument('--ros-control', action='store_true',
                         help='Let the BS start/stop the ROS stack (' + ' '.join(ROS_STACK_CMD) + '). '
                              'Linux only; needs the ROS environment sourced')
@@ -2074,6 +2254,7 @@ def main():
         lon=args.lon,
         alt=args.alt,
         ros_location_topic=args.ros_location_topic,
+        ros_wheel_topic=args.ros_wheel_topic,
         policy=policy,
         event_log=EventLog(log_path),
         bw_order=args.bw_order,
@@ -2083,6 +2264,7 @@ def main():
         state_interval_s=args.state_interval,
         loc_interval_s=max(0.2, args.loc_interval),
         run_config=dict(vars(args), **policy.describe()),
+        nav=NavBridge(args.nav_dir, os.path.join(args.log_dir, 'nav_state.json')),
         ros_stack=RosStack(args.ros_control,
                            state_path=os.path.join(args.log_dir, 'ros_control_state.json'),
                            log_dir=args.log_dir),

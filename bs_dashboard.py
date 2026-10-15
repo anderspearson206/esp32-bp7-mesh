@@ -21,6 +21,7 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import bs_core
+import route_plan
 import site_map
 from bs_core import BSCore, BS_NODE_ID
 
@@ -68,8 +69,9 @@ def radio_rgba(arr: np.ndarray) -> np.ndarray:
 
 class MapViewBox(pg.ViewBox):
     """Normal pan/zoom, except in "Place on map" mode where a left click or drag aligns the
-    selected rover (see Dashboard.align_from_map), and in "Move BS" mode where a left click
-    puts the BS there (Dashboard.move_bs_to)."""
+    selected rover (see Dashboard.align_from_map), in "Move BS" mode where a left click
+    puts the BS there (Dashboard.move_bs_to), and in "Add waypoints" mode where each left
+    click adds a route waypoint (Dashboard.add_waypoint)."""
 
     def __init__(self, dash):
         super().__init__()
@@ -87,6 +89,11 @@ class MapViewBox(pg.ViewBox):
         self.dash.align_from_map(p0.x(), p0.y(), p1.x(), p1.y(), ev.isFinish())
 
     def mouseClickEvent(self, ev):
+        if self.dash.wp_btn.isChecked() and ev.button() == QtCore.Qt.LeftButton:
+            ev.accept()
+            p = self.mapSceneToView(ev.scenePos())
+            self.dash.add_waypoint(p.x(), p.y())
+            return
         if self.dash.bs_btn.isChecked() and ev.button() == QtCore.Qt.LeftButton:
             ev.accept()
             p = self.mapSceneToView(ev.scenePos())
@@ -379,6 +386,15 @@ class Dashboard(QtWidgets.QMainWindow):
         self.anchor_marks = pg.ScatterPlotItem(size=14, symbol='x', pen=pg.mkPen('k', width=2))
         self.p_map.addItem(self.anchor_marks)
         self.align_preview = self.p_map.plot([], [], pen=pg.mkPen('#d81b60', width=3))
+        self.route_lines = {}                 # node -> route the rover was sent
+        self.route_preview = self.p_map.plot([], [], pen=pg.mkPen('#ff6f00', width=3, style=QtCore.Qt.DashLine))
+        self.wp_marks = pg.ScatterPlotItem(size=13, symbol='o', brush=pg.mkBrush('#ff6f00'),
+                                           pen=pg.mkPen('k', width=1.2))
+        self.wp_marks.setZValue(10)
+        self.p_map.addItem(self.wp_marks)
+        self.wp_labels = []
+        self.waypoints = []                   # [[x, y], ...] map metres, in driving order
+        self.route_plan = None                # Nx2 preview from the selected rover's position
         self.bs_star = self.bs_text = None
         if site is not None and site.tx_xy:
             self.bs_star = pg.ScatterPlotItem([site.tx_xy[0]], [site.tx_xy[1]], size=22, symbol='star',
@@ -463,6 +479,13 @@ class Dashboard(QtWidgets.QMainWindow):
         self.follow_check = QtWidgets.QCheckBox("Follow")
         top.addWidget(self.follow_check)
         al.addLayout(top)
+        self.camera_check = QtWidgets.QCheckBox("Camera-only pose (no wheel fusion)")
+        self.camera_check.setToolTip(
+            "rover_nav.py pose source for the selected rover. Off (default): distance from the wheels, "
+            "heading from the T265. On: the T265's own position (under-reads distance outdoors). "
+            "Switching doesn't move the rover on the map. Shows what the rover reports.")
+        self.camera_check.clicked.connect(self.on_camera_toggled)
+        al.addWidget(self.camera_check)
         self.align_btn = QtWidgets.QPushButton("Place on map…")
         self.align_btn.setCheckable(True)
         self.align_btn.setStyleSheet("QPushButton:checked { background: #f8bbd0; font-weight: bold; }")
@@ -506,6 +529,7 @@ class Dashboard(QtWidgets.QMainWindow):
         self.align_label.setTextFormat(QtCore.Qt.RichText)
         al.addWidget(self.align_label)
         sl.addWidget(ab)
+        sl.addWidget(self._build_route_box())
         sl.addWidget(self.hover_label)
         sl.addStretch(1)
         lay.addWidget(side)
@@ -515,6 +539,51 @@ class Dashboard(QtWidgets.QMainWindow):
         self.last_snap = None
         self._apply_layers()
         return w
+
+    def _build_route_box(self) -> QtWidgets.QGroupBox:
+        rb = QtWidgets.QGroupBox("Drive route (rover selected above)")
+        rl = QtWidgets.QVBoxLayout(rb)
+        row = QtWidgets.QHBoxLayout()
+        self.wp_btn = QtWidgets.QPushButton("Add waypoints…")
+        self.wp_btn.setCheckable(True)
+        self.wp_btn.setStyleSheet("QPushButton:checked { background: #ffe0b2; font-weight: bold; }")
+        self.wp_btn.setToolTip("Then click waypoints on the map in driving order. The route is planned "
+                               "(A* on the drivable area) from the rover's current position.")
+        self.wp_btn.toggled.connect(self._on_wp_toggled)
+        row.addWidget(self.wp_btn, 1)
+        undo = QtWidgets.QPushButton("Undo")
+        undo.clicked.connect(self.on_wp_undo)
+        row.addWidget(undo)
+        clear = QtWidgets.QPushButton("Clear")
+        clear.clicked.connect(self.on_wp_clear)
+        row.addWidget(clear)
+        rl.addLayout(row)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Speed"))
+        self.route_speed = QtWidgets.QDoubleSpinBox()
+        self.route_speed.setRange(0.2, bs_core.ROUTE_SPEED_MAX)
+        self.route_speed.setSingleStep(0.05)
+        self.route_speed.setValue(0.5)
+        self.route_speed.setSuffix(" m/s")
+        row.addWidget(self.route_speed)
+        send = QtWidgets.QPushButton("Send route")
+        send.setStyleSheet("font-weight: bold;")
+        send.setToolTip("Replans from the rover's current position and sends it. The rover only drives "
+                        "while RB is held on its controller; LB (manual) always overrides.")
+        send.clicked.connect(self.on_send_route)
+        row.addWidget(send)
+        stop = QtWidgets.QPushButton("Stop")
+        stop.setToolTip("Cancel the rover's route (only reaches it while in radio range; "
+                        "releasing RB stops it anywhere)")
+        stop.clicked.connect(self.on_stop_route)
+        row.addWidget(stop)
+        rl.addLayout(row)
+        self.route_label = QtWidgets.QLabel()
+        self.route_label.setWordWrap(True)
+        self.route_label.setTextFormat(QtCore.Qt.RichText)
+        rl.addWidget(self.route_label)
+        rb.setEnabled(self.site is not None and self.site.drivable is not None)
+        return rb
 
     def _image_item(self, arr, rect, z=-100):
         item = pg.ImageItem(arr[::-1], levels=(0, 255) if arr.dtype == np.uint8 else None)
@@ -676,7 +745,12 @@ class Dashboard(QtWidgets.QMainWindow):
             else:
                 self._cell(i, 7, 'unsynced' if ck == 'na' else '-', bg='#ffe0b2' if ck == 'na' else None)
             ros = st.get('ros', '-')
-            self._cell(i, 8, ros, bg={'on': '#c8e6c9', 'stopping': '#fff9c4'}.get(ros))
+            # loc (fused | wheel | wait) only from rovers running --ros-wheel-topic
+            loc = st.get('loc')
+            bg = {'on': '#c8e6c9', 'stopping': '#fff9c4'}.get(ros)
+            if ros == 'on' and loc in ('wheel', 'wait'):
+                bg = '#fff9c4'                    # stack up but no T265 heading (yet)
+            self._cell(i, 8, f"{ros}, loc {loc}" if loc else ros, bg=bg)
             self._cell(i, 9, '-' if win is None else f"{'ON' if win[0] else 'OFF'} {win[1]:.0f}s left",
                        bg=None if win is None else ('#c8e6c9' if win[0] else '#eeeeee'))
             self._cell(i, 10, f"{num('q')}/{num('qf')}")
@@ -859,6 +933,8 @@ class Dashboard(QtWidgets.QMainWindow):
             r = self.map_vb.viewRect()
             self.map_vb.translateBy(x=xs[i] - r.center().x(), y=ys[i] - r.center().y())
         self._refresh_align_label(snap, locs, now)
+        self._refresh_routes(snap)
+        self._refresh_pose_mode(snap)
 
     def _refresh_bs(self, bs, now) -> None:
         """BS star, radio-map layers (rebuilt when the BS or its maps change) and status."""
@@ -929,6 +1005,127 @@ class Dashboard(QtWidgets.QMainWindow):
                          "only click-to-place works</span>")
         self.align_label.setText("<br>".join(lines))
 
+    def _refresh_routes(self, snap) -> None:
+        routes = snap.get('routes', {})
+        for n in set(self.route_lines) | set(routes):
+            if n not in self.route_lines:
+                self.route_lines[n] = self.p_map.plot([], [], pen=pg.mkPen(self.color(n), width=4))
+                self.route_lines[n].setOpacity(0.55)
+            pts = routes.get(n, {}).get('map') or []
+            self.route_lines[n].setData([p[0] for p in pts], [p[1] for p in pts])
+        n = self.rover_box.currentText()
+        st = next((r['status'] for r in snap['rovers'] if r['node'] == n), {})
+        lines = []
+        if self.route_plan is not None:
+            lines.append(f"plan: <b>{route_plan.length(self.route_plan):.0f} m</b> through "
+                         f"{len(self.waypoints)} waypoint(s)")
+        elif self.waypoints:
+            lines.append(f"{len(self.waypoints)} waypoint(s), no plan")
+        nav = st.get('nav')
+        if nav:
+            nav = str(nav)
+            prog = f" {st.get('ni', 0):.0f}/{st.get('np', 0):.0f} m" if st.get('np') else ''
+            xte = f", {st['xte']:.1f} m off route" if isinstance(st.get('xte'), float) else ''
+            color = ('#2e7d32' if nav == 'following' else '#1565c0' if nav == 'done'
+                     else '#c62828' if nav.startswith('stopped') else '#ef6c00')
+            lines.append(f"rover: <b style='color:{color}'>{nav}</b>{prog}{xte}")
+        elif n:
+            lines.append("<i>rover reports no route state (rover_nav.py not running?)</i>")
+        self.route_label.setText("<br>".join(lines))
+
+    def _refresh_pose_mode(self, snap) -> None:
+        """Checkbox = the mode the rover reports (pm), else what we last asked for."""
+        n = self.rover_box.currentText()
+        st = next((r['status'] for r in snap['rovers'] if r['node'] == n), {})
+        mode = st.get('pm') or self.core.pose_modes.get(n)
+        wanted = self.core.pose_modes.get(n)
+        self.camera_check.setEnabled(bool(n))
+        self.camera_check.blockSignals(True)
+        self.camera_check.setChecked(mode == 'camera')
+        self.camera_check.blockSignals(False)
+        pending = wanted is not None and st.get('pm') is not None and st.get('pm') != wanted
+        self.camera_check.setText("Camera-only pose (no wheel fusion)" + (" - switching…" if pending else ""))
+
+    def on_camera_toggled(self, on: bool) -> None:
+        n = self.rover_box.currentText()
+        if n:
+            self.core.set_pose_mode(n, 'camera' if on else 'fused')
+
+    def _on_wp_toggled(self, on: bool) -> None:
+        if on:
+            self.align_btn.setChecked(False)
+            self.bs_btn.setChecked(False)
+        self.map_vb.setCursor(QtCore.Qt.CrossCursor if on else QtCore.Qt.ArrowCursor)
+
+    def add_waypoint(self, x, y) -> None:
+        self.waypoints.append([float(x), float(y)])
+        self._replan()
+
+    def on_wp_undo(self) -> None:
+        if self.waypoints:
+            self.waypoints.pop()
+        self._replan()
+
+    def on_wp_clear(self) -> None:
+        self.waypoints = []
+        self._replan()
+
+    def _replan(self) -> bool:
+        """Preview route from the selected rover through the waypoints; False (and the reason
+        in the status bar) when it can't be planned."""
+        xs, ys = zip(*self.waypoints) if self.waypoints else ((), ())
+        self.wp_marks.setData(list(xs), list(ys))
+        for t in self.wp_labels:
+            self.p_map.removeItem(t)
+        self.wp_labels = []
+        for i, (x, y) in enumerate(self.waypoints):
+            t = pg.TextItem(str(i + 1), color='k', anchor=(-0.4, 1.2))
+            t.setPos(x, y)
+            self.p_map.addItem(t)
+            self.wp_labels.append(t)
+        self.route_plan = None
+        self.route_preview.setData([], [])
+        n = self.rover_box.currentText()
+        if not self.waypoints or not n:
+            return False
+        pts, err = self.core.plan_route(n, self.waypoints)
+        if pts is None:
+            self.statusBar().showMessage(f"route: {err}", 6000)
+            return False
+        self.route_plan = pts
+        self.route_preview.setData(pts[:, 0], pts[:, 1])
+        return True
+
+    def on_send_route(self) -> None:
+        n = self.rover_box.currentText()
+        if not n:
+            QtWidgets.QMessageBox.information(self, "Route", "Select a rover with a location first.")
+            return
+        if not self._replan():
+            QtWidgets.QMessageBox.information(
+                self, "Route", "Could not plan the route (see the status bar)." if self.waypoints
+                else "Click at least one waypoint first.")
+            return
+        length = route_plan.length(self.route_plan)
+        ans = QtWidgets.QMessageBox.question(
+            self, "Send route",
+            f"Send a {length:.0f} m route at {self.route_speed.value():.2f} m/s to rover {n}?\n\n"
+            "It drives only while RB is held on its controller. Release RB to stop; LB overrides.")
+        if ans != QtWidgets.QMessageBox.Yes:
+            return
+        err = self.core.send_route(n, self.route_plan, self.route_speed.value())
+        if err:
+            QtWidgets.QMessageBox.warning(self, "Route", err)
+            return
+        self.wp_btn.setChecked(False)
+        self.waypoints = []
+        self._replan()
+
+    def on_stop_route(self) -> None:
+        n = self.rover_box.currentText()
+        if n:
+            self.core.stop_route(n)
+
     # map actions
     def _selected_location(self):
         n = self.rover_box.currentText()
@@ -942,6 +1139,8 @@ class Dashboard(QtWidgets.QMainWindow):
             self.align_btn.setChecked(False)
             QtWidgets.QMessageBox.information(self, "Align", "No location from any rover yet.")
             return
+        if on:
+            self.wp_btn.setChecked(False)
         self.map_vb.setCursor(QtCore.Qt.CrossCursor if on else QtCore.Qt.ArrowCursor)
         if not on:
             self.align_preview.setData([], [])

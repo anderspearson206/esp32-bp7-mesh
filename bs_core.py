@@ -19,6 +19,7 @@ Session folder (bs_reports/session_<time>[_<tag>]/):
                             x/y/z), yaw, RSSI, map position, and with --site the drivable flag,
                             elevation and each predicted radio map value at that point
     alignments.csv          every odometry -> map alignment change
+    routes.csv              every route sent to a rover (map + odometry points) and every stop
     bs_position.json        where the BS is on the site map (with --site; see move_bs)
     dtn_summary_<time>.txt  session report
     node_<id>_boot<n>.txt   per-boot report on @NODE_RESTART
@@ -40,6 +41,7 @@ from typing import Dict, List, Optional
 import serial
 
 import rm_generate
+import route_plan
 import site_map
 
 BS_NODE_ID       = 23768
@@ -60,6 +62,9 @@ CONFIG_DEFAULTS = {        # same keys/meaning as the radio_daemon.py CLI option
     'comms_on': 0.0, 'comms_off': 0.0, 'comms_phase': 0.0, 'payload_bytes': 0,
     'loc_interval': 1.0,
 }
+CONTROL_MAX_JSON  = 1400   # control JSON bytes per air frame (ESP-NOW v2: 1470 incl. headers)
+ROUTE_TOLERANCES  = (0.4, 0.6, 0.8, 1.0)   # simplification tried in turn until the route fits [m]
+ROUTE_SPEED_MAX   = 1.0    # m/s; rover_nav.py caps it again
 TRACK_MAX        = 20000   # location samples kept per rover for the map
 ALIGN_HEADER     = ['time', 'epoch', 'node', 'x', 'y', 'theta_deg', 'note']
 
@@ -134,6 +139,12 @@ class BSCore:
         self.bs_rejects_control = False
         self.control = {'version': 0, 'msg': None, 'sent_at': 0.0, 'last_tx': 0.0}
         self.ros_cmds: Dict[str, list] = {}   # node -> ["on"|"off", cmd_id], rides on every control msg
+        # node -> [cmd_id, speed, [x0, y0, ...] odom dm] (route) | [cmd_id, "stop"] | [cmd_id, "ok"]
+        # (route points dropped once the rover reports it has the command, see _on_rover_status)
+        self.nav_cmds: Dict[str, list] = {}
+        self.routes: Dict[str, dict] = {}     # node -> {'cmd', 'speed', 'map': [[x, y], ...]} for the map
+        self.pose_modes: Dict[str, str] = {}  # node -> "fused" | "camera" (rover_nav.py pose source)
+        self._planner = None                  # route_plan.Planner, built on first use
 
         self.session_dir = ''
         self._serial_log = None
@@ -698,6 +709,14 @@ class BSCore:
                                    f"(ctrl v{int(fields.get('cv', 0) or 0)})")
         fields['updated_at'] = now
         self.rover_status[parts[1]] = fields
+        nav = self.nav_cmds.get(parts[1])
+        nc = fields.get('nc')
+        if nav and len(nav) == 3 and isinstance(nc, float) and nc >= nav[0]:
+            # rover has it: stop re-sending the points (same version, so nobody re-acts on it)
+            self.nav_cmds[parts[1]] = [nav[0], 'ok']
+            sent = (self.control['msg'] or {}).get('nav') or {}
+            if parts[1] in sent:
+                sent[parts[1]] = [nav[0], 'ok']
         keys = sorted(k for k in fields if k != 'updated_at')
         self._csv(f"rover_status_{parts[1]}.csv", ['time', 'epoch'] + keys,
                   [_ts(now), f"{now:.3f}"] + [fields[k] for k in keys])
@@ -733,6 +752,10 @@ class BSCore:
         with self.lock:
             if self.ros_cmds:
                 msg = dict(msg, ros={n: list(c) for n, c in self.ros_cmds.items()})
+            if self.nav_cmds:
+                msg = dict(msg, nav={n: list(c) for n, c in self.nav_cmds.items()})
+            if self.pose_modes:
+                msg = dict(msg, pose=dict(self.pose_modes))
             self.control['version'] = max(int(time.time()), self.control['version'] + 1)
             self.control['msg'] = msg
             self.control['sent_at'] = time.time()
@@ -781,8 +804,80 @@ class BSCore:
             cmd_id = max([int(time.time() * 1000)] + [c[1] + 1 for c in self.ros_cmds.values()])
             for n in nodes:
                 self.ros_cmds[n] = [want, cmd_id]
-            base = {k: v for k, v in (self.control['msg'] or {}).items() if k != 'ros'}
-        self._set_control(base, f"ROS stack {want}: {', '.join(nodes)}")
+        self._set_control(self._base_msg(), f"ROS stack {want}: {', '.join(nodes)}")
+
+    def _base_msg(self) -> dict:
+        """Current fleet state without the per-rover command fields (_set_control adds them)."""
+        return {k: v for k, v in (self.control['msg'] or {}).items() if k not in ('ros', 'nav', 'pose')}
+
+    def set_pose_mode(self, node: str, mode: str) -> None:
+        """Pose source of rover_nav.py on a rover: 'fused' (wheel distance + T265 heading) or
+        'camera' (T265 only). A setting, carried on every control message."""
+        if mode not in ('fused', 'camera'):
+            return
+        with self.lock:
+            self.pose_modes[node] = mode
+        self._set_control(self._base_msg(), f"pose source {mode}: {node}")
+
+    # routes (rover_nav.py on the rover drives them; RB on its controller must be held)
+    def plan_route(self, node: str, waypoints: List[List[float]]):
+        """A* route (map metres) from the rover's current map position through the waypoints.
+        Returns (Nx2 points or None, error text)."""
+        if self.site is None or self.site.drivable is None:
+            return None, "route planning needs --site with a drivable map"
+        pose = self.map_pose(node)
+        if pose is None:
+            return None, f"no location from {node} yet"
+        if not waypoints:
+            return None, "no waypoints"
+        if self._planner is None:
+            self._planner = route_plan.Planner(self.site)
+        return self._planner.plan(pose[:2], waypoints)
+
+    def _cmd_id(self) -> int:
+        return max([int(time.time() * 1000)] + [c[0] + 1 for c in self.nav_cmds.values()])
+
+    def send_route(self, node: str, pts_map, speed: float) -> str:
+        """Send a planned route to a rover. Returns '' or why it was not sent."""
+        import numpy as np
+        pts_map = np.asarray(pts_map, float)
+        speed = round(min(max(float(speed), 0.1), ROUTE_SPEED_MAX), 2)
+        with self.lock:
+            al = self.alignments.get(node)
+            odom = route_plan.to_odom(al, pts_map)
+            cmd_id = self._cmd_id()
+            others = {n: c for n, c in self.nav_cmds.items() if n != node}
+            for tol in ROUTE_TOLERANCES:
+                keep = route_plan.simplify(odom, tol)
+                cmd = [cmd_id, speed, route_plan.encode(keep)]
+                trial = dict(self._base_msg(), ros={n: list(c) for n, c in self.ros_cmds.items()},
+                             nav=dict(others, **{node: cmd}), pose=dict(self.pose_modes), t=0.0, hop=0)
+                if len(json.dumps(trial, separators=(',', ':'))) <= CONTROL_MAX_JSON:
+                    break
+            else:
+                return (f"route too long for one control message ({len(keep)} points at "
+                        f"{tol} m); use fewer or closer waypoints")
+            self.nav_cmds[node] = cmd
+            keep_map = route_plan.simplify(pts_map, tol)
+            self.routes[node] = {'cmd': cmd_id, 'speed': speed, 'map': keep_map.tolist(), 'sent': time.time()}
+            self._csv('routes.csv', ['time', 'epoch', 'node', 'cmd_id', 'action', 'speed', 'length_m',
+                                     'points', 'tolerance_m', 'map_xy', 'odom_dm'],
+                      [_ts(time.time()), f"{time.time():.3f}", node, cmd_id, 'route', speed,
+                       f"{route_plan.length(keep_map):.1f}", len(keep), tol,
+                       json.dumps(np.round(keep_map, 2).tolist()), json.dumps(cmd[2])])
+        self._set_control(self._base_msg(), f"route to {node}: {len(keep)} pts, "
+                                            f"{route_plan.length(keep_map):.0f} m at {speed:g} m/s")
+        return ''
+
+    def stop_route(self, node: str) -> None:
+        with self.lock:
+            cmd_id = self._cmd_id()
+            self.nav_cmds[node] = [cmd_id, 'stop']
+            self.routes.pop(node, None)
+            self._csv('routes.csv', ['time', 'epoch', 'node', 'cmd_id', 'action', 'speed', 'length_m',
+                                     'points', 'tolerance_m', 'map_xy', 'odom_dm'],
+                      [_ts(time.time()), f"{time.time():.3f}", node, cmd_id, 'stop', '', '', '', '', '', ''])
+        self._set_control(self._base_msg(), f"stop route: {node}")
 
     def add_marker(self, label: str = '') -> str:
         now = time.time()
@@ -865,6 +960,7 @@ class BSCore:
                 'track_total': dict(self.track_total),
                 'locations': {n: dict(v) for n, v in self.locations.items()},
                 'alignments': {n: self.alignments.get(n) for n in self.locations},
+                'routes': {n: dict(r) for n, r in self.routes.items()},
                 'bs': dict(self._bs_position() or {}, rm_version=self.rm_version, rm_job=dict(self.rm_job)),
                 'events': [e for e in self.events if e[0] > since_event],
                 'n_delivered': len(self.delivered),
@@ -954,7 +1050,8 @@ class BSCore:
                          f"{f'periodic {on:g}s on/{off:g}s off' if on and off else 'always on'}, "
                          f"gen every {st.get('gi', 0):g}s | queue {st.get('q', 0):.0f} own/{st.get('qf', 0):.0f} "
                          f"ferried | gen {st.get('gen', 0):.0f} tx {st.get('tx', 0):.0f} "
-                         f"retx {st.get('retx', 0):.0f} ack {st.get('ack', 0):.0f} | ros {st.get('ros', '-')}")
+                         f"retx {st.get('retx', 0):.0f} ack {st.get('ack', 0):.0f} | ros {st.get('ros', '-')}"
+                         + (f", loc {st['loc']}" if st.get('loc') else ""))
             L.append("")
         if self.control['msg'] is not None:
             msg = self.control['msg']
