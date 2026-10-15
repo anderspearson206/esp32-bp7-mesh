@@ -1,0 +1,41 @@
+======================================================================
+  DTN Mesh Network  -  Session Summary Report
+  Session   : session_20261015_094354_shadow1
+  Generated : 2026-10-15 09:54:21
+  Duration  : 10m 27s
+======================================================================
+
+Totals
+  Bundles delivered (all)   : 1322
+  Data bundles delivered    : 598
+  Ferry duplicates          : 0
+  Antipacket failures       : 0
+  Data latency avg/p50/p95  : 697 / 263 / 5362 ms
+
+Per node  (data = generated sensor bundles; Data/Gen uses the rover's own counter)
+  Node       Data    Tel   AvgLat    p50    p95  RovGen  Data/Gen  FDup  APFl    RSSI
+  -----------------------------------------------------------------------------------
+  57936       598    724      697    263   5362     594    100.7%     0     0   -61.3
+
+Contacts with the BS  (link down after 3s without a beacon)
+  Node        N   UpTime   Up%  MeanLen  DataInUp  Data/s up
+  ----------------------------------------------------------
+  57936       5     605s   97%   121.1s       598       0.99
+
+Rovers (last @ROVER_STATUS)
+  57936: active 'shadow1' ctrl v1792083003, bw unlimited, always on, gen every 1s | queue 0 own/0 ferried | gen 594 tx 645 retx 51 ack 594 | ros on, loc fused
+
+Fleet control (last sent): v1792083003 active 'shadow1'
+  cfg: {"interval":1.0,"bw_limit":0.0,"bw_burst":1.0,"bw_order":"oldest","comms_on":0.0,"comms_off":0.0,"comms_phase":0.0,"payload_bytes":0,"loc_interval":1.0}
+  (full history in controls.csv)
+
+Map  (fountain: 256 m square, EPSG:32610 (WGS84 / UTM 10N) NW corner E551856 N5278186, BS/tx at (+54.5, -20.5) m (moved))
+  57936: alignment offset (+54.20, -22.80) m rotation +31.8 deg | 600 samples, 208 m driven, start-end 5.3 m, end-to-alignment point 5.3 m, on drivable 100% (100% within 1 m)
+  (alignment history in alignments.csv)
+
+BS position: moved to (+54.5, -20.5) m (cell col 182, row 148); predictions use maps generated for it (bs_position.json)
+
+Markers
+  start-shadow1    2026-10-15 09:43:54.480  (+0s)
+
+======================================================================

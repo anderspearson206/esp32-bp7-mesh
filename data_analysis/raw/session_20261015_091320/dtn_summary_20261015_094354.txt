@@ -1,0 +1,41 @@
+======================================================================
+  DTN Mesh Network  -  Session Summary Report
+  Session   : session_20261015_091320
+  Generated : 2026-10-15 09:43:54
+  Duration  : 30m 33s
+======================================================================
+
+Totals
+  Bundles delivered (all)   : 2135
+  Data bundles delivered    : 0
+  Ferry duplicates          : 0
+  Antipacket failures       : 0
+  Data latency avg/p50/p95  : N/A
+
+Per node  (data = generated sensor bundles; Data/Gen uses the rover's own counter)
+  Node       Data    Tel   AvgLat    p50    p95  RovGen  Data/Gen  FDup  APFl    RSSI
+  -----------------------------------------------------------------------------------
+  57936         0   2135        -      -      -       0         -     0     0   -59.3
+
+Contacts with the BS  (link down after 3s without a beacon)
+  Node        N   UpTime   Up%  MeanLen  DataInUp  Data/s up
+  ----------------------------------------------------------
+  57936       3    1812s   99%   604.0s         0       0.00
+
+Rovers (last @ROVER_STATUS)
+  57936: standby '-' ctrl v1792082458, bw unlimited, always on, gen every 1s | queue 0 own/0 ferried | gen 0 tx 0 retx 0 ack 0 | ros on, loc fused
+
+Fleet control (last sent): v1792082458 (no fleet state)
+  cfg: {}
+  (full history in controls.csv)
+
+Map  (fountain: 256 m square, EPSG:32610 (WGS84 / UTM 10N) NW corner E551856 N5278186, BS/tx at (+54.5, -20.5) m (moved))
+  57936: alignment offset (+54.20, -22.80) m rotation +31.8 deg | 1681 samples, 276 m driven, start-end 0.1 m, end-to-alignment point 0.0 m, on drivable 82% (89% within 1 m)
+  (alignment history in alignments.csv)
+
+BS position: moved to (+54.5, -20.5) m (cell col 182, row 148); predictions use maps generated for it (bs_position.json)
+
+Node restarts
+  57936: 2 restart(s), now on boot 2
+
+======================================================================

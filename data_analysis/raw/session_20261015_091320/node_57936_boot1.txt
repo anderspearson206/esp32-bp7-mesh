@@ -1,0 +1,4 @@
+Node 57936 boot 1 - saved 2026-10-15 09:13:34
+Duration 0 s, delivered 1, ferry dups 0, antipacket fails 0
+Latency avg 18 ms, min 18, max 18
+Seq [1..1] possible 1, rate 100.0%

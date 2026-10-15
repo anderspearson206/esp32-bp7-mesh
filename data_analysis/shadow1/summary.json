@@ -1,0 +1,77 @@
+{
+ "session": "session_20261015_094354_shadow1",
+ "node": "57936",
+ "duration_s": 642.1,
+ "bs_cell": [
+  182,
+  148
+ ],
+ "bs_xy": [
+  54.5,
+  -20.5
+ ],
+ "bs_cell_match_frac": 0.964,
+ "cut_at_bs_move": true,
+ "driven_m": 152.3,
+ "dist_to_bs_m": {
+  "min": 2.3,
+  "max": 54.8
+ },
+ "contacts": 5,
+ "uptime_frac": 0.986,
+ "beacons_heard": 602,
+ "beacon_rate_hz": 0.94,
+ "rssi_measured": {
+  "min": -96.0,
+  "median": -53.0,
+  "max": -34.0
+ },
+ "data_delivered": 613,
+ "tel_delivered": 742,
+ "rover_gen": 609,
+ "rover_tx": 660,
+ "rover_retx": 51,
+ "data_rate_per_s": 0.955,
+ "latency_ms": {
+  "mean": 685.0,
+  "p50": 263.0,
+  "p95": 5317.0,
+  "max": 20823.0
+ },
+ "window": null,
+ "data_direct_lt2s": 580,
+ "data_delayed_ge2s": 33,
+ "data_generated_while_link_down": 8,
+ "fits": {
+  "nn_pmnet": {
+   "n": 602,
+   "offset_db": -8.502326965332031,
+   "raw_bias_db": -11.522255881680207,
+   "rmse_db": 8.232153294541094,
+   "mae_db": 6.279682248137718,
+   "r": 0.9104619941098723,
+   "slope": 1.0688451314124385,
+   "intercept": -8.122358284134329
+  },
+  "nn": {
+   "n": 602,
+   "offset_db": -11.846466064453125,
+   "raw_bias_db": -13.707899644921389,
+   "rmse_db": 11.5535578344539,
+   "mae_db": 8.524223441697435,
+   "r": 0.849429303409955,
+   "slope": 0.7206844751468662,
+   "intercept": -26.89133463748605
+  },
+  "avg": {
+   "n": 602,
+   "offset_db": -9.637596130371094,
+   "raw_bias_db": -12.615077718943853,
+   "rmse_db": 9.229843255147157,
+   "mae_db": 6.612384213165587,
+   "r": 0.8866723420158061,
+   "slope": 0.8849870197873154,
+   "intercept": -18.169272945966704
+  }
+ }
+}

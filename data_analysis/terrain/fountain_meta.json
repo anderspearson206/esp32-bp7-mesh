@@ -1,0 +1,13 @@
+{
+ "site": "fountain",
+ "crs": "EPSG:32610 (WGS84 / UTM 10N)",
+ "west_E": 551856,
+ "north_N": 5278186,
+ "size_px": 256,
+ "cell_m": 1.0,
+ "row0": "north",
+ "col0": "west",
+ "min_elevation_m": 29.50576400756836,
+ "pixel_centre": "E = west_E + col + 0.5, N = north_N - row - 0.5",
+ "source": "USGS 3DEP bare-earth (elevation.nationalmap.gov 3DEPElevation ImageServer, bilinear)"
+}
