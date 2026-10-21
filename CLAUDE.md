@@ -113,7 +113,7 @@ idf.py -p COM13 flash monitor
 
 ## Running the system
 
-The BS laptop's Python environment (PySide6, pyqtgraph, pyserial, numpy) is the venv one level up, `..\.venv` (`C:\Users\Anders\Documents\esp32mesh\.venv`); the system Python lacks PySide6/pyserial. Dashboard: `python bs_dashboard.py --port COM5 --site fountain`.
+The BS laptop's Python environment (PySide6, pyqtgraph, pyserial, numpy) is the venv one level up, `..\.venv` (`C:\Users\Anders\Documents\esp32mesh\.venv`); the system Python lacks PySide6/pyserial. Dashboard: `python bs_dashboard.py --port COM5 --site fountain`. Site maps live in `..\terrain` (outside the repo). The Map tab's Layers → Background "Satellite" option uses `<site>_sat.png` there, made with `python fetch_sat.py fountain range` (USGS NAIP aerial photo, ~0.6 m/px, fetched for the site's UTM square; lines up with the drivable mask to ~1 m; `--force` to refetch).
 
 ```bash
 # Base Station: visualizer reads its serial port directly (BS firmware emits @-lines)
