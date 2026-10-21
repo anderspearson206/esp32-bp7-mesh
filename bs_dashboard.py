@@ -532,7 +532,15 @@ class Dashboard(QtWidgets.QMainWindow):
         sl.addWidget(self._build_route_box())
         sl.addWidget(self.hover_label)
         sl.addStretch(1)
-        lay.addWidget(side)
+        # scrolls instead of growing past short (laptop) screens as the wrapped labels change
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(side)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        sb = scroll.style().pixelMetric(QtWidgets.QStyle.PM_ScrollBarExtent)
+        scroll.setFixedWidth(side.maximumWidth() + sb)
+        lay.addWidget(scroll)
 
         self.track_key = None
         self.trail_since = 0.0
