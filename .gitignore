@@ -19,7 +19,7 @@ sdkconfig.old
 __pycache__/
 *.py[cod]
 
-CLAUDE.md
+
 
 bs_reports/
 
