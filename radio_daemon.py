@@ -126,7 +126,7 @@ BEACON_INTERVAL_S          = 1.0
 FORWARD_INTERVAL_S         = 1.0
 PEER_TIMEOUT_S             = 10.0
 BUNDLE_RETRANSMIT_S        = 5.0    # re-send a forwarded-but-unacked bundle to the BS after 5s
-LOCATION_INTERVAL_S        = 5.0    # how often to broadcast own location to neighbors
+LOCATION_INTERVAL_S        = 2.0    # how often to broadcast own location to neighbors (relay_brain.py uses it)
 LOCATION_BUNDLE_INTERVAL_S = 1.0    # default for how often own location goes to the BS (--loc-interval)
 ROVER_STATUS_INTERVAL_S    = 5.0    # how often to send @ROVER_STATUS telemetry toward BS
 STATE_LOG_INTERVAL_S       = 1.0    # how often to write a full state snapshot to the event log
@@ -539,6 +539,8 @@ def unpack_location(data: bytes) -> Optional[Tuple[int, float, float, float]]:
 # routes for rover_nav.py
 NAV_DIR_DEFAULT  = '/tmp/rover_nav'   # route.json (daemon -> node), status.json (node -> daemon)
 NAV_STATUS_FRESH_S = 3.0              # older status.json = rover_nav.py not running
+RELAY_TICK_S       = 2.0                # relay_brain.py decision period
+RELAY_ROUTE_TOL_M  = 0.4                # relay routes simplified like the BS's (route_plan.simplify)
 
 
 class NavBridge:
@@ -556,6 +558,7 @@ class NavBridge:
         self._state_path = state_path
         self.last_cmd = 0
         self._pose_mode: Optional[str] = None
+        self._rb_required: Optional[bool] = None
         try:
             with open(state_path) as f:
                 self.last_cmd = int(json.load(f)['cmd_id'])
@@ -589,6 +592,17 @@ class NavBridge:
                 return None
             out = {'cmd': cmd_id, 'speed': speed, 'pts': pts}
             what = f"route {len(pts)} pts at {speed:g} m/s"
+        return self._hand(out, what)
+
+    def local_route(self, cmd_id: int, speed: float, pts: list) -> str:
+        """A route chosen on the rover itself (relay_brain.py), handed over like a BS route.
+        cmd_id is BS time in ms, so a later route or stop from the BS still overrides it."""
+        cmd_id = max(int(cmd_id), self.last_cmd + 1)
+        return self._hand({'cmd': cmd_id, 'speed': float(speed), 'pts': pts},
+                          f"relay route {len(pts)} pts at {speed:g} m/s")
+
+    def _hand(self, out: dict, what: str) -> str:
+        cmd_id = out['cmd']
         out['received'] = time.time()
         try:
             self._write_json(os.path.join(self.nav_dir, 'route.json'), out)
@@ -608,6 +622,18 @@ class NavBridge:
             return f"could not hand pose mode to rover_nav.py: {e}"
         self._pose_mode = mode
         return f"pose source {mode}"
+
+    def set_rb_required(self, required: bool) -> Optional[str]:
+        """Write rb.json when the BS setting changes (rover_nav.py: RB not required = drive on
+        the mux's Autonomy input, LB still overrides). Returns what was done or None."""
+        if required == self._rb_required:
+            return None
+        try:
+            self._write_json(os.path.join(self.nav_dir, 'rb.json'), {'required': required, 'set': time.time()})
+        except OSError as e:
+            return f"could not hand RB setting to rover_nav.py: {e}"
+        self._rb_required = required
+        return "RB required" if required else "RB NOT required (LB overrides)"
 
     def status(self) -> dict:
         """rover_nav.py's status.json if it is fresh, else {}."""
@@ -845,7 +871,8 @@ class RoverDaemon:
                  loc_interval_s: float = LOCATION_BUNDLE_INTERVAL_S,
                  run_config: Optional[dict] = None,
                  ros_stack: Optional[RosStack] = None,
-                 nav: Optional[NavBridge] = None):
+                 nav: Optional[NavBridge] = None,
+                 relay=None, relay_error: str = ''):
         assert BUNDLE_SIZE == 1052, f"Bundle struct size mismatch: got {BUNDLE_SIZE}, expected 1052"
         assert ACKMAP_SIZE == 42,   f"Ackmap struct size mismatch: got {ACKMAP_SIZE}, expected 42"
 
@@ -868,6 +895,15 @@ class RoverDaemon:
         self._run_config    = run_config or {}
         self._ros           = ros_stack or RosStack(False, os.devnull, '.')
         self._nav           = nav
+        # relay role: relay_brain.RelayDriver (needs --site), switched on/off from the BS
+        self._relay         = relay
+        self._relay_error   = relay_error          # why there is no relay driver
+        self._relay_state   = ''
+        # fleet picture from the BS (control copies, see bs_core._live_fields), newest by BS time
+        self._fleet: Dict[str, list] = {}          # node -> [map x, map y, heading | None, t]
+        self._align: Dict[str, list] = {}          # node -> [x, y, theta deg, t] odometry -> map
+        self._bs_xy: Optional[Tuple[float, float]] = None
+        self._site_name = ''
         # forward loop ticks fast enough to pace the bandwidth budget smoothly
         self._forward_interval_s = (min(FORWARD_INTERVAL_S, 1.0 / self._policy.bw_limit)
                                     if self._policy.bw_limit > 0 else FORWARD_INTERVAL_S)
@@ -1330,6 +1366,7 @@ class RoverDaemon:
         self._locations[node_id] = {
             'lat': lat, 'lon': lon, 'alt': alt,
             'updated_ms': int(time.monotonic() * 1000),
+            'bs_t': FLEET_CLOCK.now(),
         }
         self._log.log('rx_location', peer=node_id, lat=lat, lon=lon, alt=alt)
         print(f"[LOC] node {node_id}: lat={lat:.6f} lon={lon:.6f} alt={alt:.1f}m")
@@ -1389,6 +1426,14 @@ class RoverDaemon:
                 fields['loc'] = nst['loc']                       # rover_nav.py does the fusion
             if nst.get('mode'):
                 fields['pm'] = nst['mode']                       # pose source in use: fused | camera
+            if nst.get('rb') in (0, 1):
+                fields['rb'] = nst['rb']                         # 1 RB required, 0 not (rover_nav.py)
+        if self._relay is not None and self._relay.cfg is not None:
+            # rl state, rm link model, rtx/rty target, rsc/rcu/rdi predicted dBm (target / here /
+            # explorer direct), rea explorer fix age [s]; see relay_brain.RelayDriver.tick
+            fields.update((k, v) for k, v in self._relay.status.items() if k != 'why')
+        elif self._relay_state == 'unavailable':
+            fields['rl'] = 'unavailable'
         self._queue_telemetry(f"@ROVER_STATUS:{self._node_id}:"
                               + ','.join(f"{k}={v}" for k, v in fields.items()))
 
@@ -1643,6 +1688,7 @@ class RoverDaemon:
         origin, version, msg = parsed
         self._counters['rx_control'] += 1
         self._sync_clock(msg)                     # every copy, also repeats of a known version
+        self._merge_fleet(msg)                    # likewise; not part of the versioned state
         msg.pop('t', None)
         msg.pop('hop', None)
         if version <= self._ctrl_version:
@@ -1661,6 +1707,12 @@ class RoverDaemon:
             if result is not None:
                 print(f"[NAV] v{version}: {result}")
                 self._log.log('pose_mode', mode=pose_mode, ctrl_version=version, result=result)
+        if self._nav is not None:
+            # "rb": {"<node>": 0} = RB not required on that rover; no entry = required
+            result = self._nav.set_rb_required((msg.get('rb') or {}).get(str(self._node_id), 1) != 0)
+            if result is not None:
+                print(f"[NAV] v{version}: {result}")
+                self._log.log('rb_setting', ctrl_version=version, result=result)
         nav = (msg.get('nav') or {}).get(str(self._node_id))
         if isinstance(nav, list) and self._nav is not None:
             result = self._nav.on_command(nav)
@@ -1668,6 +1720,7 @@ class RoverDaemon:
                 print(f"[NAV] v{version}: {result} (cmd {nav[0]})")
                 self._log.log('nav_command', cmd_id=nav[0], ctrl_version=version, result=result,
                               route=nav[2] if len(nav) > 2 else None)
+        self._on_relay_setting((msg.get('relay') or {}).get(str(self._node_id)), version)
         if 'state' not in msg:
             return                                # ROS-only control: fleet state unchanged
 
@@ -1696,6 +1749,129 @@ class RoverDaemon:
                 if wait > 0:
                     print(f"[EXP] '{exp}' starts in {wait:.1f}s")
 
+    def _merge_fleet(self, msg: dict) -> None:
+        """Take the fleet / align / bs / site fields off a control copy, keeping per node the
+        entry with the newest BS time (relays carry what they hold, see _relay_control)."""
+        for key, held in (('fleet', self._fleet), ('align', self._align)):
+            for node, entry in (msg.pop(key, None) or {}).items():
+                try:
+                    if len(entry) == 4 and float(entry[3]) > held.get(node, [0, 0, 0, -1.0])[3]:
+                        held[node] = [float(entry[0]), float(entry[1]),
+                                      None if entry[2] is None else float(entry[2]), float(entry[3])]
+                except (TypeError, ValueError):
+                    continue
+        bs = msg.pop('bs', None)
+        if isinstance(bs, list) and len(bs) == 2:
+            self._bs_xy = (float(bs[0]), float(bs[1]))
+        site = msg.pop('site', None)
+        if isinstance(site, str):
+            self._site_name = site
+
+    def _fleet_fields(self) -> dict:
+        out = {}
+        if self._fleet:
+            out['fleet'] = dict(self._fleet)
+        if self._align:
+            out['align'] = dict(self._align)
+        if self._bs_xy is not None:
+            out['bs'] = list(self._bs_xy)
+        if self._site_name:
+            out['site'] = self._site_name
+        return out
+
+    # relay role (relay_brain.py)
+    def _on_relay_setting(self, cfg, version: int) -> None:
+        """BS setting for this rover: [explorer node, speed, ferry_s(, comfort_dbm, gain_db,
+        predict_s(, link model))], or none = relay off."""
+        want = None
+        if isinstance(cfg, list) and len(cfg) in (3, 6, 7):
+            try:
+                want = {'ex': str(cfg[0]), 'speed': float(cfg[1]), 'ferry_s': float(cfg[2])}
+                if len(cfg) >= 6:
+                    want.update(comfort_dbm=float(cfg[3]), gain_db=float(cfg[4]), predict_s=float(cfg[5]))
+                if len(cfg) == 7:
+                    want['model'] = str(cfg[6])
+            except (TypeError, ValueError):
+                want = None
+        if self._relay is None:
+            if want is not None and self._relay_state != 'unavailable':
+                self._relay_state = 'unavailable'
+                print(f"[RELAY] v{version}: the BS asks for relay mode, but {self._relay_error}")
+            elif want is None:
+                self._relay_state = ''
+            return
+        note = self._relay.configure(want)
+        if note:
+            print(f"[RELAY] v{version}: {note}")
+            self._log.log('relay_config', ctrl_version=version, cfg=want, note=note)
+
+    @staticmethod
+    def _to_map(al: list, x: float, y: float) -> Tuple[float, float]:
+        th = math.radians(al[2])
+        return al[0] + math.cos(th) * x - math.sin(th) * y, al[1] + math.sin(th) * x + math.cos(th) * y
+
+    def _own_map_pose(self):
+        """(x, y) of this rover on the map from its odometry + its alignment, or None."""
+        loc, al = self._own_location, self._align.get(str(self._node_id))
+        if al is None or (loc['lat'] == 0.0 and loc['lon'] == 0.0):
+            return None
+        return self._to_map(al, loc['lat'], loc['lon'])
+
+    def _explorer_fix(self, node: str):
+        """Newest explorer position: (BS time, (x, y)) from the BS's fleet field or heard
+        directly (its own location broadcast, put on the map with its alignment)."""
+        best = None
+        f = self._fleet.get(node)
+        if f is not None:
+            best = (f[3], (f[0], f[1]))
+        try:
+            loc = self._locations.get(int(node))
+        except ValueError:
+            loc = None
+        al = self._align.get(node)
+        if (loc is not None and al is not None and 'bs_t' in loc
+                and (loc['lat'] != 0.0 or loc['lon'] != 0.0) and (best is None or loc['bs_t'] > best[0])):
+            best = (loc['bs_t'], self._to_map(al, loc['lat'], loc['lon']))
+        return best
+
+    def _relay_tick(self) -> None:
+        r = self._relay
+        if r is None or r.cfg is None:
+            return
+        me = str(self._node_id)
+        if self._site_name and self._site_name != r.site_name:
+            r.status = {'rl': 'wrong_site'}
+            return
+        nav_state = (self._nav.status().get('nav') if self._nav is not None else None) or 'no_node'
+        try:
+            route = r.tick(FLEET_CLOCK.now(), self._own_map_pose(), self._explorer_fix(r.cfg['ex']),
+                           self._bs_xy, nav_state)
+        except Exception as e:                    # never take the radio daemon down
+            r.status = {'rl': 'error'}
+            print(f"[RELAY] error: {type(e).__name__}: {e}")
+            self._log.log('relay_error', error=f"{type(e).__name__}: {e}")
+            return
+        if r.status.get('rl') == 'no_pose' and me not in self._align:
+            r.status['rl'] = 'no_align'
+        state = r.status.get('rl')
+        why = r.status.get('why') or r.why
+        if state != self._relay_state:
+            self._relay_state = state
+            print(f"[RELAY] {state}" + (f": {why}" if why else ""))
+            self._log.log('relay_state', state=state, why=why,
+                          **{k: v for k, v in r.status.items() if k not in ('rl', 'why')})
+        if route is None or self._nav is None:
+            return
+        import route_plan                          # numpy: only loaded with a relay driver
+        al = self._align[me]
+        odom = route_plan.simplify(route_plan.to_odom({'x': al[0], 'y': al[1], 'theta': al[2]}, route),
+                                   RELAY_ROUTE_TOL_M)
+        pts = [[round(float(x), 2), round(float(y), 2)] for x, y in odom]
+        result = self._nav.local_route(int(FLEET_CLOCK.now() * 1000), r.cfg['speed'], pts)
+        print(f"[RELAY] {result} to ({r.status.get('rtx')}, {r.status.get('rty')}): {why}")
+        self._log.log('relay_route', result=result, target=[r.status.get('rtx'), r.status.get('rty')],
+                      why=why, n_pts=len(pts), route_odom=pts)
+
     def _on_ros_command(self, want: str, cmd_id: int, version: int) -> None:
         result = self._ros.on_command(want, cmd_id)
         if result is None:
@@ -1720,6 +1896,7 @@ class RoverDaemon:
         if self._ctrl_msg is None:
             return
         origin, msg = self._ctrl_msg
+        msg = dict(msg, **self._fleet_fields())
         if FLEET_CLOCK.synced:
             msg = dict(msg, t=round(FLEET_CLOCK.now(), 3), hop=FLEET_CLOCK.hop + 1)
         self._air_tx(pack_control(self._ctrl_version, msg, origin), 'control',
@@ -1801,6 +1978,8 @@ class RoverDaemon:
               + (f" | ros:{self._ros.status()}" if self._ros.enabled else "")
               + (self._fusion_status() if self._fusion is not None else "")
               + (self._nav_status() if self._nav is not None else "")
+              + (f" | relay:{self._relay.status.get('rl')}" if self._relay is not None
+                 and self._relay.cfg is not None else "")
               + f" | peers {peers}")
 
     def _nav_status(self) -> str:
@@ -1871,6 +2050,7 @@ class RoverDaemon:
         last_console_status  = time.monotonic()
         last_ctrl_relay      = time.monotonic()
         last_ros_check       = 0.0
+        last_relay           = 0.0
 
         while True:
             self._check_pending_start()
@@ -1944,6 +2124,9 @@ class RoverDaemon:
                 for note in self._ros.tick():
                     print(f"[ROS] {note}")
                     self._log.log('ros_stack', note=note)
+            if self._relay is not None and (mono - last_relay) >= RELAY_TICK_S:
+                last_relay = mono
+                self._relay_tick()
             if (mono - last_console_status) >= 5.0:
                 last_console_status = mono
                 self._print_status()
@@ -2213,6 +2396,15 @@ def main():
     parser.add_argument('--nav-dir', default=NAV_DIR_DEFAULT,
                         help='Folder shared with rover_nav.py: route.json (routes from the BS) and '
                              'status.json (its progress)')
+    rl = parser.add_argument_group('relay role (relay_brain.py; needs numpy)')
+    rl.add_argument('--site', help='Site name (e.g. fountain): enables the relay role, switched on '
+                                   'from the dashboard')
+    rl.add_argument('--terrain-dir', help='Folder with <site>_meta.json, _drivable.npy, ... '
+                                          '(default: terrain/ or ../terrain/ next to this script)')
+    rl.add_argument('--linktab', action='append', default=None, metavar='NPZ',
+                    help='Link table <site>_linktab_<model>.npz (repeatable). Default: every '
+                         '<site>_linktab_*.npz in the terrain folder; the dashboard picks one per relay '
+                         '(distance model always available)')
     parser.add_argument('--ros-control', action='store_true',
                         help='Let the BS start/stop the ROS stack (' + ' '.join(ROS_STACK_CMD) + '). '
                              'Linux only; needs the ROS environment sourced')
@@ -2244,6 +2436,23 @@ def main():
 
     signal.signal(signal.SIGTERM, _sigterm)
 
+    relay, relay_error = None, 'radio_daemon.py was started without --site'
+    if args.site:
+        try:
+            import relay_brain
+            import site_map
+            tdir = site_map.find_terrain_dir(args.terrain_dir)
+            if tdir is None:
+                raise RuntimeError('terrain directory not found (use --terrain-dir)')
+            site = site_map.Site(tdir, args.site)
+            tables = args.linktab if args.linktab else relay_brain.find_tables(tdir, args.site)
+            relay = relay_brain.RelayDriver(site, relay_brain.load_models(site, tables))
+            print(f"[INIT] Relay role available: site {args.site}, link models "
+                  f"{', '.join(relay.models)} (default {relay.default_model})")
+        except Exception as e:                    # ImportError (no numpy), missing files, ...
+            relay_error = f"relay role unavailable: {type(e).__name__}: {e}"
+            print(f"[INIT] {relay_error}")
+
     daemon = RoverDaemon(
         serial_port=args.serial,
         baud=args.baud,
@@ -2268,6 +2477,7 @@ def main():
         ros_stack=RosStack(args.ros_control,
                            state_path=os.path.join(args.log_dir, 'ros_control_state.json'),
                            log_dir=args.log_dir),
+        relay=relay, relay_error=relay_error,
     )
     if args.mode == 'active':
         daemon.start_on_connect(args.run_tag or 'cli')

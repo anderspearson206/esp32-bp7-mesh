@@ -138,9 +138,10 @@ class Site:
     def xy_to_rc(self, x, y):
         """Arrays in, arrays out; cells outside the grid get -1."""
         x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
-        c = np.floor((x + self.half) / self.cell).astype(int)
-        r = np.floor((self.half - y) / self.cell).astype(int)
-        bad = (r < 0) | (r >= self.size) | (c < 0) | (c >= self.size)
+        nan = ~(np.isfinite(x) & np.isfinite(y))                 # NaN/inf points -> -1, no cast warning
+        c = np.floor((np.where(nan, -1e9, x) + self.half) / self.cell).astype(int)
+        r = np.floor((self.half - np.where(nan, -1e9, y)) / self.cell).astype(int)
+        bad = nan | (r < 0) | (r >= self.size) | (c < 0) | (c >= self.size)
         return np.where(bad, -1, r), np.where(bad, -1, c)
 
     def sample(self, arr: Optional[np.ndarray], x, y):
@@ -201,12 +202,19 @@ def solve_alignment(ox: float, oy: float, oyaw: Optional[float],
                     mx: float, my: float, mheading: Optional[float], keep_theta: float) -> dict:
     """Alignment that puts odometry pose (ox, oy, oyaw) at map pose (mx, my, mheading).
     Without a heading (plain click, or no yaw from the rover) the current rotation is kept."""
-    theta = keep_theta
-    if mheading is not None and oyaw is not None:
+    theta = keep_theta if math.isfinite(keep_theta) else 0.0
+    if mheading is not None and oyaw is not None and math.isfinite(oyaw):
         theta = (mheading - oyaw + 180.0) % 360.0 - 180.0
     th = math.radians(theta)
     c, s = math.cos(th), math.sin(th)
     return {'x': mx - (c * ox - s * oy), 'y': my - (s * ox + c * oy), 'theta': theta}
+
+
+def finite_alignment(al: dict) -> bool:
+    try:
+        return all(math.isfinite(float(al.get(k, IDENTITY[k]))) for k in IDENTITY)
+    except (TypeError, ValueError):
+        return False
 
 
 class AlignmentStore:
@@ -220,11 +228,19 @@ class AlignmentStore:
                 self.data = {k: dict(IDENTITY, **v) for k, v in json.load(f).items()}
         except (OSError, ValueError):
             pass
+        # a NaN alignment (saved by older code from a rover with no yaw) would hide the rover and
+        # flood the console with warnings: drop it, the rover needs placing again
+        for k in [k for k, v in self.data.items() if not finite_alignment(v)]:
+            print(f"[MAP] ignoring saved alignment of {k} (not finite); place it on the map again")
+            del self.data[k]
 
     def get(self, node: str) -> dict:
         return dict(self.data.get(node, IDENTITY))
 
     def set(self, node: str, al: dict) -> None:
+        if not finite_alignment(al):
+            print(f"[MAP] refusing non-finite alignment for {node}: {al}")
+            return
         self.data[node] = {k: float(al.get(k, IDENTITY[k])) for k in IDENTITY}
         if 'anchor' in al:
             self.data[node]['anchor'] = [float(v) for v in al['anchor']]

@@ -62,7 +62,10 @@ CONFIG_DEFAULTS = {        # same keys/meaning as the radio_daemon.py CLI option
     'comms_on': 0.0, 'comms_off': 0.0, 'comms_phase': 0.0, 'payload_bytes': 0,
     'loc_interval': 1.0,
 }
-CONTROL_MAX_JSON  = 1400   # control JSON bytes per air frame (ESP-NOW v2: 1470 incl. headers)
+# control JSON bytes per air frame. ESP-NOW v2 would carry 1470, but the firmware drops serial
+# frames over HOST_MAX_PAYLOAD (1100): a rover's ESP32 hands it on as [mac 6][rssi 1][air], and the
+# air frame has a 7-byte control header, so 1100 - 7 - 7.
+CONTROL_MAX_JSON  = 1086
 ROUTE_TOLERANCES  = (0.4, 0.6, 0.8, 1.0)   # simplification tried in turn until the route fits [m]
 ROUTE_SPEED_MAX   = 1.0    # m/s; rover_nav.py caps it again
 TRACK_MAX        = 20000   # location samples kept per rover for the map
@@ -144,6 +147,13 @@ class BSCore:
         self.nav_cmds: Dict[str, list] = {}
         self.routes: Dict[str, dict] = {}     # node -> {'cmd', 'speed', 'map': [[x, y], ...]} for the map
         self.pose_modes: Dict[str, str] = {}  # node -> "fused" | "camera" (rover_nav.py pose source)
+        # rovers whose rover_nav.py drives without RB held (mux Autonomy input, LB overrides)
+        self.rb_off: Dict[str, int] = {}      # node -> 0, carried as "rb" on every control msg
+        # node -> [explorer node, speed m/s, ferry_s, comfort dBm, gain dB, look-ahead s, link model]:
+        # that rover acts as a relay (relay_brain.py)
+        self.relay_cfg: Dict[str, list] = {}
+        # BS time each alignment was last set: rovers keep the newest copy (see _live_fields)
+        self.align_ts: Dict[str, float] = {n: time.time() for n in self.alignments.data}
         self._planner = None                  # route_plan.Planner, built on first use
 
         self.session_dir = ''
@@ -517,6 +527,10 @@ class BSCore:
         node, x, y, z = parts[1], float(parts[2]), float(parts[3]), float(parts[4])
         rssi = int(parts[5]) if len(parts) >= 6 and parts[5] else None
         yaw = float(parts[6]) if len(parts) >= 7 and parts[6] else None
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return                               # rover pose not ready (NaN): keep the last good one
+        if yaw is not None and not math.isfinite(yaw):
+            yaw = None
         self.locations[node] = {'x': x, 'y': y, 'z': z, 'yaw': yaw, 'rssi': rssi, 'updated_at': now}
         if x == 0.0 and y == 0.0:
             return                                # no location source on that rover
@@ -537,7 +551,11 @@ class BSCore:
         """Store a rover's odometry -> map alignment (see site_map.py) and log the change."""
         now = time.time()
         with self.lock:
+            if not site_map.finite_alignment(al):
+                self._event('map', f"{node}: alignment not set (not finite: no pose/heading from the rover?)")
+                return
             self.alignments.set(node, al)
+            self.align_ts[node] = now
             a = self.alignments.get(node)
             self._log_serial(f"#ALIGN:{node}:{a['x']:.3f}:{a['y']:.3f}:{a['theta']:.2f}:{note}")
             self._csv('alignments.csv', ALIGN_HEADER,
@@ -729,7 +747,7 @@ class BSCore:
         # every copy carries the BS time: rovers run experiment starts and radio windows on it
         # (FleetClock in radio_daemon.py), so their own clocks don't need NTP. Before any fleet
         # state exists a time-only message goes out as version 0, which rovers never adopt.
-        msg = dict(msg or {}, t=round(time.time(), 3), hop=0)
+        msg = dict(msg or {}, **self._live_fields(), t=round(time.time(), 3), hop=0)
         air = (struct.pack('<BHI', PKT_TYPE_CONTROL, BS_NODE_ID, self.control['version'] & 0xFFFFFFFF)
                + json.dumps(msg, separators=(',', ':')).encode())
         try:
@@ -741,6 +759,38 @@ class BSCore:
             with self.lock:
                 self._event('warn', f"control send failed: {e}")
             return False
+
+    def _live_fields(self) -> dict:
+        """Fleet picture added to every control copy (not versioned, never logged as a change):
+            fleet  {node: [map x, map y, heading deg | null, BS time of that fix]}
+            align  {node: [x, y, theta deg, BS time it was set]}   odometry -> map, site_map.py
+            bs     [map x, map y] of the BS, site  the site name
+        Relays carry the newest entries they have (by time), so a relay rover knows where the
+        explorer is even when it can't hear it directly."""
+        out = {}
+        with self.lock:
+            fleet = {}
+            for n, loc in self.locations.items():
+                pose = self.map_pose(n)
+                if pose is None or not all(math.isfinite(v) for v in pose[:2]):
+                    continue
+                yaw = round(pose[2]) if pose[2] is not None and math.isfinite(pose[2]) else None
+                fleet[n] = [round(pose[0], 1), round(pose[1], 1), yaw, round(loc['updated_at'], 1)]
+            align = {}
+            for n in self.alignments.data:
+                a = self.alignments.get(n)
+                vals = [a['x'], a['y'], a['theta']]
+                if all(math.isfinite(v) for v in vals):
+                    align[n] = [round(vals[0], 2), round(vals[1], 2), round(vals[2], 1),
+                                int(self.align_ts.get(n, 0))]
+            if fleet:
+                out['fleet'] = fleet
+            if align:
+                out['align'] = align
+            if self.site is not None and self.site.tx_xy is not None:
+                out['bs'] = [round(self.site.tx_xy[0], 1), round(self.site.tx_xy[1], 1)]
+                out['site'] = self.site.name
+        return out
 
     def _maybe_send_control(self, now: float) -> None:
         if now - self.control['last_tx'] >= CONTROL_PERIOD_S:
@@ -756,6 +806,10 @@ class BSCore:
                 msg = dict(msg, nav={n: list(c) for n, c in self.nav_cmds.items()})
             if self.pose_modes:
                 msg = dict(msg, pose=dict(self.pose_modes))
+            if self.relay_cfg:
+                msg = dict(msg, relay={n: list(c) for n, c in self.relay_cfg.items()})
+            if self.rb_off:
+                msg = dict(msg, rb=dict(self.rb_off))
             self.control['version'] = max(int(time.time()), self.control['version'] + 1)
             self.control['msg'] = msg
             self.control['sent_at'] = time.time()
@@ -808,7 +862,7 @@ class BSCore:
 
     def _base_msg(self) -> dict:
         """Current fleet state without the per-rover command fields (_set_control adds them)."""
-        return {k: v for k, v in (self.control['msg'] or {}).items() if k not in ('ros', 'nav', 'pose')}
+        return {k: v for k, v in (self.control['msg'] or {}).items() if k not in ('ros', 'nav', 'pose', 'relay', 'rb')}
 
     def set_pose_mode(self, node: str, mode: str) -> None:
         """Pose source of rover_nav.py on a rover: 'fused' (wheel distance + T265 heading) or
@@ -819,7 +873,18 @@ class BSCore:
             self.pose_modes[node] = mode
         self._set_control(self._base_msg(), f"pose source {mode}: {node}")
 
-    # routes (rover_nav.py on the rover drives them; RB on its controller must be held)
+    def set_rb_required(self, node: str, required: bool) -> None:
+        """Whether rover_nav.py on a rover needs RB held to drive. Off: it drives on the mux's
+        Autonomy input (above teleop) while its controller is connected; LB still overrides.
+        A setting, carried on every control message."""
+        with self.lock:
+            if required:
+                self.rb_off.pop(node, None)
+            else:
+                self.rb_off[node] = 0
+        self._set_control(self._base_msg(), f"RB {'required' if required else 'NOT required'}: {node}")
+
+    # routes (rover_nav.py on the rover drives them; RB on its controller must be held unless rb_off)
     def plan_route(self, node: str, waypoints: List[List[float]]):
         """A* route (map metres) from the rover's current map position through the waypoints.
         Returns (Nx2 points or None, error text)."""
@@ -851,13 +916,17 @@ class BSCore:
                 keep = route_plan.simplify(odom, tol)
                 cmd = [cmd_id, speed, route_plan.encode(keep)]
                 trial = dict(self._base_msg(), ros={n: list(c) for n, c in self.ros_cmds.items()},
-                             nav=dict(others, **{node: cmd}), pose=dict(self.pose_modes), t=0.0, hop=0)
+                             nav=dict(others, **{node: cmd}), pose=dict(self.pose_modes),
+                             relay={n: list(c) for n, c in self.relay_cfg.items() if n != node},
+                             rb=dict(self.rb_off),
+                             **self._live_fields(), t=0.0, hop=0)
                 if len(json.dumps(trial, separators=(',', ':'))) <= CONTROL_MAX_JSON:
                     break
             else:
                 return (f"route too long for one control message ({len(keep)} points at "
                         f"{tol} m); use fewer or closer waypoints")
             self.nav_cmds[node] = cmd
+            self.relay_cfg.pop(node, None)        # a hand-sent route takes over from the relay
             keep_map = route_plan.simplify(pts_map, tol)
             self.routes[node] = {'cmd': cmd_id, 'speed': speed, 'map': keep_map.tolist(), 'sent': time.time()}
             self._csv('routes.csv', ['time', 'epoch', 'node', 'cmd_id', 'action', 'speed', 'length_m',
@@ -870,14 +939,55 @@ class BSCore:
         return ''
 
     def stop_route(self, node: str) -> None:
+        self.stop_routes([node])
+
+    def stop_routes(self, nodes, what: str = 'stop route') -> None:
+        """Cancel the routes of these rovers and turn their relays off, in one control message."""
+        nodes = sorted({str(n) for n in nodes if n})
+        if not nodes:
+            return
+        relays_off = []
         with self.lock:
-            cmd_id = self._cmd_id()
-            self.nav_cmds[node] = [cmd_id, 'stop']
+            for node in nodes:
+                self._stop_locked(node)
+                if self.relay_cfg.pop(node, None) is not None:
+                    relays_off.append(node)
+        self._set_control(self._base_msg(), f"{what}: {', '.join(nodes)}"
+                          + (f" (relay off: {', '.join(relays_off)})" if relays_off else ""))
+
+    def _stop_locked(self, node: str) -> None:
+        cmd_id = self._cmd_id()
+        self.nav_cmds[node] = [cmd_id, 'stop']
+        self.routes.pop(node, None)
+        self._csv('routes.csv', ['time', 'epoch', 'node', 'cmd_id', 'action', 'speed', 'length_m',
+                                 'points', 'tolerance_m', 'map_xy', 'odom_dm'],
+                  [_ts(time.time()), f"{time.time():.3f}", node, cmd_id, 'stop', '', '', '', '', '', ''])
+
+    # relay role (relay_brain.py in the rover's radio_daemon.py, which needs --site)
+    def set_relay(self, node: str, explorer: str, speed: float, ferry_s: float,
+                  comfort_dbm: float = -75.0, gain_db: float = 6.0, predict_s: float = 4.0,
+                  model: str = 'nn_pmnet') -> str:
+        """Make a rover keep itself between the BS and the explorer (or change its settings:
+        same explorer = no reset on the rover). Returns '' or why not. The tuning values are
+        relay_brain.DEFAULTS comfort_dbm / gain_db / predict_s; model = link table key on the
+        rover (nn_pmnet, nn) or 'distance'."""
+        if not node or not explorer or node == explorer:
+            return "pick a relay rover and a different explorer rover"
+        speed = round(min(max(float(speed), 0.1), ROUTE_SPEED_MAX), 2)
+        cfg = [str(explorer), speed, round(float(ferry_s), 1), round(float(comfort_dbm), 1),
+               round(float(gain_db), 1), round(float(predict_s), 1), str(model)]
+        with self.lock:
+            self.relay_cfg[node] = cfg
             self.routes.pop(node, None)
-            self._csv('routes.csv', ['time', 'epoch', 'node', 'cmd_id', 'action', 'speed', 'length_m',
-                                     'points', 'tolerance_m', 'map_xy', 'odom_dm'],
-                      [_ts(time.time()), f"{time.time():.3f}", node, cmd_id, 'stop', '', '', '', '', '', ''])
-        self._set_control(self._base_msg(), f"stop route: {node}")
+            # the explorer is driven by hand: if it was itself a relay (e.g. roles swapped), stop it
+            swapped = self.relay_cfg.pop(str(explorer), None) is not None
+            if swapped:
+                self._stop_locked(str(explorer))
+        self._set_control(self._base_msg(), f"relay on: {node} for explorer {explorer} at {speed:g} m/s, "
+                                            f"ferry after {cfg[2]:g} s, comfort {cfg[3]:g} dBm, "
+                                            f"gain {cfg[4]:g} dB, look-ahead {cfg[5]:g} s, model {cfg[6]}"
+                                            + (f" (relay on {explorer} stopped)" if swapped else ""))
+        return ''
 
     def add_marker(self, label: str = '') -> str:
         now = time.time()
@@ -961,6 +1071,8 @@ class BSCore:
                 'locations': {n: dict(v) for n, v in self.locations.items()},
                 'alignments': {n: self.alignments.get(n) for n in self.locations},
                 'routes': {n: dict(r) for n, r in self.routes.items()},
+                'relay_cfg': {n: list(c) for n, c in self.relay_cfg.items()},
+                'rb_off': dict(self.rb_off),
                 'bs': dict(self._bs_position() or {}, rm_version=self.rm_version, rm_job=dict(self.rm_job)),
                 'events': [e for e in self.events if e[0] > since_event],
                 'n_delivered': len(self.delivered),

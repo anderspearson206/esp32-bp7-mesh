@@ -30,7 +30,7 @@ def clearance(drivable: np.ndarray, max_cells: int) -> np.ndarray:
     clr = np.zeros(drivable.shape, np.int32)
     cur = drivable.copy()
     for k in range(1, max_cells + 1):
-        p = np.pad(cur, 1, constant_values=False)
+        p = np.pad(cur, 1, mode='constant', constant_values=False)   # mode: numpy < 1.17 (Jetson)
         er = cur.copy()
         for dr in (-1, 0, 1):
             for dc in (-1, 0, 1):

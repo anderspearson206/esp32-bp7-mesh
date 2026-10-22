@@ -19,14 +19,24 @@ rover_nav.py - ROS node on the rover: fused odometry + following routes sent fro
 Safety: it only drives while RB (~rb_button) is held on the controller and its joystick
 messages are fresh, the T265 heading is live (not wheel-only) and the wheel odometry is
 fresh. Releasing RB or losing the controller stops it; LB (manual teleop) always overrides
-in the mux. It also stops for good at the end of the route, if it ends up more than ~max_xte
+in the mux.
+
+RB not required (dashboard setting; radio_daemon.py writes <nav_dir>/rb.json {"required":
+false}, /tmp, so a reboot requires RB again): joy_teleop's idle zero on input/teleop
+(priority 5) would block input/navigation, so commands go to ~auto_topic instead, an extra
+mux input above teleop (ackermann_cmd_mux/param/mux.yaml: "Autonomy", input/autonomy,
+priority 6, timeout 0.2). The controller must still be connected (fresh joystick messages,
+else it stops) and holding LB (~lb_button) silences this node, so the mux falls back to
+manual teleop within its 0.2 s timeout. It also stops for good at the end of the route, if it ends up more than ~max_xte
 from the route, or when the BS sends a stop. A route that was already in route.json when
 the node started is never driven (no replay after a stack restart).
 
 Progress goes to <nav_dir>/status.json for radio_daemon.py:
     {"t", "nav", "cmd", "ni", "np", "xte", "loc", "mode"}
-    nav: idle | hold_rb | no_t265 | no_wheels | following | done | stopped_off_route | stopped_bs
+    nav: idle | hold_rb | no_joy | manual | no_t265 | no_wheels | following | done |
+         stopped_off_route | stopped_bs      (no_joy / manual: RB not required, see above)
     loc: fused | wheel | wait (fused mode), camera | no_t265 (camera mode)
+    rb:  1 = RB required, 0 = not
 
 Python 2 (ROS Melodic rospy) and 3. Needs odom_fusion.py next to it.
 """
@@ -109,9 +119,11 @@ class RoverNav(object):
         self.wheel_topic = p('~wheel_topic', '/car/vesc/odom')
         self.joy_topic = p('~joy_topic', '/car/teleop/joy')
         self.cmd_topic = p('~cmd_topic', '/car/mux/ackermann_cmd_mux/input/navigation')
+        self.auto_topic = p('~auto_topic', '/car/mux/ackermann_cmd_mux/input/autonomy')
         self.fused_topic = p('~fused_topic', '/car/fused_odom')
         self.nav_dir = p('~nav_dir', '/tmp/rover_nav')
         self.rb_button = int(p('~rb_button', 5))
+        self.lb_button = int(p('~lb_button', 4))
         self.joy_timeout = float(p('~joy_timeout', 0.3))
         self.wheel_timeout = float(p('~wheel_timeout', 0.5))
         self.wheelbase = float(p('~wheelbase', 0.225))   # racecar-uw-nano vesc.yaml
@@ -130,7 +142,9 @@ class RoverNav(object):
         self.mode = mode if mode in MODES else 'fused'
         self._anchor = (0.0, 0.0, 0.0)             # output = rotate(src, a[0] deg) + (a[1], a[2])
         self._pose_mtime = None
-        self.joy_t, self.rb = 0.0, False
+        self.joy_t, self.rb, self.lb = 0.0, False, False
+        self.rb_required = True
+        self._rb_mtime = None
         self.route = None
         self.state = 'idle'
         self.seen_cmd = self._route_file_cmd()     # never drive a route left over from before
@@ -141,11 +155,13 @@ class RoverNav(object):
             os.makedirs(self.nav_dir)
 
         self.cmd_pub = rospy.Publisher(self.cmd_topic, AckermannDriveStamped, queue_size=1)
+        self.auto_pub = rospy.Publisher(self.auto_topic, AckermannDriveStamped, queue_size=1)
         self.odom_pub = rospy.Publisher(self.fused_topic, Odometry, queue_size=5)
         rospy.Subscriber(self.loc_topic, Odometry, self._on_t265, queue_size=10)
         rospy.Subscriber(self.wheel_topic, Odometry, self._on_wheel, queue_size=10)
         rospy.Subscriber(self.joy_topic, Joy, self._on_joy, queue_size=5)
         self._poll_pose_mode()
+        self._poll_rb()
         rospy.loginfo("rover_nav: pose %s (fused = %s distance + %s heading) -> %s; routes from %s; "
                       "drives only while button %d is held", self.mode,
                       self.wheel_topic, self.loc_topic, self.fused_topic, self.nav_dir, self.rb_button)
@@ -212,6 +228,28 @@ class RoverNav(object):
         except (IOError, OSError, ValueError, KeyError, TypeError):
             return
 
+    def _poll_rb(self):
+        path = os.path.join(self.nav_dir, 'rb.json')
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = None
+        if mtime == self._rb_mtime:
+            return
+        self._rb_mtime = mtime
+        required = True                            # no file (e.g. after a reboot) = RB required
+        if mtime is not None:
+            try:
+                with open(path) as f:
+                    required = bool(json.load(f).get('required', True))
+            except (IOError, OSError, ValueError, AttributeError):
+                required = True
+        if required != self.rb_required:
+            self.rb_required = required
+            self._last_status = 0.0
+            rospy.logwarn("rover_nav: RB %s", "required again" if required else
+                          "NOT required: driving on %s, hold LB to take over" % self.auto_topic)
+
     def _publish_pose(self, _event):
         p = self.pose()
         if p is None:
@@ -228,6 +266,7 @@ class RoverNav(object):
     def _on_joy(self, msg):
         self.joy_t = time.time()
         self.rb = len(msg.buttons) > self.rb_button and msg.buttons[self.rb_button] == 1
+        self.lb = len(msg.buttons) > self.lb_button and msg.buttons[self.lb_button] == 1
 
     # route file
     def _route_file_cmd(self):
@@ -267,8 +306,9 @@ class RoverNav(object):
             rospy.logwarn("rover_nav: bad route in %s: %s", path, e)
             return
         self.state = 'hold_rb'
-        rospy.loginfo("rover_nav: new route cmd %d: %d points, %.1f m at %.2f m/s - hold RB to drive",
-                      cmd, len(r['pts']), self.route.length, speed)
+        rospy.loginfo("rover_nav: new route cmd %d: %d points, %.1f m at %.2f m/s - %s",
+                      cmd, len(r['pts']), self.route.length, speed,
+                      "hold RB to drive" if self.rb_required else "driving (RB not required, LB overrides)")
 
     def _finish(self, state):
         self.state = state
@@ -283,13 +323,20 @@ class RoverNav(object):
         cmd.header.stamp = rospy.Time.now()
         cmd.drive.speed = speed
         cmd.drive.steering_angle = steer
-        self.cmd_pub.publish(cmd)
+        if self.rb_required:
+            self.cmd_pub.publish(cmd)
+        elif not (self.lb and time.time() - self.joy_t <= self.joy_timeout):
+            # above teleop in the mux: silent while LB is held, so manual takes over
+            self.auto_pub.publish(cmd)
 
     def _tick(self, _event):
         now = time.time()
         self._poll_pose_mode()
         self._poll_route()
-        rb = self.rb and now - self.joy_t <= self.joy_timeout
+        self._poll_rb()
+        joy_ok = now - self.joy_t <= self.joy_timeout
+        rb = self.rb and joy_ok
+        go = rb if self.rb_required else (joy_ok and not self.lb)
         src = self.source(now)
         wheel_age = self.fusion.wheel_age(now)
         r = self.route
@@ -297,7 +344,7 @@ class RoverNav(object):
         if not active:
             # hold still while RB is held or just after a route ended; otherwise stay silent so
             # another navigation source (the OPTIONS planner) isn't fought on the same input
-            if rb or now < self._zero_until:
+            if (self.rb_required and rb) or now < self._zero_until:
                 self._publish(0.0, 0.0)
             self._write_status(now, src)
             return
@@ -308,8 +355,8 @@ class RoverNav(object):
         # gates: anything wrong -> explicit zero on the navigation input. Doesn't rely on the
         # mux timing out (with RB released teleop's own zero wins anyway; with the controller
         # gone nothing else would be commanding).
-        if not rb:
-            self.state = 'hold_rb'
+        if not go:
+            self.state = ('hold_rb' if self.rb_required else 'manual' if joy_ok else 'no_joy')
         elif wheel_age is None or wheel_age > self.wheel_timeout:
             self.state = 'no_wheels'
         elif src not in ('fused', 'camera') or hdg is None:
@@ -347,7 +394,7 @@ class RoverNav(object):
         self._last_status = now
         r = self.route
         st = {'t': now, 'nav': self.state, 'loc': src, 'mode': self.mode,
-              'cmd': r.cmd if r else self.seen_cmd}
+              'cmd': r.cmd if r else self.seen_cmd, 'rb': 1 if self.rb_required else 0}
         if r is not None:
             st.update(ni=r.s[r.idx], np=r.length, xte=r.xte)
         tmp = os.path.join(self.nav_dir, 'status.json.tmp')

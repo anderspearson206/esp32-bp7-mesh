@@ -25,3 +25,8 @@ bs_reports/
 
 
 rover_logs/
+
+# Colab radio-map bundles (rm_colab_bundle.py)
+rm_colab_*.zip
+# relay link tables (rm_linktab_colab.ipynb output; keep in ../terrain)
+*_linktab_*.npz

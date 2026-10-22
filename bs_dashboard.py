@@ -21,6 +21,7 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import bs_core
+import relay_brain
 import route_plan
 import site_map
 from bs_core import BSCore, BS_NODE_ID
@@ -387,6 +388,10 @@ class Dashboard(QtWidgets.QMainWindow):
         self.p_map.addItem(self.anchor_marks)
         self.align_preview = self.p_map.plot([], [], pen=pg.mkPen('#d81b60', width=3))
         self.route_lines = {}                 # node -> route the rover was sent
+        # relay rovers' current targets (relay_brain.py, from their @ROVER_STATUS rtx/rty)
+        self.relay_marks = pg.ScatterPlotItem(size=17, symbol='d', pen=pg.mkPen('k', width=1.5))
+        self.relay_marks.setZValue(9)
+        self.p_map.addItem(self.relay_marks)
         self.route_preview = self.p_map.plot([], [], pen=pg.mkPen('#ff6f00', width=3, style=QtCore.Qt.DashLine))
         self.wp_marks = pg.ScatterPlotItem(size=13, symbol='o', brush=pg.mkBrush('#ff6f00'),
                                            pen=pg.mkPen('k', width=1.2))
@@ -530,6 +535,7 @@ class Dashboard(QtWidgets.QMainWindow):
         al.addWidget(self.align_label)
         sl.addWidget(ab)
         sl.addWidget(self._build_route_box())
+        sl.addWidget(self._build_relay_box())
         sl.addWidget(self.hover_label)
         sl.addStretch(1)
         # scrolls instead of growing past short (laptop) screens as the wrapped labels change
@@ -586,12 +592,107 @@ class Dashboard(QtWidgets.QMainWindow):
         stop.clicked.connect(self.on_stop_route)
         row.addWidget(stop)
         rl.addLayout(row)
+        stop_all = QtWidgets.QPushButton("STOP ALL rovers (routes + relays)")
+        stop_all.setStyleSheet("background: #c62828; color: white; font-weight: bold;")
+        stop_all.setToolTip("Cancel every rover's route and turn every relay off (only reaches rovers in "
+                            "radio range; unplugging the motor battery always works)")
+        stop_all.clicked.connect(self.on_stop_all)
+        rl.addWidget(stop_all)
+        self.rb_check = QtWidgets.QCheckBox("Drive without RB (LB still overrides)")
+        self.rb_check.setToolTip(
+            "Selected rover: rover_nav.py drives routes and the relay without RB held, on an extra mux "
+            "input above teleop. Its controller must stay connected (it stops if the controller drops); "
+            "holding LB takes over. Shows what the rover reports. Needs the Autonomy input in mux.yaml.")
+        self.rb_check.clicked.connect(self.on_rb_toggled)
+        rl.addWidget(self.rb_check)
         self.route_label = QtWidgets.QLabel()
         self.route_label.setWordWrap(True)
         self.route_label.setTextFormat(QtCore.Qt.RichText)
         rl.addWidget(self.route_label)
         rb.setEnabled(self.site is not None and self.site.drivable is not None)
         return rb
+
+    def _build_relay_box(self) -> QtWidgets.QGroupBox:
+        b = QtWidgets.QGroupBox("Relay (rover selected above)")
+        lay = QtWidgets.QVBoxLayout(b)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Explorer"))
+        self.relay_explorer = QtWidgets.QComboBox()
+        self.relay_explorer.setToolTip("The rover to keep linked to the BS")
+        row.addWidget(self.relay_explorer, 1)
+        row.addWidget(QtWidgets.QLabel("Ferry after"))
+        self.relay_ferry = QtWidgets.QSpinBox()
+        self.relay_ferry.setRange(0, 600)
+        self.relay_ferry.setValue(15)
+        self.relay_ferry.setSuffix(" s")
+        self.relay_ferry.setToolTip("When the explorer has been silent for 10 s plus this long, the relay "
+                                    "drives to its last known position until it is heard again")
+        row.addWidget(self.relay_ferry)
+        lay.addLayout(row)
+        grid = QtWidgets.QGridLayout()
+        self.relay_comfort = QtWidgets.QDoubleSpinBox()
+        self.relay_comfort.setRange(-100.0, -40.0)
+        self.relay_comfort.setSingleStep(1.0)
+        self.relay_comfort.setDecimals(0)
+        self.relay_comfort.setValue(relay_brain.DEFAULTS['comfort_dbm'])
+        self.relay_comfort.setSuffix(" dBm")
+        self.relay_comfort.setToolTip("Weaker link at or above this = the relay is fine where it is. Below it, "
+                                      "a spot just 2 dB better is worth moving for")
+        self.relay_gain = QtWidgets.QDoubleSpinBox()
+        self.relay_gain.setRange(1.0, 30.0)
+        self.relay_gain.setDecimals(0)
+        self.relay_gain.setValue(relay_brain.DEFAULTS['gain_db'])
+        self.relay_gain.setSuffix(" dB")
+        self.relay_gain.setToolTip("A spot this much better than the current one is worth moving for even "
+                                   "when the link is comfortable. Higher = moves less often")
+        self.relay_predict = QtWidgets.QDoubleSpinBox()
+        self.relay_predict.setRange(0.0, 20.0)
+        self.relay_predict.setDecimals(0)
+        self.relay_predict.setValue(relay_brain.DEFAULTS['predict_s'])
+        self.relay_predict.setSuffix(" s")
+        self.relay_predict.setToolTip("The explorer's position is predicted this far ahead from its recent "
+                                      "movement (0 = use where it is)")
+        grid.addWidget(QtWidgets.QLabel("Comfort"), 0, 0)
+        grid.addWidget(self.relay_comfort, 0, 1)
+        grid.addWidget(QtWidgets.QLabel("Gain"), 0, 2)
+        grid.addWidget(self.relay_gain, 0, 3)
+        self.relay_model = QtWidgets.QComboBox()
+        self.relay_model.addItems(['nn_pmnet', 'nn', 'distance'])
+        self.relay_model.setToolTip("Link model on the relay rover: nn_pmnet = PMNet link table (default, "
+                                    "smoother), nn = with the diffusion residual (noisier), distance = no "
+                                    "table, roughly the midpoint. Tables must be in the rover's terrain folder")
+        grid.addWidget(QtWidgets.QLabel("Look-ahead"), 1, 0)
+        grid.addWidget(self.relay_predict, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("Model"), 1, 2)
+        grid.addWidget(self.relay_model, 1, 3)
+        lay.addLayout(grid)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Speed"))
+        self.relay_speed = QtWidgets.QDoubleSpinBox()
+        self.relay_speed.setRange(0.2, bs_core.ROUTE_SPEED_MAX)
+        self.relay_speed.setSingleStep(0.05)
+        self.relay_speed.setValue(0.5)
+        self.relay_speed.setSuffix(" m/s")
+        row.addWidget(self.relay_speed)
+        start = QtWidgets.QPushButton("Start relay")
+        start.setStyleSheet("font-weight: bold;")
+        start.setToolTip("The selected rover keeps choosing a spot between the BS and the explorer and "
+                         "drives there (radio_daemon.py needs --site). Press again to apply changed "
+                         "settings (same explorer: the relay keeps its target).")
+        start.clicked.connect(self.on_start_relay)
+        row.addWidget(start)
+        stop = QtWidgets.QPushButton("Stop relays")
+        stop.setToolTip("Every relay off and its route stopped, plus the selected rover's route, whichever "
+                        "rover is selected above")
+        stop.clicked.connect(self.on_stop_relays)
+        row.addWidget(stop)
+        lay.addLayout(row)
+        self.relay_label = QtWidgets.QLabel()
+        self.relay_label.setWordWrap(True)
+        self.relay_label.setTextFormat(QtCore.Qt.RichText)
+        lay.addWidget(self.relay_label)
+        b.setEnabled(self.site is not None and self.site.drivable is not None)
+        return b
 
     def _image_item(self, arr, rect, z=-100):
         item = pg.ImageItem(arr[::-1], levels=(0, 255) if arr.dtype == np.uint8 else None)
@@ -942,7 +1043,9 @@ class Dashboard(QtWidgets.QMainWindow):
             self.map_vb.translateBy(x=xs[i] - r.center().x(), y=ys[i] - r.center().y())
         self._refresh_align_label(snap, locs, now)
         self._refresh_routes(snap)
+        self._refresh_relay(snap, names)
         self._refresh_pose_mode(snap)
+        self._refresh_rb(snap)
 
     def _refresh_bs(self, bs, now) -> None:
         """BS star, radio-map layers (rebuilt when the BS or its maps change) and status."""
@@ -1035,11 +1138,103 @@ class Dashboard(QtWidgets.QMainWindow):
             prog = f" {st.get('ni', 0):.0f}/{st.get('np', 0):.0f} m" if st.get('np') else ''
             xte = f", {st['xte']:.1f} m off route" if isinstance(st.get('xte'), float) else ''
             color = ('#2e7d32' if nav == 'following' else '#1565c0' if nav == 'done'
-                     else '#c62828' if nav.startswith('stopped') else '#ef6c00')
+                     else '#c62828' if nav.startswith('stopped') or nav == 'no_joy' else '#ef6c00')
             lines.append(f"rover: <b style='color:{color}'>{nav}</b>{prog}{xte}")
         elif n:
             lines.append("<i>rover reports no route state (rover_nav.py not running?)</i>")
         self.route_label.setText("<br>".join(lines))
+
+    def _refresh_relay(self, snap, names) -> None:
+        """Explorer list, relay targets on the map and the selected rover's relay state."""
+        n = self.rover_box.currentText()
+        others = [m for m in names if m != n]
+        if others != [self.relay_explorer.itemText(i) for i in range(self.relay_explorer.count())]:
+            cur = self.relay_explorer.currentText()
+            self.relay_explorer.blockSignals(True)
+            self.relay_explorer.clear()
+            self.relay_explorer.addItems(others)
+            if cur in others:
+                self.relay_explorer.setCurrentText(cur)
+            self.relay_explorer.blockSignals(False)
+        cfg = snap.get('relay_cfg', {})
+        status = {r['node']: r['status'] for r in snap['rovers']}
+        spots = []
+        for node in cfg:
+            st = status.get(node, {})
+            if isinstance(st.get('rtx'), float) and isinstance(st.get('rty'), float):
+                spots.append({'pos': (st['rtx'], st['rty']), 'brush': pg.mkBrush(self.color(node))})
+        self.relay_marks.setData(spots)
+        if not n:
+            self.relay_label.setText("")
+            return
+        st = status.get(n, {})
+        lines = []
+        if n in cfg:
+            ex, speed, ferry = cfg[n][:3]
+            lines.append(f"relay for <b>{ex}</b> at {speed:g} m/s, ferry after {ferry:g} s")
+            if len(cfg[n]) >= 6:
+                lines.append(f"comfort {cfg[n][3]:g} dBm, gain {cfg[n][4]:g} dB, look-ahead {cfg[n][5]:g} s")
+            if len(cfg[n]) == 7 and st.get('rm') and str(st['rm']) != cfg[n][6]:
+                lines.append(f"<span style='color:#c62828'>rover uses model {st['rm']}: no {cfg[n][6]} "
+                             f"table on it</span>")
+            elif st.get('rm'):
+                lines.append(f"model {st['rm']}")
+            rl = st.get('rl')
+            if rl is None:
+                lines.append("<i>rover hasn't reported a relay state yet</i>")
+            else:
+                rl = str(rl)
+                color = ('#2e7d32' if rl in ('move', 'hold', 'at_target') else '#1565c0' if rl == 'ferry'
+                         else '#c62828')
+                lines.append(f"rover: <b style='color:{color}'>{rl}</b>"
+                             + (f", explorer fix {st['rea']:.0f} s old" if isinstance(st.get('rea'), float) else ''))
+                pred = [(k, lab) for k, lab in (('rsc', 'target'), ('rcu', 'here'), ('rdi', 'explorer direct'))
+                        if isinstance(st.get(k), float)]
+                if pred:
+                    lines.append("predicted weaker link: " + ", ".join(f"{lab} {st[k]:.0f} dBm" for k, lab in pred))
+                hints = {'unavailable': "radio_daemon.py needs --site (and numpy) for the relay role",
+                         'no_align': "place the relay rover on the map first",
+                         'no_pose': "no position from the relay rover",
+                         'wait_ex': "no position from the explorer yet (place it on the map)",
+                         'no_bs': "rover doesn't know the BS position yet",
+                         'wrong_site': "rover was started with a different --site",
+                         'no_route': "no drivable route to the chosen spot"}
+                if rl in hints:
+                    lines.append(f"<span style='color:#c62828'>{hints[rl]}</span>")
+        elif st.get('rl') == 'unavailable':
+            lines.append("<span style='color:#c62828'>relay role unavailable on this rover "
+                         "(radio_daemon.py without --site or numpy)</span>")
+        others_on = [f"<b>{m}</b> (for {c[0]})" for m, c in sorted(cfg.items()) if m != n]
+        if others_on:
+            lines.append("<span style='color:#e65100'>relay also on: " + ", ".join(others_on)
+                         + " - select it to see it; Stop relays stops all</span>")
+        self.relay_label.setText("<br>".join(lines))
+
+    def on_start_relay(self) -> None:
+        n, ex = self.rover_box.currentText(), self.relay_explorer.currentText()
+        if not n or not ex:
+            QtWidgets.QMessageBox.information(self, "Relay", "Select the relay rover above and an explorer "
+                                                             "(both need a location).")
+            return
+        if self.core.relay_cfg.get(n, [None])[0] == ex:
+            # already relaying for this explorer: just apply the settings, no confirmation
+            err = self.core.set_relay(n, ex, self.relay_speed.value(), self.relay_ferry.value(),
+                                      self.relay_comfort.value(), self.relay_gain.value(),
+                                      self.relay_predict.value(), self.relay_model.currentText())
+            if err:
+                QtWidgets.QMessageBox.warning(self, "Relay", err)
+            return
+        ans = QtWidgets.QMessageBox.question(
+            self, "Start relay",
+            f"Rover {n} will keep driving to a spot between the BS and rover {ex} at "
+            f"{self.relay_speed.value():.2f} m/s.\n\n" + self._drive_note(n))
+        if ans != QtWidgets.QMessageBox.Yes:
+            return
+        err = self.core.set_relay(n, ex, self.relay_speed.value(), self.relay_ferry.value(),
+                                  self.relay_comfort.value(), self.relay_gain.value(), self.relay_predict.value(),
+                                  self.relay_model.currentText())
+        if err:
+            QtWidgets.QMessageBox.warning(self, "Relay", err)
 
     def _refresh_pose_mode(self, snap) -> None:
         """Checkbox = the mode the rover reports (pm), else what we last asked for."""
@@ -1053,6 +1248,44 @@ class Dashboard(QtWidgets.QMainWindow):
         self.camera_check.blockSignals(False)
         pending = wanted is not None and st.get('pm') is not None and st.get('pm') != wanted
         self.camera_check.setText("Camera-only pose (no wheel fusion)" + (" - switching…" if pending else ""))
+
+    def _refresh_rb(self, snap) -> None:
+        """Checkbox = what the rover reports (rb=0/1), else what we last asked for."""
+        n = self.rover_box.currentText()
+        st = next((r['status'] for r in snap['rovers'] if r['node'] == n), {})
+        wanted_off = n in snap.get('rb_off', {})
+        rep = st.get('rb')
+        off = (rep == 0.0) if isinstance(rep, float) else wanted_off
+        self.rb_check.setEnabled(bool(n))
+        self.rb_check.blockSignals(True)
+        self.rb_check.setChecked(off)
+        self.rb_check.blockSignals(False)
+        pending = isinstance(rep, float) and (rep == 0.0) != wanted_off
+        self.rb_check.setText("Drive without RB (LB still overrides)" + (" - switching…" if pending else ""))
+        self.rb_check.setStyleSheet("color: #c62828; font-weight: bold;" if off else "")
+
+    def on_rb_toggled(self, off: bool) -> None:
+        n = self.rover_box.currentText()
+        if not n:
+            return
+        if off:
+            ans = QtWidgets.QMessageBox.warning(
+                self, "Drive without RB",
+                f"Rover {n} will drive routes and relay moves without anyone holding RB.\n\n"
+                "Keep its controller connected and within reach: holding LB takes over, Stop on the "
+                "dashboard cancels the route (in radio range only), and it stops if the controller "
+                "drops. Needs the Autonomy input in mux.yaml on that car.",
+                QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel)
+            if ans != QtWidgets.QMessageBox.Ok:
+                self.rb_check.setChecked(False)
+                return
+        self.core.set_rb_required(n, not off)
+
+    def _drive_note(self, n: str) -> str:
+        if n in self.core.rb_off:
+            return ("It drives WITHOUT RB held (controller must stay connected). Hold LB to take over; "
+                    "Stop cancels.")
+        return "It drives only while RB is held on its controller. Release RB to stop; LB overrides."
 
     def on_camera_toggled(self, on: bool) -> None:
         n = self.rover_box.currentText()
@@ -1118,7 +1351,7 @@ class Dashboard(QtWidgets.QMainWindow):
         ans = QtWidgets.QMessageBox.question(
             self, "Send route",
             f"Send a {length:.0f} m route at {self.route_speed.value():.2f} m/s to rover {n}?\n\n"
-            "It drives only while RB is held on its controller. Release RB to stop; LB overrides.")
+            + self._drive_note(n))
         if ans != QtWidgets.QMessageBox.Yes:
             return
         err = self.core.send_route(n, self.route_plan, self.route_speed.value())
@@ -1134,11 +1367,19 @@ class Dashboard(QtWidgets.QMainWindow):
         if n:
             self.core.stop_route(n)
 
+    def on_stop_relays(self) -> None:
+        self.core.stop_routes(list(self.core.relay_cfg) + [self.rover_box.currentText()], 'stop relays')
+
+    def on_stop_all(self) -> None:
+        nodes = set(self.core.relay_cfg) | set(self.core.nav_cmds) | set((self.last_snap or {}).get('locations', {}))
+        nodes |= {r['node'] for r in (self.last_snap or {}).get('rovers', [])}
+        self.core.stop_routes(nodes, 'STOP ALL')
+
     # map actions
     def _selected_location(self):
         n = self.rover_box.currentText()
         loc = (self.last_snap or {}).get('locations', {}).get(n)
-        if not n or not loc or (loc['x'] == 0.0 and loc['y'] == 0.0):
+        if not n or not loc or (loc['x'] == 0.0 and loc['y'] == 0.0)                 or not (math.isfinite(loc['x']) and math.isfinite(loc['y'])):
             return None, None
         return n, loc
 
