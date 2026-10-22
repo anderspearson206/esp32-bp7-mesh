@@ -1,6 +1,12 @@
 {
  "session": "session_20261015_094354_shadow1",
  "node": "57936",
+ "date": "2026-10-15",
+ "start": "09:43:54",
+ "end": "09:54:36",
+ "utc_offset": "-07:00",
+ "start_epoch": 1792082634.48,
+ "end_epoch": 1792083276.558,
  "duration_s": 642.1,
  "bs_cell": [
   182,
@@ -42,6 +48,41 @@
  "data_direct_lt2s": 580,
  "data_delayed_ge2s": 33,
  "data_generated_while_link_down": 8,
+ "start_to_end_m": 5.3,
+ "routes": [
+  {
+   "sent": "09:44:19",
+   "speed_mps": 0.5,
+   "route_m": 128.6,
+   "points": 22,
+   "first_following": "09:44:45",
+   "ended": "done",
+   "ended_at": "09:49:21",
+   "last_state": "done",
+   "progress_m": 128.1,
+   "following_reports": 50,
+   "reports": 68,
+   "max_xte_m": 0.3,
+   "stop_at": "09:49:21",
+   "end_to_route_end_m": 0.6
+  },
+  {
+   "sent": "09:50:03",
+   "speed_mps": 0.5,
+   "route_m": 23.6,
+   "points": 6,
+   "first_following": "09:50:12",
+   "ended": "done",
+   "ended_at": "09:51:07",
+   "last_state": "done",
+   "progress_m": 23.2,
+   "following_reports": 9,
+   "reports": 54,
+   "max_xte_m": 0.3,
+   "stop_at": "09:51:07",
+   "end_to_route_end_m": 0.6
+  }
+ ],
  "fits": {
   "nn_pmnet": {
    "n": 602,

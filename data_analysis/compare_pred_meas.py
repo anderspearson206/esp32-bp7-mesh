@@ -9,7 +9,8 @@ Writes:
     data_analysis/offset/offset.md / .json    the numbers
 
 Usage (repo root, ..\\.venv Python). A run is folder:name, optionally @HH:MM:SS-HH:MM:SS to use
-only part of a session. --pool names the runs whose cells form the pooled offset; runs left out
+only part of a session and #<node> to pick one rover of a multi-rover session (it is then named
+<name>/<node>). --pool names the runs whose cells form the pooled offset; runs left out
 (e.g. a different BS setup) get their own offset in their side-by-side figure:
     python data_analysis/compare_pred_meas.py bs_reports/session_20261015_094354_shadow1:shadow1 \\
         bs_reports/session_20261015_095910_shadow2:shadow2 \\
@@ -26,6 +27,7 @@ correlated (same shadow edge, same alignment error).
 """
 
 import argparse
+import itertools
 import json
 import os
 import sys
@@ -135,8 +137,8 @@ def fig_side_by_side(P, name, offsets, out, offset_note='pooled offset applied')
     ax.set_ylabel('beacons')
     ax.set_title('Residual distribution', loc='left', fontsize=11)
     ax.legend(loc='upper left', fontsize=8)
-    fig.suptitle(f'{name} - predicted vs measured RSSI along the path ({offset_note})',
-                 x=0.01, ha='left', fontsize=13)
+    fig.suptitle(f'{name}  ({A.span_text(s.when)}) - predicted vs measured RSSI along the path '
+                 f'({offset_note})', x=0.01, ha='left', fontsize=13)
     fig.savefig(out)
     plt.close(fig)
 
@@ -196,7 +198,7 @@ def fig_offset(runs, stats, pool, out):
     edges = np.arange(-115, -25, 7.5)
     for m in models:
         st = stats[m]['pooled']
-        for (n, c), ls in zip(runs, ['-', '--', ':', '-.']):
+        for (n, c), ls in zip(runs, itertools.cycle(['-', '--', ':', '-.', (0, (5, 1, 1, 1, 1, 1))])):
             cc = c[m]
             d = cc[:, 2] - cc[:, 3]
             pred = cc[:, 3] + stats[m]['pooled' if n in pool else n]['offset_db']
@@ -229,9 +231,12 @@ def main():
 
     runs, preps = [], {}
     for spec in a.runs:
+        spec, _, node = spec.partition('#')
         spec, _, window = spec.partition('@')
         path, name = spec.rsplit(':', 1) if ':' in spec[2:] else (spec, os.path.basename(spec))
-        P = A.prepare(path, name, a.site, window or None)
+        P = A.prepare(path, name, a.site, window or None, node or None)
+        if node:
+            name = f'{name}/{node}'          # one rover of a multi-rover run: data_analysis/<name>/<node>/
         preps[name] = P
         runs.append((name, {m: cell_residuals(P, m) for m in A.MODELS if m in P['pred_net']}))
 

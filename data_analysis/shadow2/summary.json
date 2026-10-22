@@ -1,6 +1,12 @@
 {
  "session": "session_20261015_095910_shadow2",
  "node": "57936",
+ "date": "2026-10-15",
+ "start": "09:59:10",
+ "end": "10:03:11",
+ "utc_offset": "-07:00",
+ "start_epoch": 1792083550.815,
+ "end_epoch": 1792083791.661,
  "duration_s": 240.8,
  "bs_cell": [
   170,
@@ -42,6 +48,25 @@
  "data_direct_lt2s": 218,
  "data_delayed_ge2s": 11,
  "data_generated_while_link_down": 0,
+ "start_to_end_m": 5.5,
+ "routes": [
+  {
+   "sent": "09:59:19",
+   "speed_mps": 0.5,
+   "route_m": 98.2,
+   "points": 18,
+   "first_following": "09:59:29",
+   "ended": "done",
+   "ended_at": "10:02:56",
+   "last_state": "done",
+   "progress_m": 97.9,
+   "following_reports": 38,
+   "reports": 44,
+   "max_xte_m": 0.4,
+   "stop_at": "10:02:56",
+   "end_to_route_end_m": 0.5
+  }
+ ],
  "fits": {
   "nn_pmnet": {
    "n": 234,

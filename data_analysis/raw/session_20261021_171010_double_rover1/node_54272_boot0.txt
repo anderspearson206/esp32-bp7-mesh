@@ -1,0 +1,2 @@
+Node 54272 boot 0 - saved 2026-10-21 17:11:55
+Duration 105 s, delivered 0, ferry dups 0, antipacket fails 0

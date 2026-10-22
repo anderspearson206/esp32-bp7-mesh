@@ -1,0 +1,4 @@
+Node 54272 boot 1 - saved 2026-10-21 17:11:55
+Duration 0 s, delivered 1, ferry dups 0, antipacket fails 0
+Latency avg 2 ms, min 2, max 2
+Seq [1..1] possible 1, rate 100.0%

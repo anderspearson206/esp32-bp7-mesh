@@ -15,6 +15,12 @@ Usage (from the repo root, with the ..\\.venv Python):
     python data_analysis/analyze_session.py bs_reports/session_*_shadow2
     python data_analysis/analyze_session.py bs_reports/session_20261015_091320 --name preshadow \
         --window 09:14:20-09:35:41          (only part of a session)
+    python data_analysis/analyze_session.py data_analysis/raw/session_20261021_171010_double_rover1 \
+        --name double_rover1 --node 57936,54272 --window 17:15:45-
+            (several rovers: one folder per rover under <name>/, plus <name>/overview.png and
+             <name>/summary.md comparing them)
+
+Every summary and figure title carries the date and local clock time of the analysed span.
 
 Data sources and their timing:
   * Measured RSSI = the BS's own RSSI of the rover's beacons (@NET lines). These are fresh
@@ -45,6 +51,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from matplotlib.colors import LogNorm
 from matplotlib.lines import Line2D
 
@@ -59,6 +66,8 @@ C_MEAS, C_PMNET, C_NN, C_AVG = '#2a78d6', '#eb6834', '#1baf7a', '#6250d6'
 C_TEL, C_GEN = '#e87ba4', '#52514e'
 C_DOWN = '#e34948'
 MODEL_COLOR = {'nn_pmnet': C_PMNET, 'nn': C_NN, 'avg': C_AVG}
+ROVER_COLORS = (C_MEAS, C_PMNET, C_NN, C_AVG)    # one per rover in multi-rover figures
+NAV_END = ('done', 'stopped_off_route', 'stopped_bs')
 INK, INK2, GRID = '#0b0b0b', '#52514e', '#e4e3df'
 RSSI_CMAP = 'viridis'
 RATE_BIN_S = 5.0
@@ -76,6 +85,22 @@ plt.rcParams.update({
 
 def ts(s: str) -> float:
     return datetime.strptime(s.strip(), '%Y-%m-%d %H:%M:%S.%f').timestamp()
+
+
+def clock(t: float) -> str:
+    return datetime.fromtimestamp(t).strftime('%H:%M:%S')
+
+
+def span_info(t0: float, t1: float) -> dict:
+    """Date and local clock time (laptop clock) of [t0, t1]."""
+    d0 = datetime.fromtimestamp(t0).astimezone()
+    z = d0.strftime('%z')
+    return {'date': d0.strftime('%Y-%m-%d'), 'start': clock(t0), 'end': clock(t1),
+            'utc_offset': f'{z[:3]}:{z[3:]}', 'start_epoch': round(t0, 3), 'end_epoch': round(t1, 3)}
+
+
+def span_text(w: dict) -> str:
+    return f"{w['date']} {w['start']}-{w['end']}"
 
 
 def read_csv(path):
@@ -430,8 +455,14 @@ def fig_timeseries(s, track, bs_xy, net_xy, pred_net, fits, data, tel_t, out):
         ax.text(0.5, 0.5, 'no data bundles in this run', transform=ax.transAxes, ha='center',
                 color=INK2)
     ax.set_ylabel('data latency [ms]')
-    ax.set_xlabel(f'time since session start [s]   (red bands: link to BS down)')
+    ax.set_xlabel(f'time since {clock(t0)} [s]   (red bands: link to BS down)')
     ax.set_title('Delivery latency (by arrival time)', loc='left', fontsize=11)
+    # local clock time under the seconds axis
+    midnight = datetime.fromtimestamp(t0).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    sec = ax.secondary_xaxis(-0.42, functions=(lambda v: v + t0 - midnight, lambda v: v - t0 + midnight))
+    sec.xaxis.set_major_formatter(plt.FuncFormatter(
+        lambda v, _: f'{int(v // 3600) % 24:02d}:{int(v % 3600 // 60):02d}:{int(v % 60):02d}'))
+    sec.set_xlabel(f'local time on {datetime.fromtimestamp(t0).strftime("%Y-%m-%d")}')
 
     for ax in axes:
         shade_down(ax, s, t0)
@@ -486,6 +517,51 @@ def fig_pred_vs_true(s, track, net_xy, pred_net, fits, out):
     fig.tight_layout()
     fig.savefig(out)
     plt.close(fig)
+
+
+def route_results(s, track):
+    """Per route sent to this rover: when, how fast, and how rover_nav.py followed it
+    (from the nav fields of @ROVER_STATUS, one report every ~5 s)."""
+    out = []
+    for r in s.routes:
+        if r['action'] != 'route':
+            continue
+        t_sent = ts(r['time'])
+        st = [(t, d) for t, d in s.status if t >= t_sent and d.get('nc') == r['cmd_id']]
+        follow = [t for t, d in st if d.get('nav') == 'following']
+        ended = [(t, d) for t, d in st if d.get('nav') in NAV_END]
+        last = (ended[0] if ended else st[-1])[1] if st else {}
+        xte = [fnum(d.get('xte')) for _, d in st if d.get('nav') == 'following']
+        xte = [v for v in xte if np.isfinite(v)]
+        pts = np.array(json.loads(r['map_xy']))
+        # where the rover was when the route ended (or when it last drove it); it may be moved after
+        t_stop = ended[0][0] if ended else (follow[-1] if follow else np.nan)
+        ex, ey = interp_pos(track, [t_stop])
+        out.append({
+            'sent': clock(t_sent), 'speed_mps': fnum(r['speed']), 'route_m': fnum(r['length_m']),
+            'points': int(r['points']),
+            'first_following': clock(follow[0]) if follow else None,
+            'ended': ended[0][1]['nav'] if ended else None,
+            'ended_at': clock(ended[0][0]) if ended else None,
+            'last_state': last.get('nav'), 'progress_m': fnum(last.get('ni')),
+            'following_reports': len(follow), 'reports': len(st),
+            'max_xte_m': max(xte) if xte else None,
+            'stop_at': clock(t_stop) if np.isfinite(t_stop) else None,
+            'end_to_route_end_m': round(float(np.hypot(ex[0] - pts[-1, 0], ey[0] - pts[-1, 1])), 1),
+        })
+    return out
+
+
+def nav_intervals(s, state='following'):
+    """(t0, t1) spans where @ROVER_STATUS reported nav=state (each report holds until the next)."""
+    out = []
+    for (t, d), (tn, _) in zip(s.status, s.status[1:] + [(s.t_end, None)]):
+        if d.get('nav') == state:
+            if out and abs(out[-1][1] - t) < 0.5:
+                out[-1] = (out[-1][0], tn)
+            else:
+                out.append((t, tn))
+    return out
 
 
 def binned_frac(x, ok, edges):
@@ -585,11 +661,11 @@ def clip_session(s: Session, t0=None, t1=None):
     s.t_end = min(s.t_end, hi)
 
 
-def prepare(path, name, site_name, window=None):
+def prepare(path, name, site_name, window=None, node=None):
     """Load a session and line up beacons (measured RSSI) with positions and predictions.
-    window: 'HH:MM:SS-HH:MM:SS' to analyse only part of the session."""
-    s = Session(path)
-    s.label = name
+    window: 'HH:MM:SS-HH:MM:SS' to analyse only part of the session.
+    node: the rover to analyse (default: the first one in coverage.csv)."""
+    s = Session(path, node)
     s.window = window
     if window:
         clip_session(s, *parse_window(s, window))
@@ -604,6 +680,8 @@ def prepare(path, name, site_name, window=None):
         clip_session(s, None, cut)
     else:
         cut = None
+    s.when = span_info(s.t_start, s.t_end)
+    s.label = (f'{name}, rover {node}' if node else name) + f'  ({span_text(s.when)})'
 
     track = position_track(s)
     net_t = np.array([t for t, _ in s.net])
@@ -618,8 +696,8 @@ def prepare(path, name, site_name, window=None):
             'pred_net': pred_net, 'fits': fits}
 
 
-def analyze(path, name, site_name, out_root, window=None):
-    P = prepare(path, name, site_name, window)
+def analyze(path, name, site_name, out_root, window=None, node=None, out=None):
+    P = prepare(path, name, site_name, window, node)
     s, site, (bc, br), bs_xy, maps, match, cut = (P[k] for k in ('s', 'site', 'bs_cell', 'bs_xy',
                                                                   'maps', 'match', 'cut'))
     track, net_xy, pred_net, fits = P['track'], P['net_xy'], P['pred_net'], P['fits']
@@ -633,7 +711,7 @@ def analyze(path, name, site_name, out_root, window=None):
     data = {'t_arr': t_arr, 'lat_ms': lat, 't_gen': t_gen, 'gx': gx, 'gy': gy}
     tel_t = np.array([fnum(r['epoch']) for r in s.deliv if r['kind'] == 'tel'])
 
-    out = os.path.join(out_root, name)
+    out = out or os.path.join(out_root, name)
     os.makedirs(out, exist_ok=True)
     fig_map_rm(s, site, track, bs_xy, maps, os.path.join(out, 'map_rm.png'))
     fig_map_comms(s, site, track, bs_xy, net_xy, data, os.path.join(out, 'map_comms.png'))
@@ -653,7 +731,7 @@ def analyze(path, name, site_name, out_root, window=None):
     direct = lat < 2000
     gen_up = contact_state(s, t_gen)
     summary = {
-        'session': s.name, 'node': s.node, 'duration_s': round(dur, 1),
+        'session': s.name, 'node': s.node, **s.when, 'duration_s': round(dur, 1),
         'bs_cell': [bc, br], 'bs_xy': [round(bs_xy[0], 1), round(bs_xy[1], 1)],
         'bs_cell_match_frac': round(float(match), 3), 'cut_at_bs_move': bool(cut),
         'driven_m': round(driven, 1),
@@ -673,12 +751,14 @@ def analyze(path, name, site_name, out_root, window=None):
         'window': s.window,
         'data_direct_lt2s': int(direct.sum()), 'data_delayed_ge2s': int((~direct).sum()),
         'data_generated_while_link_down': int((~gen_up).sum()),
+        'start_to_end_m': round(float(np.hypot(px[okp][-1] - px[okp][0], py[okp][-1] - py[okp][0])), 1),
+        'routes': route_results(s, track),
         'fits': fits,
     }
     with open(os.path.join(out, 'summary.json'), 'w') as f:
         json.dump(summary, f, indent=1)
-    write_md(summary, os.path.join(out, 'summary.md'), name)
-    return summary
+    write_md(summary, os.path.join(out, 'summary.md'), f'{name}, rover {node}' if node else name)
+    return summary, P
 
 
 def write_md(sm_, path, name):
@@ -686,8 +766,10 @@ def write_md(sm_, path, name):
     lines = [
         f"# {name}  (`{f['session']}`)", '',
         *([f"- Analysed window: {f['window']} only", ''] if f.get('window') else []),
+        f"- Recorded {f['date']}, {f['start']} to {f['end']} local time (UTC{f['utc_offset']})",
         f"- Rover {f['node']}, {f['duration_s']:.0f} s, drove {f['driven_m']:.0f} m, "
-        f"{f['dist_to_bs_m']['min']}-{f['dist_to_bs_m']['max']} m from the BS",
+        f"{f['dist_to_bs_m']['min']}-{f['dist_to_bs_m']['max']} m from the BS, "
+        f"ended {f['start_to_end_m']} m from where it started",
         f"- BS at map ({f['bs_xy'][0]:+.1f}, {f['bs_xy'][1]:+.1f}) m, cell col {f['bs_cell'][0]} row {f['bs_cell'][1]}"
         f" (matches {f['bs_cell_match_frac']:.0%} of the logged predictions)"
         + ("; data after a mid-session BS move dropped" if f['cut_at_bs_move'] else ''),
@@ -706,6 +788,26 @@ def write_md(sm_, path, name):
          else "| Latency | no data bundles |"),
         f"| Delivered < 2 s / >= 2 s | {f['data_direct_lt2s']} / {f['data_delayed_ge2s']} |",
         f"| Generated while link down | {f['data_generated_while_link_down']} |", '',
+    ]
+    if f['routes']:
+        lines += ['## Routes', '',
+                  'From routes.csv and the nav fields of the rover status (one report every ~5 s). '
+                  '"Following" counts the reports where the rover was driving the route; the rest '
+                  'were mostly RB released (hold_rb). "End to route end" is the distance from the '
+                  'route\'s last point when it ended (or at the last following report if it never '
+                  'did).', '',
+                  '| Sent | Speed | Length | Started | Ended | Progress | Following | Max off route | '
+                  'End to route end |',
+                  '|---|---|---|---|---|---|---|---|---|']
+        for r in f['routes']:
+            ended = f"{r['ended']} at {r['ended_at']}" if r['ended'] else f"not ended (last: {r['last_state']})"
+            xte = f"{r['max_xte_m']:.1f} m" if r['max_xte_m'] is not None else '-'
+            lines.append(f"| {r['sent']} | {r['speed_mps']} m/s | {r['route_m']:.1f} m | "
+                         f"{r['first_following'] or '-'} | {ended} | {r['progress_m']:.1f} m | "
+                         f"{r['following_reports']} of {r['reports']} reports | {xte} | "
+                         f"{r['end_to_route_end_m']} m |")
+        lines.append('')
+    lines += [
         '## Predicted vs measured RSSI', '',
         'Prediction = map path gain + a constant offset (median of measured - predicted).', '',
         '| Model | n | offset [dB] | r | RMSE [dB] | MAE [dB] | slope |',
@@ -722,6 +824,122 @@ def write_md(sm_, path, name):
         fh.write('\n'.join(lines))
 
 
+# ----------------------------------------------------------------------------- several rovers
+
+def fig_overview(name, Ps, out):
+    """All rovers of one run: paths on the map, measured RSSI and link/driving state by clock time."""
+    site, bs_xy = Ps[0]['site'], Ps[0]['bs_xy']
+    fig = plt.figure(figsize=(16, 7.2), layout='constrained')
+    gs = fig.add_gridspec(2, 2, width_ratios=[1, 1.35], height_ratios=[2, 1])
+    ax_map = fig.add_subplot(gs[:, 0])
+    ax_r = fig.add_subplot(gs[0, 1])
+    ax_s = fig.add_subplot(gs[1, 1], sharex=ax_r)
+
+    xs = np.concatenate([P['track'][1] for P in Ps])
+    ys = np.concatenate([P['track'][2] for P in Ps])
+    draw_base(ax_map, site, map_extent(site, xs, ys, bs_xy), bs_xy)
+    rows = []
+    for P, col in zip(Ps, ROVER_COLORS):
+        s, (_, x, y, _) = P['s'], P['track']
+        for r in s.routes:
+            if r['action'] == 'route':
+                pts = np.array(json.loads(r['map_xy']))
+                ax_map.plot(pts[:, 0], pts[:, 1], ls=(0, (4, 3)), lw=1.2, color=col, alpha=0.6, zorder=4)
+        ax_map.plot(x, y, color=col, lw=1.8, zorder=5, label=f'rover {s.node} driven')
+        ax_map.plot(x[0], y[0], 'o', ms=8, color='white', mec=col, mew=2, zorder=6)
+        ax_map.plot(x[-1], y[-1], 's', ms=7, color=col, mec='white', zorder=6)
+
+        nt, _, _, nr = P['net_xy']
+        ax_r.plot([datetime.fromtimestamp(t) for t in nt], nr, '.', ms=3.5, color=col,
+                  label=f'rover {s.node}')
+        rows.append((s, col))
+    ax_map.plot([], [], ls=(0, (4, 3)), color=INK2, label='planned route')
+    ax_map.plot([], [], 'o', ms=8, color='white', mec=INK2, mew=2, label='start')
+    ax_map.plot([], [], 's', ms=7, color=INK2, label='end')
+    ax_map.legend(loc='lower left', fontsize=8, frameon=True, facecolor='white', framealpha=0.85)
+    ax_map.set_title('Driven paths and planned routes', loc='left', fontsize=11)
+    ax_r.set_ylabel('measured RSSI at BS [dBm]')
+    ax_r.set_title('RSSI of each rover\'s beacons at the BS', loc='left', fontsize=11)
+    ax_r.legend(loc='lower left', fontsize=8)
+
+    def bars(spans, y, color, alpha=1.0):
+        ax_s.broken_barh([(mdates.date2num(datetime.fromtimestamp(a)),
+                           mdates.date2num(datetime.fromtimestamp(b)) - mdates.date2num(datetime.fromtimestamp(a)))
+                          for a, b in spans], (y - 0.35, 0.7), color=color, alpha=alpha, lw=0)
+
+    labels = []
+    for i, (s, col) in enumerate(rows):
+        y_link, y_drive = 2 * i + 1, 2 * i
+        bars([(s.t_start, s.t_end)], y_link, C_DOWN, 0.25)
+        bars(s.contacts, y_link, col, 0.85)
+        bars(nav_intervals(s), y_drive, col, 0.85)
+        for r in s.routes:
+            if r['action'] == 'route':
+                t = mdates.date2num(datetime.fromtimestamp(ts(r['time'])))
+                ax_s.plot([t], [y_drive], marker='v', ms=8, color=INK, zorder=5)
+        labels += [(y_drive, f'{s.node} following route'), (y_link, f'{s.node} link to BS')]
+    ax_s.set_yticks([y for y, _ in labels], [l for _, l in labels])
+    ax_s.set_ylim(-0.7, 2 * len(rows) - 0.3)
+    ax_s.grid(False)
+    ax_s.set_title('Link (red: down) and route driving (gaps: RB released); triangle = route sent',
+                   loc='left', fontsize=11)
+    ax_s.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    w = Ps[0]['s'].when
+    ax_s.set_xlabel(f"local time on {w['date']}")
+    ax_s.set_xlim(datetime.fromtimestamp(min(P['s'].t_start for P in Ps)),
+                  datetime.fromtimestamp(max(P['s'].t_end for P in Ps)))
+    fig.suptitle(f"{name} - {len(Ps)} rovers  ({w['date']} {clock(min(P['s'].t_start for P in Ps))}-"
+                 f"{clock(max(P['s'].t_end for P in Ps))})", x=0.01, ha='left', fontsize=13)
+    fig.savefig(out)
+    plt.close(fig)
+
+
+def write_group_md(name, results, path):
+    """results: [(summary, P)] per rover."""
+    sm0, P0 = results[0]
+    w = span_info(min(P['s'].t_start for _, P in results), max(P['s'].t_end for _, P in results))
+    lines = [
+        f"# {name}  (`{sm0['session']}`)", '',
+        *([f"- Analysed window: {sm0['window']} only"] if sm0.get('window') else []),
+        f"- Recorded {w['date']}, {w['start']} to {w['end']} local time (UTC{w['utc_offset']})",
+        f"- Rovers {', '.join(sm['node'] for sm, _ in results)}",
+        f"- BS at map ({sm0['bs_xy'][0]:+.1f}, {sm0['bs_xy'][1]:+.1f}) m, cell col {sm0['bs_cell'][0]} "
+        f"row {sm0['bs_cell'][1]}", '',
+        '| Rover | Route sent | Speed | Length | Ended | Progress | Max off route | Driven | '
+        'Start to end | End to route end | Link up | Contacts | RSSI min / median | Telemetry |',
+        '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|',
+    ]
+    for sm, _ in results:
+        rt = sm['routes'][-1] if sm['routes'] else None
+        if rt:
+            ended = f"{rt['ended']} {rt['ended_at']}" if rt['ended'] else f"no ({rt['last_state']})"
+            xte = f"{rt['max_xte_m']:.1f} m" if rt['max_xte_m'] is not None else '-'
+            rcols = (f"{rt['sent']} | {rt['speed_mps']} m/s | {rt['route_m']:.1f} m | {ended} | "
+                     f"{rt['progress_m']:.1f} m | {xte}")
+        else:
+            rcols = '- | - | - | - | - | -'
+        lines.append(
+            f"| [{sm['node']}]({sm['node']}/summary.md) | {rcols} | {sm['driven_m']:.0f} m | "
+            f"{sm['start_to_end_m']} m | {rt['end_to_route_end_m'] if rt else '-'} m | "
+            f"{sm['uptime_frac']:.0%} | {sm['contacts']} | {sm['rssi_measured']['min']:.0f} / "
+            f"{sm['rssi_measured']['median']:.0f} dBm | {sm['tel_delivered']} |")
+    lines += ['', 'Per-rover figures and numbers are in the linked folders.', '',
+              '![overview](overview.png)', '']
+    with open(path, 'w') as fh:
+        fh.write('\n'.join(lines))
+
+
+def analyze_group(path, name, site_name, out_root, window, nodes):
+    results = [analyze(path, name, site_name, out_root, window, n, os.path.join(out_root, name, n))
+               for n in nodes]
+    out = os.path.join(out_root, name)
+    fig_overview(name, [P for _, P in results], os.path.join(out, 'overview.png'))
+    write_group_md(name, results, os.path.join(out, 'summary.md'))
+    with open(os.path.join(out, 'summary.json'), 'w') as f:
+        json.dump({sm['node']: sm for sm, _ in results}, f, indent=1)
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('sessions', nargs='+', help='session folders (globs ok)')
@@ -729,13 +947,22 @@ def main():
     ap.add_argument('--site', default='fountain')
     ap.add_argument('--out', default=HERE)
     ap.add_argument('--window', help="only this part, 'HH:MM:SS-HH:MM:SS' (single session only)")
+    ap.add_argument('--node', help='rover node id(s), comma-separated; several = one folder per rover '
+                                   'plus an overview (default: the first rover in coverage.csv)')
     a = ap.parse_args()
     paths = [p for raw in a.sessions for p in sorted(glob.glob(raw))]
+    nodes = a.node.split(',') if a.node else [None]
     for p in paths:
         name = a.name if (a.name and len(paths) == 1) else os.path.basename(p.rstrip('/\\')).split('_', 3)[-1]
-        sm_ = analyze(p, name, a.site, a.out, a.window if len(paths) == 1 else None)
-        print(f"{name}: {sm_['data_delivered']} data, uptime {sm_['uptime_frac']:.0%}, "
-              + ', '.join(f"{m} RMSE {v['rmse_db']:.1f} dB r={v['r']:.2f}" for m, v in sm_['fits'].items() if v))
+        window = a.window if len(paths) == 1 else None
+        if len(nodes) > 1:
+            results = analyze_group(p, name, a.site, a.out, window, nodes)
+        else:
+            results = [analyze(p, name, a.site, a.out, window, nodes[0])]
+        for sm_, _ in results:
+            print(f"{name} {sm_['node']} ({sm_['date']} {sm_['start']}-{sm_['end']}): "
+                  f"{sm_['data_delivered']} data, uptime {sm_['uptime_frac']:.0%}, "
+                  + ', '.join(f"{m} RMSE {v['rmse_db']:.1f} dB r={v['r']:.2f}" for m, v in sm_['fits'].items() if v))
 
 
 if __name__ == '__main__':

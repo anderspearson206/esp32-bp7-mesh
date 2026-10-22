@@ -1,0 +1,97 @@
+{
+ "session": "session_20261021_171010_double_rover1",
+ "node": "57936",
+ "date": "2026-10-21",
+ "start": "17:15:45",
+ "end": "17:26:26",
+ "utc_offset": "-07:00",
+ "start_epoch": 1792628145.0,
+ "end_epoch": 1792628786.592,
+ "duration_s": 641.6,
+ "bs_cell": [
+  163,
+  118
+ ],
+ "bs_xy": [
+  35.5,
+  9.5
+ ],
+ "bs_cell_match_frac": 0.998,
+ "cut_at_bs_move": false,
+ "driven_m": 129.3,
+ "dist_to_bs_m": {
+  "min": 1.9,
+  "max": 41.2
+ },
+ "contacts": 5,
+ "uptime_frac": 0.947,
+ "beacons_heard": 571,
+ "beacon_rate_hz": 0.89,
+ "rssi_measured": {
+  "min": -92.0,
+  "median": -57.0,
+  "max": -32.0
+ },
+ "data_delivered": 0,
+ "tel_delivered": 710,
+ "rover_gen": 0,
+ "rover_tx": 0,
+ "rover_retx": 0,
+ "data_rate_per_s": 0.0,
+ "latency_ms": null,
+ "window": "17:15:45-",
+ "data_direct_lt2s": 0,
+ "data_delayed_ge2s": 0,
+ "data_generated_while_link_down": 0,
+ "start_to_end_m": 3.0,
+ "routes": [
+  {
+   "sent": "17:16:47",
+   "speed_mps": 0.5,
+   "route_m": 107.2,
+   "points": 16,
+   "first_following": "17:17:09",
+   "ended": "done",
+   "ended_at": "17:22:20",
+   "last_state": "done",
+   "progress_m": 106.7,
+   "following_reports": 43,
+   "reports": 108,
+   "max_xte_m": 0.2,
+   "stop_at": "17:22:20",
+   "end_to_route_end_m": 0.5
+  }
+ ],
+ "fits": {
+  "nn_pmnet": {
+   "n": 571,
+   "offset_db": -23.343109130859375,
+   "raw_bias_db": -23.167185581294124,
+   "rmse_db": 10.15093655432787,
+   "mae_db": 8.629903789994595,
+   "r": 0.9685731418098315,
+   "slope": 1.9898558712107581,
+   "intercept": 12.116646523961334
+  },
+  "nn": {
+   "n": 571,
+   "offset_db": -23.718521118164062,
+   "raw_bias_db": -23.97222884356871,
+   "rmse_db": 10.347561289773086,
+   "mae_db": 8.92289001678627,
+   "r": 0.9624916808412349,
+   "slope": 2.000931244977025,
+   "intercept": 10.90059669939922
+  },
+  "avg": {
+   "n": 571,
+   "offset_db": -23.53081512451172,
+   "raw_bias_db": -23.569707212431418,
+   "rmse_db": 10.230487048104939,
+   "mae_db": 8.761894212712757,
+   "r": 0.9675864311273218,
+   "slope": 2.003822031943674,
+   "intercept": 11.807894530396835
+  }
+ }
+}
