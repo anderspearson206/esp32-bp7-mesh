@@ -54,7 +54,7 @@ import time
 import traceback
 import serial
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -86,7 +86,8 @@ PKT_TYPE_CONTROL  = 0x06   # fleet control from the BS laptop: [type][origin u16
 
 CONTROL_HDR_FMT    = '<BHI'
 CONTROL_HDR_SIZE   = struct.calcsize(CONTROL_HDR_FMT)   # 7
-CONTROL_REPEAT_S   = 5.0    # rovers re-broadcast their current control so out-of-range rovers get it
+CONTROL_REPEAT_S   = 2.0    # rovers re-broadcast their current control so out-of-range rovers get it
+                             # (also carries "bsh", the radio deadman's BS contact time: keep it short)
 # config keys the BS may set at runtime (same names as the CLI options)
 CONFIG_KEYS = ('interval', 'bw_limit', 'bw_burst', 'bw_order', 'bw_count_telemetry',
                'comms_on', 'comms_off', 'comms_phase', 'payload_bytes', 'retransmit_s',
@@ -559,6 +560,7 @@ class NavBridge:
         self.last_cmd = 0
         self._pose_mode: Optional[str] = None
         self._rb_required: Optional[bool] = None
+        self._deadman_s: float = 0.0
         try:
             with open(state_path) as f:
                 self.last_cmd = int(json.load(f)['cmd_id'])
@@ -623,17 +625,34 @@ class NavBridge:
         self._pose_mode = mode
         return f"pose source {mode}"
 
-    def set_rb_required(self, required: bool) -> Optional[str]:
+    def set_rb_required(self, required: bool, deadman_s: float = 0.0) -> Optional[str]:
         """Write rb.json when the BS setting changes (rover_nav.py: RB not required = drive on
-        the mux's Autonomy input, LB still overrides). Returns what was done or None."""
-        if required == self._rb_required:
+        the mux's Autonomy input, LB still overrides; deadman_s > 0 = it may also drive with
+        no controller while the BS was heard within deadman_s, see write_radio). Returns what
+        was done or None."""
+        deadman_s = 0.0 if required else float(deadman_s)
+        if (required, deadman_s) == (self._rb_required, self._deadman_s):
             return None
         try:
-            self._write_json(os.path.join(self.nav_dir, 'rb.json'), {'required': required, 'set': time.time()})
+            self._write_json(os.path.join(self.nav_dir, 'rb.json'),
+                             {'required': required, 'deadman_s': deadman_s, 'set': time.time()})
         except OSError as e:
             return f"could not hand RB setting to rover_nav.py: {e}"
-        self._rb_required = required
-        return "RB required" if required else "RB NOT required (LB overrides)"
+        self._rb_required, self._deadman_s = required, deadman_s
+        if required:
+            return "RB required"
+        return "RB NOT required (LB overrides), " + (
+            f"no controller needed while the BS was heard within {deadman_s:g} s" if deadman_s > 0
+            else "controller must stay connected")
+
+    def write_radio(self, bs_age: Optional[float]) -> None:
+        """radio.json for rover_nav.py's radio deadman: seconds since the BS was last heard
+        (directly or through a relay; None = never). rover_nav.py also checks this file is fresh."""
+        try:
+            self._write_json(os.path.join(self.nav_dir, 'radio.json'),
+                             {'t': time.time(), 'bs_age': None if bs_age is None else round(bs_age, 2)})
+        except OSError:
+            pass
 
     def status(self) -> dict:
         """rover_nav.py's status.json if it is fresh, else {}."""
@@ -932,6 +951,8 @@ class RoverDaemon:
 
         self._delivered: Set[tuple] = set()                  # (source, creation_time, seq) acked by BS
         self._peers: Dict[int, dict] = {}                    # node_id -> {last_seen, boot_id, rssi}
+        self._rssi_hist: Dict[int, deque] = {}               # node_id -> (monotonic s, rssi) of recent beacons
+        self._bs_heard_t: Optional[float] = None             # BS time the BS was last reachable (_note_bs_contact)
         self._ack: Dict[int, dict] = {}                      # source_node -> {seq_base, bitmap, dirty}
 
         # lat/lon/alt carry odometry x/y/z when a ROS topic is used; yaw is degrees
@@ -1111,6 +1132,7 @@ class RoverDaemon:
         clock_offset_ms = timestamp_ms - daemon_rel_now   # peer_ts - daemon_ts; const between reboots
         self._peers[node_id] = {'last_seen': now, 'boot_id': boot_id, 'rssi': rssi,
                                 'clock_offset_ms': clock_offset_ms}
+        self._rssi_hist.setdefault(node_id, deque(maxlen=64)).append((now / 1000.0, rssi))
         self._counters['rx_beacon'] += 1
         self._log.log('rx_beacon', peer=node_id, rssi=rssi, peer_boot_id=boot_id,
                       peer_ts_ms=timestamp_ms, clock_offset_ms=clock_offset_ms)
@@ -1428,10 +1450,24 @@ class RoverDaemon:
                 fields['pm'] = nst['mode']                       # pose source in use: fused | camera
             if nst.get('rb') in (0, 1):
                 fields['rb'] = nst['rb']                         # 1 RB required, 0 not (rover_nav.py)
+            if isinstance(nst.get('dm'), (int, float)) and nst['dm'] > 0:
+                fields['dm'] = round(float(nst['dm']), 1)        # radio deadman [s] (0 = controller needed)
+            if nst.get('go'):
+                fields['go'] = nst['go']                         # what lets it drive: joy | radio
+            if isinstance(nst.get('start'), (int, float)):
+                fields['ns'] = int(nst['start'])                 # rover_nav.py start: changes = pose restarted at 0
+        bs_age = self._bs_age()
+        if bs_age is not None:
+            fields['bsa'] = round(bs_age, 1)                     # s since the BS was reachable (maybe via a relay)
         if self._relay is not None and self._relay.cfg is not None:
-            # rl state, rm link model, rtx/rty target, rsc/rcu/rdi predicted dBm (target / here /
-            # explorer direct), rea explorer fix age [s]; see relay_brain.RelayDriver.tick
+            # rl state, rm link model, rtx/rty target, rsc/rcu/rdi weaker link dBm (target / here,
+            # measurement-corrected when measured is on / explorer direct, model), rea explorer fix
+            # age [s], rmb/rme measured RSSI from the BS / explorer; see relay_brain.RelayDriver.tick
             fields.update((k, v) for k, v in self._relay.status.items() if k != 'why')
+            why = self._relay.status.get('why') or self._relay.why
+            if why:
+                # reason for the last decision, e.g. "here -60 dBm; best -58 dBm" (no , = :)
+                fields['rwhy'] = ''.join(ch if ch not in ',=:' else ';' for ch in why)[:60]
         elif self._relay_state == 'unavailable':
             fields['rl'] = 'unavailable'
         self._queue_telemetry(f"@ROVER_STATUS:{self._node_id}:"
@@ -1689,8 +1725,10 @@ class RoverDaemon:
         self._counters['rx_control'] += 1
         self._sync_clock(msg)                     # every copy, also repeats of a known version
         self._merge_fleet(msg)                    # likewise; not part of the versioned state
+        self._note_bs_contact(msg)
         msg.pop('t', None)
         msg.pop('hop', None)
+        msg.pop('bsh', None)
         if version <= self._ctrl_version:
             return                                # already have this one (or newer)
         self._log.log('rx_control', origin=origin, version=version, rssi=rssi, msg=msg)
@@ -1708,8 +1746,14 @@ class RoverDaemon:
                 print(f"[NAV] v{version}: {result}")
                 self._log.log('pose_mode', mode=pose_mode, ctrl_version=version, result=result)
         if self._nav is not None:
-            # "rb": {"<node>": 0} = RB not required on that rover; no entry = required
-            result = self._nav.set_rb_required((msg.get('rb') or {}).get(str(self._node_id), 1) != 0)
+            # "rb": {"<node>": 0} = RB not required on that rover; no entry = required.
+            # "dm": {"<node>": s} = with RB not required, it may drive without a controller while
+            # the BS was heard within s seconds (radio deadman); no entry = controller needed
+            try:
+                deadman = float((msg.get('dm') or {}).get(str(self._node_id), 0) or 0)
+            except (TypeError, ValueError, AttributeError):
+                deadman = 0.0
+            result = self._nav.set_rb_required((msg.get('rb') or {}).get(str(self._node_id), 1) != 0, deadman)
             if result is not None:
                 print(f"[NAV] v{version}: {result}")
                 self._log.log('rb_setting', ctrl_version=version, result=result)
@@ -1782,15 +1826,17 @@ class RoverDaemon:
     # relay role (relay_brain.py)
     def _on_relay_setting(self, cfg, version: int) -> None:
         """BS setting for this rover: [explorer node, speed, ferry_s(, comfort_dbm, gain_db,
-        predict_s(, link model))], or none = relay off."""
+        predict_s(, link model(, measured 1|0)))], or none = relay off."""
         want = None
-        if isinstance(cfg, list) and len(cfg) in (3, 6, 7):
+        if isinstance(cfg, list) and len(cfg) in (3, 6, 7, 8):
             try:
                 want = {'ex': str(cfg[0]), 'speed': float(cfg[1]), 'ferry_s': float(cfg[2])}
                 if len(cfg) >= 6:
                     want.update(comfort_dbm=float(cfg[3]), gain_db=float(cfg[4]), predict_s=float(cfg[5]))
-                if len(cfg) == 7:
+                if len(cfg) >= 7:
                     want['model'] = str(cfg[6])
+                if len(cfg) == 8:
+                    want['measured'] = bool(cfg[7])
             except (TypeError, ValueError):
                 want = None
         if self._relay is None:
@@ -1834,6 +1880,17 @@ class RoverDaemon:
             best = (loc['bs_t'], self._to_map(al, loc['lat'], loc['lon']))
         return best
 
+    def _measured_rssi(self, node_id: int) -> Optional[float]:
+        """Median beacon RSSI from a peer over the last MEAS_WINDOW_S, None if nothing heard for
+        MEAS_STALE_S (relay_brain treats that as a lost link)."""
+        import relay_brain                         # numpy: only loaded with a relay driver
+        hist = self._rssi_hist.get(node_id)
+        now = time.monotonic()
+        if not hist or now - hist[-1][0] > relay_brain.MEAS_STALE_S:
+            return None
+        vals = sorted(r for t, r in hist if now - t <= relay_brain.MEAS_WINDOW_S)
+        return float(vals[len(vals) // 2]) if vals else None
+
     def _relay_tick(self) -> None:
         r = self._relay
         if r is None or r.cfg is None:
@@ -1844,8 +1901,11 @@ class RoverDaemon:
             return
         nav_state = (self._nav.status().get('nav') if self._nav is not None else None) or 'no_node'
         try:
+            ex = int(r.cfg['ex']) if r.cfg['ex'].isdigit() else None
+            meas = {'bs': self._measured_rssi(BASE_STATION_NODE_ID),
+                    'ex': self._measured_rssi(ex) if ex is not None else None}
             route = r.tick(FLEET_CLOCK.now(), self._own_map_pose(), self._explorer_fix(r.cfg['ex']),
-                           self._bs_xy, nav_state)
+                           self._bs_xy, nav_state, meas)
         except Exception as e:                    # never take the radio daemon down
             r.status = {'rl': 'error'}
             print(f"[RELAY] error: {type(e).__name__}: {e}")
@@ -1891,14 +1951,42 @@ class RoverDaemon:
             self._log.log('clock_sync', offset_s=round(FLEET_CLOCK.offset, 3),
                           step_s=round(step, 3), hop=hop)
 
+    def _note_bs_contact(self, msg: dict) -> None:
+        """Newest BS time at which the BS was still reachable: a copy straight from the BS
+        (hop 0) gives its own time, a relayed copy its sender's "bsh". "t" on a relayed copy is
+        only the relay's clock estimate, so it says nothing about the BS still being there."""
+        heard = []
+        try:
+            if int(msg.get('hop', -1)) == 0 and msg.get('t') is not None:
+                heard.append(float(msg['t']))
+        except (TypeError, ValueError):
+            pass
+        try:
+            if msg.get('bsh') is not None:
+                heard.append(float(msg['bsh']))
+        except (TypeError, ValueError):
+            pass
+        for t in heard:
+            if math.isfinite(t) and (self._bs_heard_t is None or t > self._bs_heard_t):
+                self._bs_heard_t = t
+
+    def _bs_age(self) -> Optional[float]:
+        """Seconds since the BS was last reachable (BS time), None if never or no clock sync."""
+        if self._bs_heard_t is None or not FLEET_CLOCK.synced:
+            return None
+        return max(0.0, FLEET_CLOCK.now() - self._bs_heard_t)
+
     def _relay_control(self) -> None:
-        """Re-broadcast the adopted control message, stamped with our BS-time estimate."""
+        """Re-broadcast the adopted control message, stamped with our BS-time estimate and the
+        last time we know the BS was reachable (bsh, for other rovers' radio deadman)."""
         if self._ctrl_msg is None:
             return
         origin, msg = self._ctrl_msg
         msg = dict(msg, **self._fleet_fields())
         if FLEET_CLOCK.synced:
             msg = dict(msg, t=round(FLEET_CLOCK.now(), 3), hop=FLEET_CLOCK.hop + 1)
+        if self._bs_heard_t is not None:
+            msg['bsh'] = round(self._bs_heard_t, 1)
         self._air_tx(pack_control(self._ctrl_version, msg, origin), 'control',
                      version=self._ctrl_version)
 
@@ -2093,6 +2181,8 @@ class RoverDaemon:
             if (mono - last_beacon) >= BEACON_INTERVAL_S:
                 last_beacon = mono
                 self._send_beacon()
+                if self._nav is not None:
+                    self._nav.write_radio(self._bs_age())
             if (mono - last_forward) >= self._forward_interval_s:
                 last_forward = mono
                 self._forward()

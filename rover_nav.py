@@ -25,18 +25,23 @@ RB not required (dashboard setting; radio_daemon.py writes <nav_dir>/rb.json {"r
 false}, /tmp, so a reboot requires RB again): joy_teleop's idle zero on input/teleop
 (priority 5) would block input/navigation, so commands go to ~auto_topic instead, an extra
 mux input above teleop (ackermann_cmd_mux/param/mux.yaml: "Autonomy", input/autonomy,
-priority 6, timeout 0.2). The controller must still be connected (fresh joystick messages,
-else it stops) and holding LB (~lb_button) silences this node, so the mux falls back to
-manual teleop within its 0.2 s timeout. It also stops for good at the end of the route, if it ends up more than ~max_xte
+priority 6, timeout 0.2). Holding LB (~lb_button) silences this node, so the mux falls back
+to manual teleop within its 0.2 s timeout. The controller must stay connected (fresh joystick
+messages, else it stops), unless rb.json has "deadman_s" > 0 (radio deadman, dashboard): then
+with no controller it keeps driving while the BS was heard, directly or through a relay,
+within deadman_s (radio_daemon.py writes <nav_dir>/radio.json {"t", "bs_age"} every second;
+a stale file counts as no BS). It also stops for good at the end of the route, if it ends up more than ~max_xte
 from the route, or when the BS sends a stop. A route that was already in route.json when
 the node started is never driven (no replay after a stack restart).
 
 Progress goes to <nav_dir>/status.json for radio_daemon.py:
     {"t", "nav", "cmd", "ni", "np", "xte", "loc", "mode"}
-    nav: idle | hold_rb | no_joy | manual | no_t265 | no_wheels | following | done |
-         stopped_off_route | stopped_bs      (no_joy / manual: RB not required, see above)
+    nav: idle | hold_rb | no_joy | no_radio | manual | no_t265 | no_wheels | following | done |
+         stopped_off_route | stopped_bs      (no_joy / no_radio / manual: RB not required)
     loc: fused | wheel | wait (fused mode), camera | no_t265 (camera mode)
-    rb:  1 = RB required, 0 = not
+    rb:  1 = RB required, 0 = not;  dm: radio deadman [s] (0 = controller needed)
+    go:  what lets it drive now: joy (controller) | radio (deadman) | ''
+    start: when this node started (a new value = the pose restarted at 0)
 
 Python 2 (ROS Melodic rospy) and 3. Needs odom_fusion.py next to it.
 """
@@ -60,6 +65,7 @@ DENSIFY_M = 0.25        # route resampled to this spacing for progress tracking
 SEARCH_AHEAD_M = 6.0    # nearest-point search window ahead of the current progress
 STATUS_PERIOD_S = 0.5
 CAM_STALE_S = 0.5       # T265 silent this long = no camera pose
+RADIO_FILE_STALE_S = 3.0  # radio.json older than this = radio_daemon.py not updating it = no BS
 MODES = ('fused', 'camera')
 
 
@@ -144,7 +150,12 @@ class RoverNav(object):
         self._pose_mtime = None
         self.joy_t, self.rb, self.lb = 0.0, False, False
         self.rb_required = True
+        self.deadman_s = 0.0                       # radio deadman (rb.json), 0 = controller needed
         self._rb_mtime = None
+        self._radio = (0.0, None)                  # (local time written, s since the BS was heard)
+        self._radio_mtime = None
+        self.go_by = ''
+        self.start_t = time.time()
         self.route = None
         self.state = 'idle'
         self.seen_cmd = self._route_file_cmd()     # never drive a route left over from before
@@ -237,18 +248,43 @@ class RoverNav(object):
         if mtime == self._rb_mtime:
             return
         self._rb_mtime = mtime
-        required = True                            # no file (e.g. after a reboot) = RB required
+        required, deadman = True, 0.0              # no file (e.g. after a reboot) = RB required
         if mtime is not None:
             try:
                 with open(path) as f:
-                    required = bool(json.load(f).get('required', True))
-            except (IOError, OSError, ValueError, AttributeError):
-                required = True
-        if required != self.rb_required:
-            self.rb_required = required
+                    d = json.load(f)
+                required = bool(d.get('required', True))
+                deadman = 0.0 if required else max(0.0, float(d.get('deadman_s', 0.0) or 0.0))
+            except (IOError, OSError, ValueError, AttributeError, TypeError):
+                required, deadman = True, 0.0
+        if (required, deadman) != (self.rb_required, self.deadman_s):
+            self.rb_required, self.deadman_s = required, deadman
             self._last_status = 0.0
             rospy.logwarn("rover_nav: RB %s", "required again" if required else
-                          "NOT required: driving on %s, hold LB to take over" % self.auto_topic)
+                          "NOT required: driving on %s, hold LB to take over; %s" % (
+                              self.auto_topic, "no controller needed while the BS was heard within %g s"
+                              % deadman if deadman > 0 else "controller must stay connected"))
+
+    def _poll_radio(self):
+        path = os.path.join(self.nav_dir, 'radio.json')
+        try:
+            mtime = os.path.getmtime(path)
+            if mtime == self._radio_mtime:
+                return
+            self._radio_mtime = mtime
+            with open(path) as f:
+                d = json.load(f)
+            age = d.get('bs_age')
+            self._radio = (float(d['t']), None if age is None else float(age))
+        except (IOError, OSError, ValueError, KeyError, TypeError):
+            return
+
+    def radio_ok(self, now):
+        """Radio deadman: on, radio.json fresh, and the BS heard within deadman_s."""
+        t, age = self._radio
+        if self.deadman_s <= 0 or age is None or now - t > RADIO_FILE_STALE_S:
+            return False
+        return age + max(0.0, now - t) <= self.deadman_s
 
     def _publish_pose(self, _event):
         p = self.pose()
@@ -334,9 +370,17 @@ class RoverNav(object):
         self._poll_pose_mode()
         self._poll_route()
         self._poll_rb()
+        self._poll_radio()
         joy_ok = now - self.joy_t <= self.joy_timeout
         rb = self.rb and joy_ok
-        go = rb if self.rb_required else (joy_ok and not self.lb)
+        if self.rb_required:
+            go, self.go_by = rb, ('joy' if rb else '')
+        elif joy_ok:
+            go, self.go_by = not self.lb, ('joy' if not self.lb else '')
+        else:
+            # controller gone (out of Bluetooth range): only the radio deadman lets it drive
+            go = self.radio_ok(now)
+            self.go_by = 'radio' if go else ''
         src = self.source(now)
         wheel_age = self.fusion.wheel_age(now)
         r = self.route
@@ -356,7 +400,8 @@ class RoverNav(object):
         # mux timing out (with RB released teleop's own zero wins anyway; with the controller
         # gone nothing else would be commanding).
         if not go:
-            self.state = ('hold_rb' if self.rb_required else 'manual' if joy_ok else 'no_joy')
+            self.state = ('hold_rb' if self.rb_required else 'manual' if joy_ok
+                          else 'no_radio' if self.deadman_s > 0 else 'no_joy')
         elif wheel_age is None or wheel_age > self.wheel_timeout:
             self.state = 'no_wheels'
         elif src not in ('fused', 'camera') or hdg is None:
@@ -394,7 +439,8 @@ class RoverNav(object):
         self._last_status = now
         r = self.route
         st = {'t': now, 'nav': self.state, 'loc': src, 'mode': self.mode,
-              'cmd': r.cmd if r else self.seen_cmd, 'rb': 1 if self.rb_required else 0}
+              'cmd': r.cmd if r else self.seen_cmd, 'rb': 1 if self.rb_required else 0,
+              'dm': self.deadman_s, 'go': self.go_by, 'start': self.start_t}
         if r is not None:
             st.update(ni=r.s[r.idx], np=r.length, xte=r.xte)
         tmp = os.path.join(self.nav_dir, 'status.json.tmp')

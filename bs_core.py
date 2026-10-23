@@ -149,6 +149,9 @@ class BSCore:
         self.pose_modes: Dict[str, str] = {}  # node -> "fused" | "camera" (rover_nav.py pose source)
         # rovers whose rover_nav.py drives without RB held (mux Autonomy input, LB overrides)
         self.rb_off: Dict[str, int] = {}      # node -> 0, carried as "rb" on every control msg
+        self.deadman: Dict[str, float] = {}   # node -> radio deadman s (with rb_off), carried as "dm"
+        self.nav_start: Dict[str, float] = {} # node -> rover_nav.py start time it last reported (ns)
+        self.pose_reset: Dict[str, str] = {}  # node -> why its pose restarted at 0 since it was placed
         # node -> [explorer node, speed m/s, ferry_s, comfort dBm, gain dB, look-ahead s, link model]:
         # that rover acts as a relay (relay_brain.py)
         self.relay_cfg: Dict[str, list] = {}
@@ -547,6 +550,27 @@ class BSCore:
         self._csv('coverage.csv', self._coverage_header(), row)
 
     # map alignment
+    def _check_pose_reset(self, node: str, fields: dict) -> None:
+        """A ROS stack restart starts rover_nav.py's pose at (0, 0) again, so the rover's map
+        alignment no longer fits (routes and the relay then use wrong positions). Flag it until
+        the rover is placed again: rover_nav.py's start time (ns) changed, or the stack was seen
+        stopping / gone (rovers without ns). Only for rovers that have an alignment."""
+        ns, prev = fields.get('ns'), self.nav_start.get(node)
+        if isinstance(ns, float):
+            self.nav_start[node] = ns
+        if node in self.pose_reset or node not in self.alignments.data:
+            return
+        why = None
+        if isinstance(ns, float) and prev is not None and ns != prev:
+            why = "rover_nav restarted (ROS stack restart)"
+        elif fields.get('ros') in ('stopping', 'off') or fields.get('nav') == 'no_node':
+            why = f"ROS stack {fields.get('ros') if fields.get('ros') in ('stopping', 'off') else 'node gone'}"
+        if why:
+            self.pose_reset[node] = why
+            self._event('warn', f"{node}: POSE RESET ({why}): its pose starts at (0, 0) again; "
+                                f"place it on the map again before routes or relaying")
+            self._log_serial(f"#POSE_RESET:{node}:{why}")
+
     def set_alignment(self, node: str, al: dict, note: str = '') -> None:
         """Store a rover's odometry -> map alignment (see site_map.py) and log the change."""
         now = time.time()
@@ -556,6 +580,8 @@ class BSCore:
                 return
             self.alignments.set(node, al)
             self.align_ts[node] = now
+            if self.pose_reset.pop(node, None):
+                self._event('map', f"{node}: pose reset cleared (placed again)")
             a = self.alignments.get(node)
             self._log_serial(f"#ALIGN:{node}:{a['x']:.3f}:{a['y']:.3f}:{a['theta']:.2f}:{note}")
             self._csv('alignments.csv', ALIGN_HEADER,
@@ -727,6 +753,7 @@ class BSCore:
                                    f"(ctrl v{int(fields.get('cv', 0) or 0)})")
         fields['updated_at'] = now
         self.rover_status[parts[1]] = fields
+        self._check_pose_reset(parts[1], fields)
         nav = self.nav_cmds.get(parts[1])
         nc = fields.get('nc')
         if nav and len(nav) == 3 and isinstance(nc, float) and nc >= nav[0]:
@@ -810,6 +837,9 @@ class BSCore:
                 msg = dict(msg, relay={n: list(c) for n, c in self.relay_cfg.items()})
             if self.rb_off:
                 msg = dict(msg, rb=dict(self.rb_off))
+            dm = {n: v for n, v in self.deadman.items() if n in self.rb_off and v > 0}
+            if dm:
+                msg = dict(msg, dm=dm)
             self.control['version'] = max(int(time.time()), self.control['version'] + 1)
             self.control['msg'] = msg
             self.control['sent_at'] = time.time()
@@ -862,7 +892,7 @@ class BSCore:
 
     def _base_msg(self) -> dict:
         """Current fleet state without the per-rover command fields (_set_control adds them)."""
-        return {k: v for k, v in (self.control['msg'] or {}).items() if k not in ('ros', 'nav', 'pose', 'relay', 'rb')}
+        return {k: v for k, v in (self.control['msg'] or {}).items() if k not in ('ros', 'nav', 'pose', 'relay', 'rb', 'dm')}
 
     def set_pose_mode(self, node: str, mode: str) -> None:
         """Pose source of rover_nav.py on a rover: 'fused' (wheel distance + T265 heading) or
@@ -873,16 +903,24 @@ class BSCore:
             self.pose_modes[node] = mode
         self._set_control(self._base_msg(), f"pose source {mode}: {node}")
 
-    def set_rb_required(self, node: str, required: bool) -> None:
+    def set_rb_required(self, node: str, required: bool, deadman_s: float = 0.0) -> None:
         """Whether rover_nav.py on a rover needs RB held to drive. Off: it drives on the mux's
         Autonomy input (above teleop) while its controller is connected; LB still overrides.
-        A setting, carried on every control message."""
+        deadman_s > 0 (with RB off): it may also drive with no controller, as long as it heard
+        the BS (directly or through a relay) within deadman_s. Settings, carried on every
+        control message."""
+        deadman_s = round(max(0.0, float(deadman_s)), 1)
         with self.lock:
             if required:
                 self.rb_off.pop(node, None)
+                self.deadman.pop(node, None)
             else:
                 self.rb_off[node] = 0
-        self._set_control(self._base_msg(), f"RB {'required' if required else 'NOT required'}: {node}")
+                self.deadman[node] = deadman_s
+        note = "required" if required else "NOT required, " + (
+            f"no controller needed while the BS is heard within {deadman_s:g} s" if deadman_s > 0
+            else "controller needed")
+        self._set_control(self._base_msg(), f"RB {note}: {node}")
 
     # routes (rover_nav.py on the rover drives them; RB on its controller must be held unless rb_off)
     def plan_route(self, node: str, waypoints: List[List[float]]):
@@ -918,8 +956,10 @@ class BSCore:
                 trial = dict(self._base_msg(), ros={n: list(c) for n, c in self.ros_cmds.items()},
                              nav=dict(others, **{node: cmd}), pose=dict(self.pose_modes),
                              relay={n: list(c) for n, c in self.relay_cfg.items() if n != node},
-                             rb=dict(self.rb_off),
-                             **self._live_fields(), t=0.0, hop=0)
+                             rb=dict(self.rb_off), dm=dict(self.deadman),
+                             # a relaying rover adds its BS-time t, hop and bsh
+                             **self._live_fields(), t=round(time.time(), 3), hop=9,
+                             bsh=round(time.time(), 1))
                 if len(json.dumps(trial, separators=(',', ':'))) <= CONTROL_MAX_JSON:
                     break
             else:
@@ -966,16 +1006,17 @@ class BSCore:
     # relay role (relay_brain.py in the rover's radio_daemon.py, which needs --site)
     def set_relay(self, node: str, explorer: str, speed: float, ferry_s: float,
                   comfort_dbm: float = -75.0, gain_db: float = 6.0, predict_s: float = 4.0,
-                  model: str = 'nn_pmnet') -> str:
+                  model: str = 'nn_pmnet', measured: bool = True) -> str:
         """Make a rover keep itself between the BS and the explorer (or change its settings:
         same explorer = no reset on the rover). Returns '' or why not. The tuning values are
         relay_brain.DEFAULTS comfort_dbm / gain_db / predict_s; model = link table key on the
-        rover (nn_pmnet, nn) or 'distance'."""
+        rover (nn_pmnet, nn) or 'distance'; measured = correct the model with the RSSI the relay
+        hears (comfort/gain then in real ESP32 dBm, else in model units)."""
         if not node or not explorer or node == explorer:
             return "pick a relay rover and a different explorer rover"
         speed = round(min(max(float(speed), 0.1), ROUTE_SPEED_MAX), 2)
         cfg = [str(explorer), speed, round(float(ferry_s), 1), round(float(comfort_dbm), 1),
-               round(float(gain_db), 1), round(float(predict_s), 1), str(model)]
+               round(float(gain_db), 1), round(float(predict_s), 1), str(model), int(bool(measured))]
         with self.lock:
             self.relay_cfg[node] = cfg
             self.routes.pop(node, None)
@@ -986,6 +1027,7 @@ class BSCore:
         self._set_control(self._base_msg(), f"relay on: {node} for explorer {explorer} at {speed:g} m/s, "
                                             f"ferry after {cfg[2]:g} s, comfort {cfg[3]:g} dBm, "
                                             f"gain {cfg[4]:g} dB, look-ahead {cfg[5]:g} s, model {cfg[6]}"
+                                            + (", measured RSSI" if measured else ", model only")
                                             + (f" (relay on {explorer} stopped)" if swapped else ""))
         return ''
 
@@ -1072,7 +1114,9 @@ class BSCore:
                 'alignments': {n: self.alignments.get(n) for n in self.locations},
                 'routes': {n: dict(r) for n, r in self.routes.items()},
                 'relay_cfg': {n: list(c) for n, c in self.relay_cfg.items()},
+                'pose_reset': dict(self.pose_reset),
                 'rb_off': dict(self.rb_off),
+                'deadman': dict(self.deadman),
                 'bs': dict(self._bs_position() or {}, rm_version=self.rm_version, rm_job=dict(self.rm_job)),
                 'events': [e for e in self.events if e[0] > since_event],
                 'n_delivered': len(self.delivered),

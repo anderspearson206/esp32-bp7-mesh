@@ -15,6 +15,13 @@ Link models (LinkModel), chosen from the dashboard per relay:
               kept on the drivable area
 The rover loads every <site>_linktab_*.npz in its terrain folder at startup (find_tables).
 
+Measured RSSI (on by default, dashboard "Measured RSSI"): the rover passes the RSSI it hears
+from the BS and from the explorer (beacons, median over MEAS_WINDOW_S; not heard for MEAS_STALE_S
+counts as LOST_DBM). Each link's prediction is shifted by (measured - predicted at the current
+positions), so the weaker link here is the measured one and comfort/gain are real ESP32 dBm; the
+model only says which spots are better than here. Off = model numbers only (the model reads
+~20 dB above the ESP32s, so comfort then has to be in model units).
+
 Behaviour (RelayBrain.step), every RELAY_TICK_S:
     The explorer's position is predicted PREDICT_S ahead from its recent fixes, so the relay
     starts moving before the link gets weak. With no target yet the relay stays where it is
@@ -51,7 +58,14 @@ DEFAULTS = {
     'max_ex_speed': 1.5,       # m/s cap on the explorer velocity estimate
     'stale_s': 10.0,           # explorer fix older than this = explorer lost
     'ferry_s': 15.0,           # lost this much longer = drive to its last known position
+    'measured': True,          # correct the model with the measured RSSI of both links
 }
+
+# measured RSSI (fed by radio_daemon.py; see RelayBrain.step)
+MEAS_WINDOW_S = 8.0            # median of the beacons heard this long
+MEAS_STALE_S = 5.0             # nothing heard this long = link lost
+LOST_DBM = -95.0               # a lost link counts as this
+OFFSET_MIN_DB, OFFSET_MAX_DB = -50.0, 20.0   # measured - predicted, clamped
 
 # fallback path loss: rss = P0 - 10 n log10(d)
 DIST_P0_DBM = -40.0
@@ -164,11 +178,14 @@ class RelayBrain(object):
             px, py = x + vx * ahead, y + vy * ahead
         return (x, y), now - t, (px, py)
 
-    def step(self, now: float, relay_xy, bs_xy) -> dict:
-        """One decision. Returns {'state', 'target' (xy or None), 'new_target' (bool),
-        'score_target', 'score_here', 'direct', 'ex_age', 'why'}."""
+    def step(self, now: float, relay_xy, bs_xy, meas: Optional[dict] = None) -> dict:
+        """One decision. meas = {'bs': dBm, 'ex': dBm} measured RSSI from the BS / explorer
+        (None in a value = not heard; meas None = model only). Returns {'state', 'target' (xy
+        or None), 'new_target' (bool), 'score_target', 'score_here', 'direct', 'ex_age',
+        'meas_bs', 'meas_ex', 'why'}."""
         p, m = self.p, self.model
-        out = {'new_target': False, 'score_here': None, 'direct': None, 'ex_age': None, 'why': ''}
+        out = {'new_target': False, 'score_here': None, 'direct': None, 'ex_age': None,
+               'meas_bs': None, 'meas_ex': None, 'why': ''}
 
         def done(state, why=''):
             self.state = state
@@ -198,8 +215,14 @@ class RelayBrain(object):
                 out['new_target'] = True
             return done('ferry', f"explorer silent {age:.0f} s: to its last position")
 
-        score = np.minimum(to_bs, m.link_to(pred_xy))
         i_here = m.nearest_cand(relay_xy)
+        off_bs = off_ex = 0.0
+        if meas is not None and p['measured']:
+            out['meas_bs'] = mb = LOST_DBM if meas.get('bs') is None else float(meas['bs'])
+            out['meas_ex'] = me = LOST_DBM if meas.get('ex') is None else float(meas['ex'])
+            off_bs = min(max(mb - float(to_bs[i_here]), OFFSET_MIN_DB), OFFSET_MAX_DB)
+            off_ex = min(max(me - float(m.link_to(last_xy)[i_here]), OFFSET_MIN_DB), OFFSET_MAX_DB)
+        score = np.minimum(to_bs + off_bs, m.link_to(pred_xy) + off_ex)
         here = float(score[i_here])
         out['score_here'] = here
         dist = np.hypot(*(m.cand_xy - np.asarray(relay_xy, float)).T)
@@ -269,7 +292,8 @@ class RelayDriver(object):
         if old is None or old.get('ex') != cfg.get('ex'):
             self.brain.reset()
             self._sent_target = None
-        self.brain.set_params(**{k: cfg.get(k) for k in ('ferry_s', 'comfort_dbm', 'gain_db', 'predict_s')})
+        self.brain.set_params(**{k: cfg.get(k) for k in ('ferry_s', 'comfort_dbm', 'gain_db', 'predict_s',
+                                                          'measured')})
         want = cfg.get('model') or self.default_model
         missing = ''
         if want not in self.models:
@@ -279,21 +303,22 @@ class RelayDriver(object):
         p = self.brain.p
         return (f"relay for {cfg.get('ex')} at {cfg.get('speed')} m/s, model {want}{missing} (ferry after "
                 f"{p['ferry_s']:g} s, comfort {p['comfort_dbm']:g} dBm, gain {p['gain_db']:g} dB, "
-                f"look-ahead {p['predict_s']:g} s)")
+                f"look-ahead {p['predict_s']:g} s, {'measured RSSI' if p['measured'] else 'model only'})")
 
-    def tick(self, now: float, relay_xy, ex_fix, bs_xy, nav_state: str):
-        """ex_fix = (bs_time, (x, y)) of the explorer or None. Returns map points or None."""
+    def tick(self, now: float, relay_xy, ex_fix, bs_xy, nav_state: str, meas: Optional[dict] = None):
+        """ex_fix = (bs_time, (x, y)) of the explorer or None; meas see RelayBrain.step.
+        Returns map points or None."""
         if self.cfg is None:
             return None
         if ex_fix is not None:
             self.brain.add_fix(ex_fix[0], ex_fix[1])
-        d = self.brain.step(now, relay_xy, bs_xy)
+        d = self.brain.step(now, relay_xy, bs_xy, meas)
         self.why = d['why']
         st = {'rl': d['state'], 'rm': self.brain.model.key}
         if d['target'] is not None:
             st['rtx'], st['rty'] = round(d['target'][0], 1), round(d['target'][1], 1)
         for k, v in (('rsc', d['score_target']), ('rcu', d['score_here']), ('rdi', d['direct']),
-                     ('rea', d['ex_age'])):
+                     ('rea', d['ex_age']), ('rmb', d['meas_bs']), ('rme', d['meas_ex'])):
             if v is not None:
                 st[k] = round(float(v), 1 if k != 'rea' else 0)
         route = None
