@@ -377,6 +377,11 @@ def _read_exact(ser: serial.Serial, n: int, timeout_s: float = 1.0) -> bytes:
     return buf
 
 
+# serial frames from the ESP32 that were dropped: oversized length claim, CRC mismatch, cut off
+# (header or CRC missing). Logged with the counters and reported as fe= in @ROVER_STATUS.
+FRAME_ERRORS: Dict[str, int] = defaultdict(int)
+
+
 def recv_frame(ser: serial.Serial, timeout_s: float = 1.0, verbose: bool = False,
                on_ascii: Optional[Callable[[str], None]] = None) -> Optional[Tuple[int, bytes]]:
     """Block until a valid frame arrives or timeout. Returns (cmd, payload) or None.
@@ -404,20 +409,25 @@ def recv_frame(ser: serial.Serial, timeout_s: float = 1.0, verbose: bool = False
         _flush_skipped()
         header = _read_exact(ser, 3, timeout_s=0.2)
         if len(header) < 3:
+            FRAME_ERRORS['short'] += 1
             return None
         cmd = header[0]
         plen = header[1] | (header[2] << 8)
         if plen > HOST_MAX_PAYLOAD:
             print(f"[RECV] Oversized payload claim {plen} > {HOST_MAX_PAYLOAD}, discarding")
+            FRAME_ERRORS['oversized'] += 1
             continue
         payload = _read_exact(ser, plen, timeout_s=1.0) if plen else b''
         crc_bytes = _read_exact(ser, 2, timeout_s=0.2)
         if len(crc_bytes) < 2:
+            FRAME_ERRORS['short'] += 1
             return None
         recv_crc = crc_bytes[0] | (crc_bytes[1] << 8)
         calc_crc = _crc16(bytes([cmd, header[1], header[2]]) + payload)
         if recv_crc != calc_crc:
-            print(f"[WARN] CRC mismatch cmd=0x{cmd:02x} expected=0x{calc_crc:04x} got=0x{recv_crc:04x}")
+            print(f"[WARN] CRC mismatch cmd=0x{cmd:02x} expected=0x{calc_crc:04x} got=0x{recv_crc:04x} "
+                  f"len={plen}")
+            FRAME_ERRORS['crc'] += 1
             continue
         if verbose:
             print(f"[RECV] Frame cmd=0x{cmd:02x} len={plen}")
@@ -1136,6 +1146,12 @@ class RoverDaemon:
         self._counters['rx_beacon'] += 1
         self._log.log('rx_beacon', peer=node_id, rssi=rssi, peer_boot_id=boot_id,
                       peer_ts_ms=timestamp_ms, clock_offset_ms=clock_offset_ms)
+        if node_id == BASE_STATION_NODE_ID and FLEET_CLOCK.synced:
+            # the BS is in direct range (radio deadman): control copies can be lost while its
+            # beacons still get through (2026-10-23)
+            t = FLEET_CLOCK.now()
+            if self._bs_heard_t is None or t > self._bs_heard_t:
+                self._bs_heard_t = t
 
         if not (was_absent or restarted):
             return
@@ -1459,6 +1475,8 @@ class RoverDaemon:
         bs_age = self._bs_age()
         if bs_age is not None:
             fields['bsa'] = round(bs_age, 1)                     # s since the BS was reachable (maybe via a relay)
+        if FRAME_ERRORS:
+            fields['fe'] = sum(FRAME_ERRORS.values())            # serial frames from the ESP32 dropped (CRC etc.)
         if self._relay is not None and self._relay.cfg is not None:
             # rl state, rm link model, rtx/rty target, rsc/rcu/rdi weaker link dBm (target / here,
             # measurement-corrected when measured is on / explorer direct, model), rea explorer fix
@@ -1731,7 +1749,7 @@ class RoverDaemon:
         msg.pop('bsh', None)
         if version <= self._ctrl_version:
             return                                # already have this one (or newer)
-        self._log.log('rx_control', origin=origin, version=version, rssi=rssi, msg=msg)
+        self._log.log('rx_control', origin=origin, version=version, rssi=rssi, bytes=len(rest), msg=msg)
         self._ctrl_version = version
         self._ctrl_msg = (origin, msg)
         self._relay_control()                     # relay once immediately (multi-hop)
@@ -1954,7 +1972,8 @@ class RoverDaemon:
     def _note_bs_contact(self, msg: dict) -> None:
         """Newest BS time at which the BS was still reachable: a copy straight from the BS
         (hop 0) gives its own time, a relayed copy its sender's "bsh". "t" on a relayed copy is
-        only the relay's clock estimate, so it says nothing about the BS still being there."""
+        only the relay's clock estimate, so it says nothing about the BS still being there.
+        A BS beacon heard directly counts too (_on_beacon)."""
         heard = []
         try:
             if int(msg.get('hop', -1)) == 0 and msg.get('t') is not None:
@@ -1978,17 +1997,23 @@ class RoverDaemon:
 
     def _relay_control(self) -> None:
         """Re-broadcast the adopted control message, stamped with our BS-time estimate and the
-        last time we know the BS was reachable (bsh, for other rovers' radio deadman)."""
+        last time we know the BS was reachable (bsh, for other rovers' radio deadman). The fleet
+        picture we hold goes in a second copy with version 0, which nobody adopts (every copy's
+        t / fleet / bsh are read before the version check), so the versioned copy stays small:
+        on 2026-10-23 BS copies over ~640 bytes stopped reaching the rovers in the field."""
         if self._ctrl_msg is None:
             return
         origin, msg = self._ctrl_msg
-        msg = dict(msg, **self._fleet_fields())
+        stamp = {}
         if FLEET_CLOCK.synced:
-            msg = dict(msg, t=round(FLEET_CLOCK.now(), 3), hop=FLEET_CLOCK.hop + 1)
+            stamp.update(t=round(FLEET_CLOCK.now(), 3), hop=FLEET_CLOCK.hop + 1)
         if self._bs_heard_t is not None:
-            msg['bsh'] = round(self._bs_heard_t, 1)
-        self._air_tx(pack_control(self._ctrl_version, msg, origin), 'control',
+            stamp['bsh'] = round(self._bs_heard_t, 1)
+        self._air_tx(pack_control(self._ctrl_version, dict(msg, **stamp), origin), 'control',
                      version=self._ctrl_version)
+        fleet = self._fleet_fields()
+        if fleet:
+            self._air_tx(pack_control(0, dict(fleet, **stamp), origin), 'control', version=0)
 
     def _check_pending_start(self) -> None:
         p = self._pending_start
@@ -2045,8 +2070,11 @@ class RoverDaemon:
                       radio_on=self._radio_on, window_left_s=left, cycle=cycle,
                       tokens=self._policy.tokens(), peers=peers,
                       bs_clock_offset=round(FLEET_CLOCK.offset, 3) if FLEET_CLOCK.synced else None,
-                      loc=dict(self._own_location), counters=dict(self._counters),
+                      loc=dict(self._own_location), counters=self._all_counters(),
                       **self._store_counts())
+
+    def _all_counters(self) -> dict:
+        return dict(self._counters, **{'frame_err_' + k: v for k, v in FRAME_ERRORS.items()})
 
     def _print_status(self) -> None:
         c = self._store_counts()
@@ -2101,7 +2129,7 @@ class RoverDaemon:
             'duration_s': round(time.time() - since, 1),
             'config':    self._current_config(),
             'launch_args': self._run_config,
-            'counters':  dict(self._counters),
+            'counters':  self._all_counters(),
             'store_at_exit': self._store_counts(),
             'own_data_ack_latency_ms': {
                 'n': len(lats),

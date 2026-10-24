@@ -1377,9 +1377,13 @@ class Dashboard(QtWidgets.QMainWindow):
         if n in snap.get('deadman', {}) and not self.deadman_spin.hasFocus():
             self.deadman_spin.setValue(snap['deadman'][n])
         resets = snap.get('pose_reset', {})
-        self.reset_banner.setText("<br>".join(f"POSE RESET {m}: {why}. Place it on the map again before "
-                                              f"routes or relaying." for m, why in sorted(resets.items())))
-        self.reset_banner.setVisible(bool(resets))
+        lag = snap.get('ctrl_lag', {})
+        self.reset_banner.setText("<br>".join(
+            [f"POSE RESET {m}: {why}. Place it on the map again before routes or relaying."
+             for m, why in sorted(resets.items())]
+            + [f"CONTROL NOT RECEIVED by {m}: still on v{c[0]}, {c[1]} s after v{c[2]} went out. "
+               f"Its routes, relay and settings are stale." for m, c in sorted(lag.items())]))
+        self.reset_banner.setVisible(bool(resets or lag))
 
     def on_rb_toggled(self, off: bool) -> None:
         n = self.rover_box.currentText()

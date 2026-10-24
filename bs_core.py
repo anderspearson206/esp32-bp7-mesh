@@ -62,10 +62,14 @@ CONFIG_DEFAULTS = {        # same keys/meaning as the radio_daemon.py CLI option
     'comms_on': 0.0, 'comms_off': 0.0, 'comms_phase': 0.0, 'payload_bytes': 0,
     'loc_interval': 1.0,
 }
-# control JSON bytes per air frame. ESP-NOW v2 would carry 1470, but the firmware drops serial
-# frames over HOST_MAX_PAYLOAD (1100): a rover's ESP32 hands it on as [mac 6][rssi 1][air], and the
-# air frame has a 7-byte control header, so 1100 - 7 - 7.
-CONTROL_MAX_JSON  = 1086
+# control JSON bytes per air frame. The hard limit is 1086: ESP-NOW v2 would carry 1470, but the
+# firmware drops serial frames over HOST_MAX_PAYLOAD (1100), a rover's ESP32 hands a frame on as
+# [mac 6][rssi 1][air] and the air frame has a 7-byte control header (1100 - 7 - 7). Kept well below
+# that: on 2026-10-23 BS copies of ~640+ bytes stopped reaching the rovers in the field (cause not
+# found; on the bench 700 bytes arrived like small frames, 800-1000 about half as often). The live
+# fleet fields go in their own version-0 copy (_send_control_now), so this covers the versioned part.
+CONTROL_MAX_JSON  = 700
+CONTROL_LAG_S     = 10.0   # a rover still on an older control version this long after it was sent = warn
 ROUTE_TOLERANCES  = (0.4, 0.6, 0.8, 1.0)   # simplification tried in turn until the route fits [m]
 ROUTE_SPEED_MAX   = 1.0    # m/s; rover_nav.py caps it again
 TRACK_MAX        = 20000   # location samples kept per rover for the map
@@ -141,6 +145,7 @@ class BSCore:
         self.last_line_at = 0.0
         self.bs_rejects_control = False
         self.control = {'version': 0, 'msg': None, 'sent_at': 0.0, 'last_tx': 0.0}
+        self.ctrl_lag: Dict[str, list] = {}   # node -> [version it has, s behind] (CONTROL_LAG_S)
         self.ros_cmds: Dict[str, list] = {}   # node -> ["on"|"off", cmd_id], rides on every control msg
         # node -> [cmd_id, speed, [x0, y0, ...] odom dm] (route) | [cmd_id, "stop"] | [cmd_id, "ok"]
         # (route points dropped once the rover reports it has the command, see _on_rover_status)
@@ -189,6 +194,8 @@ class BSCore:
         self.link: Dict[str, dict] = {}                      # node -> {up, since, last, data, tel, rssi[]}
         self.contacts = defaultdict(list)                    # node -> [{start, end, data, tel, avg_rssi}]
         self.rover_status: Dict[str, dict] = {}
+        self._status_cols: Dict[str, list] = {}       # node -> rover_status csv columns so far
+        self._csv_headers: Dict[str, list] = {}       # csv path -> header written
         self.markers: List[tuple] = []
         self.data_stats = defaultdict(lambda: [0, 0])        # node -> [n data delivered, latency sum]
         self._pending_metric = None
@@ -218,9 +225,23 @@ class BSCore:
         print(f"[CORE] session folder: {self.session_dir}")
 
     def _csv(self, name: str, header: list, row: Optional[list]) -> None:
+        """Append a row; a header that differs from the file's (columns added) rewrites the file
+        under the new header, old rows matched by column name."""
         path = os.path.join(self.session_dir, name)
         try:
             new = not os.path.exists(path)
+            old = None if new else self._csv_headers.get(path)
+            if not new and old is None:
+                with open(path, newline='') as f:
+                    old = next(csv.reader(f), [])
+            if not new and old != header:
+                with open(path, newline='') as f:
+                    rows = list(csv.DictReader(f))
+                with open(path, 'w', newline='') as f:
+                    w = csv.writer(f)
+                    w.writerow(header)
+                    w.writerows([r.get(k, '') for k in header] for r in rows)
+            self._csv_headers[path] = list(header)
             with open(path, 'a', newline='') as f:
                 w = csv.writer(f)
                 if new:
@@ -550,6 +571,25 @@ class BSCore:
         self._csv('coverage.csv', self._coverage_header(), row)
 
     # map alignment
+    def _check_control_lag(self, node: str, fields: dict, now: float) -> None:
+        """A rover still reporting an older control version CONTROL_LAG_S after a new one went
+        out isn't getting the BS's control copies (2026-10-23: lost while beacons and data still
+        got through). Warn once per version; cleared when it catches up."""
+        cv, v = fields.get('cv'), self.control['version']
+        if not isinstance(cv, float) or not self.control['msg']:
+            return
+        behind = now - self.control['sent_at']
+        if cv >= v or behind < CONTROL_LAG_S:
+            if self.ctrl_lag.pop(node, None) is not None and cv >= v:
+                self._event('control', f"{node} took control v{v}")
+            return
+        first = node not in self.ctrl_lag or self.ctrl_lag[node][2] != v
+        self.ctrl_lag[node] = [int(cv), round(behind), v]
+        if first:
+            self._event('warn', f"{node} has NOT taken control v{v} after {behind:.0f} s (still on "
+                                f"v{int(cv)}): it isn't getting the BS's control messages")
+            self._log_serial(f"#CONTROL_LAG:{node}:{int(cv)}:{v}")
+
     def _check_pose_reset(self, node: str, fields: dict) -> None:
         """A ROS stack restart starts rover_nav.py's pose at (0, 0) again, so the rover's map
         alignment no longer fits (routes and the relay then use wrong positions). Flag it until
@@ -754,6 +794,7 @@ class BSCore:
         fields['updated_at'] = now
         self.rover_status[parts[1]] = fields
         self._check_pose_reset(parts[1], fields)
+        self._check_control_lag(parts[1], fields, now)
         nav = self.nav_cmds.get(parts[1])
         nc = fields.get('nc')
         if nav and len(nav) == 3 and isinstance(nc, float) and nc >= nav[0]:
@@ -762,9 +803,12 @@ class BSCore:
             sent = (self.control['msg'] or {}).get('nav') or {}
             if parts[1] in sent:
                 sent[parts[1]] = [nav[0], 'ok']
-        keys = sorted(k for k in fields if k != 'updated_at')
-        self._csv(f"rover_status_{parts[1]}.csv", ['time', 'epoch'] + keys,
-                  [_ts(now), f"{now:.3f}"] + [fields[k] for k in keys])
+        # columns = every key this rover has reported this session (status keys come and go,
+        # e.g. the relay's); _csv rewrites the file when a new one appears
+        cols = self._status_cols.setdefault(parts[1], [])
+        cols.extend(sorted(k for k in fields if k != 'updated_at' and k not in cols))
+        self._csv(f"rover_status_{parts[1]}.csv", ['time', 'epoch'] + cols,
+                  [_ts(now), f"{now:.3f}"] + [fields.get(k, '') for k in cols])
 
     # fleet control
     def _send_control_now(self) -> bool:
@@ -774,12 +818,20 @@ class BSCore:
         # every copy carries the BS time: rovers run experiment starts and radio windows on it
         # (FleetClock in radio_daemon.py), so their own clocks don't need NTP. Before any fleet
         # state exists a time-only message goes out as version 0, which rovers never adopt.
-        msg = dict(msg or {}, **self._live_fields(), t=round(time.time(), 3), hop=0)
-        air = (struct.pack('<BHI', PKT_TYPE_CONTROL, BS_NODE_ID, self.control['version'] & 0xFFFFFFFF)
-               + json.dumps(msg, separators=(',', ':')).encode())
+        # The live fleet picture goes in a second copy with version 0, which rovers never adopt
+        # (they read t / fleet / align from every copy before the version check), so the versioned
+        # copy stays small (see CONTROL_MAX_JSON).
+        stamp = {'t': round(time.time(), 3), 'hop': 0}
+        frames = [(self.control['version'], dict(msg or {}, **stamp))]
+        live = self._live_fields()
+        if live and msg:
+            frames.append((0, dict(live, **stamp)))
         try:
             with self._ser_write_lock:
-                ser.write(encode_frame(HOST_CMD_WIFI_TX, air))
+                for version, m in frames:
+                    air = (struct.pack('<BHI', PKT_TYPE_CONTROL, BS_NODE_ID, version & 0xFFFFFFFF)
+                           + json.dumps(m, separators=(',', ':')).encode())
+                    ser.write(encode_frame(HOST_CMD_WIFI_TX, air))
             self.control['last_tx'] = time.time()
             return True
         except (serial.SerialException, OSError) as e:
@@ -957,9 +1009,9 @@ class BSCore:
                              nav=dict(others, **{node: cmd}), pose=dict(self.pose_modes),
                              relay={n: list(c) for n, c in self.relay_cfg.items() if n != node},
                              rb=dict(self.rb_off), dm=dict(self.deadman),
-                             # a relaying rover adds its BS-time t, hop and bsh
-                             **self._live_fields(), t=round(time.time(), 3), hop=9,
-                             bsh=round(time.time(), 1))
+                             # a relaying rover adds its BS-time t, hop and bsh (fleet fields
+                             # go in a separate copy)
+                             t=round(time.time(), 3), hop=9, bsh=round(time.time(), 1))
                 if len(json.dumps(trial, separators=(',', ':'))) <= CONTROL_MAX_JSON:
                     break
             else:
@@ -1115,6 +1167,7 @@ class BSCore:
                 'routes': {n: dict(r) for n, r in self.routes.items()},
                 'relay_cfg': {n: list(c) for n, c in self.relay_cfg.items()},
                 'pose_reset': dict(self.pose_reset),
+                'ctrl_lag': {n: list(c) for n, c in self.ctrl_lag.items()},
                 'rb_off': dict(self.rb_off),
                 'deadman': dict(self.deadman),
                 'bs': dict(self._bs_position() or {}, rm_version=self.rm_version, rm_job=dict(self.rm_job)),
