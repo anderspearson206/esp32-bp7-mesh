@@ -34,8 +34,10 @@
 #define PKT_TYPE_BEACON  0x01
 #define PKT_TYPE_BUNDLE  0x02
 #define PKT_TYPE_ACKMAP  0x04   // bitmap ACK: one packet ACKs up to 256 bundles per source
-// 0x05 = location, 0x06 = fleet control: both are handled by the rover daemons only and
-// ignored by this firmware (the BS just broadcasts control frames the laptop hands it)
+// 0x05 = location, 0x06 = fleet control: both are handled by the rover daemons only. The BS
+// sends control frames the laptop hands it unicast to each active peer (host_wifi_tx), so the
+// radio acknowledges and retries them; broadcast has no retries.
+#define PKT_TYPE_CONTROL 0x06
 
 #define ACKMAP_BITMAP_BYTES  32                  // 256 sequence numbers per ackmap packet
 #define ACKMAP_BITMAP_BITS   (ACKMAP_BITMAP_BYTES * 8)
@@ -57,6 +59,11 @@
 #define HOST_SOF              0xAA
 #define HOST_MAX_PAYLOAD      1100      // headroom above relayed bundle (6 mac + 1 rssi + 1053 air)
 #define HOST_PULL_INTERVAL_MS    1000   // pull from Jetson store every 1s when peers active
+// The BS laptop (bs_core.py) never answers PULL_REQ, so every pull waited 500 ms and threw away
+// any control frame (WIFI_TX) that arrived meanwhile: half of each second, phase-locked with the
+// laptop's 2 s resend, which lost control for minutes on 2026-10-23. Only the legacy
+// jetson_daemon.py answers pulls; set to 1 for that bench setup.
+#define HOST_PULL_ENABLED        0
 #define BUNDLE_RETRANSMIT_MS     5000   // retry forwarded but unacked bundles to BS after 5s
 // Jetson -> ESP32
 #define HOST_CMD_TX_BUNDLE    0x01      // payload: raw dtn_bundle_t bytes
@@ -209,6 +216,12 @@ static int               peer_count = 0;
 static SemaphoreHandle_t data_mutex;
 static QueueHandle_t     rx_queue;
 static QueueHandle_t     antipkt_notify_q;  // rx_process_task -> host_uart_task notifications
+
+// BS send statistics, reported as @TXSTAT every TXSTAT_INTERVAL_S (cumulative since boot):
+// control frames from the laptop, unicast copies queued, esp_now_send errors on them, unicast
+// frames acknowledged / not acknowledged after the radio's retries (all unicast, from send_cb)
+#define TXSTAT_INTERVAL_S 10
+static volatile uint32_t stat_ctrl_in, stat_ctrl_sent, stat_ctrl_err, stat_uni_ok, stat_uni_fail;
 
 // static TX buffer , written only from bundle_tx_task (single writer, no race)
 static uint8_t tx_pkt_buf[1 + sizeof(dtn_bundle_t)];
@@ -467,6 +480,13 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data,
         free(item);
         ESP_LOGW(TAG, "RX queue full, packet dropped");
     }
+}
+
+// send callback, runs in WiFi task context: count unicast delivery results
+static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status) {
+    if (tx_info && tx_info->des_addr && memcmp(tx_info->des_addr, BROADCAST_MAC, 6) == 0) return;
+    if (status == ESP_NOW_SEND_SUCCESS) stat_uni_ok++;
+    else stat_uni_fail++;
 }
 
 // forward declaration , defined in host_uart_task section below
@@ -845,6 +865,7 @@ static void bundle_tx_task(void *arg) {
     int bundle_gen_timer  = 0;
     int store_dump_timer  = 0;
     int bs_heartbeat_timer = 0;
+    int txstat_timer       = 0;
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(TX_INTERVAL_MS));
@@ -867,6 +888,11 @@ static void bundle_tx_task(void *arg) {
             if (bs_heartbeat_timer >= 5) {
                 bs_heartbeat_timer = 0;
                 printf("@NET:%u:0:0\n", my_id);
+            }
+            if (++txstat_timer >= TXSTAT_INTERVAL_S) {
+                txstat_timer = 0;
+                printf("@TXSTAT:%" PRIu32 ":%" PRIu32 ":%" PRIu32 ":%" PRIu32 ":%" PRIu32 "\n",
+                       stat_ctrl_in, stat_ctrl_sent, stat_ctrl_err, stat_uni_ok, stat_uni_fail);
             }
         }
 
@@ -1161,6 +1187,37 @@ static int host_inject_bundle(const uint8_t *data, uint16_t plen) {
     return -1;
 }
 
+// BS: send a frame the laptop handed over (WIFI_TX). Control frames go unicast to each active
+// peer (acknowledged, retried by the radio), or broadcast when no peer is active; everything
+// else is broadcast verbatim.
+static void host_wifi_tx(const uint8_t *data, uint16_t plen) {
+    if (plen == 0) return;
+    if (data[0] != PKT_TYPE_CONTROL) {
+        esp_now_send(BROADCAST_MAC, data, plen);
+        return;
+    }
+    stat_ctrl_in++;
+    uint8_t macs[MAX_PEERS][6];
+    int n = 0;
+    xSemaphoreTake(data_mutex, portMAX_DELAY);
+    for (int i = 0; i < peer_count; i++)
+        if (peer_list[i].active) memcpy(macs[n++], peer_list[i].mac, 6);
+    xSemaphoreGive(data_mutex);
+    if (n == 0) {
+        esp_now_send(BROADCAST_MAC, data, plen);
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        esp_err_t err = esp_now_send(macs[i], data, plen);
+        if (err == ESP_ERR_ESPNOW_NO_MEM) {          // send queue full: wait a little, try once more
+            vTaskDelay(pdMS_TO_TICKS(5));
+            err = esp_now_send(macs[i], data, plen);
+        }
+        if (err == ESP_OK) stat_ctrl_sent++;
+        else stat_ctrl_err++;
+    }
+}
+
 static void host_uart_task(void *arg) {
     uint16_t my_id = get_my_node_id();
     uint32_t last_pull_ms = 0;
@@ -1219,8 +1276,8 @@ static void host_uart_task(void *arg) {
                 break;
             }
             case HOST_CMD_WIFI_TX:
-                // BS laptop -> fleet control packets (PKT_TYPE_CONTROL), broadcast verbatim
-                if (plen > 0) esp_now_send(BROADCAST_MAC, host_rx_payload, plen);
+                // BS laptop -> fleet control packets (PKT_TYPE_CONTROL), see host_wifi_tx
+                host_wifi_tx(host_rx_payload, plen);
                 break;
             default:
                 ESP_LOGW(TAG, "Host: unknown cmd 0x%02x len=%u", cmd, plen);
@@ -1230,7 +1287,7 @@ static void host_uart_task(void *arg) {
 
         // periodic bundle pull from Jetson when we have peers to forward to
         uint32_t ts = now_ms();
-        if (ts - last_pull_ms >= HOST_PULL_INTERVAL_MS) {
+        if (HOST_PULL_ENABLED && ts - last_pull_ms >= HOST_PULL_INTERVAL_MS) {
             last_pull_ms = ts;
             bool has_peers = false;
             xSemaphoreTake(data_mutex, portMAX_DELAY);
@@ -1254,6 +1311,10 @@ static void host_uart_task(void *arg) {
                         uint8_t r_cmd;
                         uint16_t r_plen;
                         if (!host_recv_frame(&r_cmd, &r_plen, 500)) break;
+                        if (r_cmd == HOST_CMD_WIFI_TX) {      // don't drop a control frame
+                            host_wifi_tx(host_rx_payload, r_plen);
+                            continue;
+                        }
                         if (r_cmd == HOST_CMD_NO_BUNDLES) {
                             last_host_active_ms = now_ms();
                             break;
@@ -1698,6 +1759,7 @@ void app_main(void) {
 
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
+    ESP_ERROR_CHECK(esp_now_register_send_cb(espnow_send_cb));
 
     // Broadcast peer required for beacon TX
     esp_now_peer_info_t bcast = {

@@ -45,6 +45,7 @@ import argparse
 import json
 import math
 import os
+import random
 import platform
 import signal
 import struct
@@ -88,6 +89,8 @@ CONTROL_HDR_FMT    = '<BHI'
 CONTROL_HDR_SIZE   = struct.calcsize(CONTROL_HDR_FMT)   # 7
 CONTROL_REPEAT_S   = 2.0    # rovers re-broadcast their current control so out-of-range rovers get it
                              # (also carries "bsh", the radio deadman's BS contact time: keep it short)
+CONTROL_JITTER     = 0.15   # random fraction of CONTROL_REPEAT_S, so copies from the rovers and the BS
+                             # don't keep colliding; the fleet copy goes half a period after the control copy
 # config keys the BS may set at runtime (same names as the CLI options)
 CONFIG_KEYS = ('interval', 'bw_limit', 'bw_burst', 'bw_order', 'bw_count_telemetry',
                'comms_on', 'comms_off', 'comms_phase', 'payload_bytes', 'retransmit_s',
@@ -1995,25 +1998,33 @@ class RoverDaemon:
             return None
         return max(0.0, FLEET_CLOCK.now() - self._bs_heard_t)
 
-    def _relay_control(self) -> None:
-        """Re-broadcast the adopted control message, stamped with our BS-time estimate and the
-        last time we know the BS was reachable (bsh, for other rovers' radio deadman). The fleet
-        picture we hold goes in a second copy with version 0, which nobody adopts (every copy's
-        t / fleet / bsh are read before the version check), so the versioned copy stays small:
-        on 2026-10-23 BS copies over ~640 bytes stopped reaching the rovers in the field."""
-        if self._ctrl_msg is None:
-            return
-        origin, msg = self._ctrl_msg
+    def _relay_stamp(self) -> dict:
+        """Our BS-time estimate and the last time we know the BS was reachable (bsh, for other
+        rovers' radio deadman), added to every copy we relay."""
         stamp = {}
         if FLEET_CLOCK.synced:
             stamp.update(t=round(FLEET_CLOCK.now(), 3), hop=FLEET_CLOCK.hop + 1)
         if self._bs_heard_t is not None:
             stamp['bsh'] = round(self._bs_heard_t, 1)
-        self._air_tx(pack_control(self._ctrl_version, dict(msg, **stamp), origin), 'control',
+        return stamp
+
+    def _relay_control(self) -> None:
+        """Re-broadcast the adopted control message (stamped, see _relay_stamp)."""
+        if self._ctrl_msg is None:
+            return
+        origin, msg = self._ctrl_msg
+        self._air_tx(pack_control(self._ctrl_version, dict(msg, **self._relay_stamp()), origin), 'control',
                      version=self._ctrl_version)
+
+    def _relay_fleet(self) -> None:
+        """Re-broadcast the fleet picture we hold in its own copy with version 0, which nobody
+        adopts (every copy's t / fleet / bsh are read before the version check), so the versioned
+        copy stays small: on 2026-10-23 BS copies over ~640 bytes stopped reaching the rovers."""
         fleet = self._fleet_fields()
-        if fleet:
-            self._air_tx(pack_control(0, dict(fleet, **stamp), origin), 'control', version=0)
+        if self._ctrl_msg is None or not fleet:
+            return
+        self._air_tx(pack_control(0, dict(fleet, **self._relay_stamp()), self._ctrl_msg[0]), 'control',
+                     version=0)
 
     def _check_pending_start(self) -> None:
         p = self._pending_start
@@ -2165,6 +2176,8 @@ class RoverDaemon:
         last_state_log       = 0.0
         last_console_status  = time.monotonic()
         last_ctrl_relay      = time.monotonic()
+        ctrl_period          = CONTROL_REPEAT_S
+        fleet_due: Optional[float] = None
         last_ros_check       = 0.0
         last_relay           = 0.0
 
@@ -2215,9 +2228,15 @@ class RoverDaemon:
                 last_forward = mono
                 self._forward()
             if (self._ctrl_msg is not None and self._radio_on
-                    and (mono - last_ctrl_relay) >= CONTROL_REPEAT_S):
+                    and (mono - last_ctrl_relay) >= ctrl_period):
                 last_ctrl_relay = mono
+                ctrl_period = CONTROL_REPEAT_S * (1 + random.uniform(-CONTROL_JITTER, CONTROL_JITTER))
                 self._relay_control()
+                fleet_due = mono + ctrl_period / 2
+            if fleet_due is not None and mono >= fleet_due:
+                fleet_due = None
+                if self._radio_on:
+                    self._relay_fleet()
             if self._mode == 'active' and self._interval > 0 and (mono - last_gen) >= self._interval:
                 last_gen = mono
                 self._generate_bundle()

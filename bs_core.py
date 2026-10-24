@@ -30,6 +30,7 @@ import csv
 import json
 import math
 import os
+import random
 import struct
 import subprocess
 import threading
@@ -54,7 +55,12 @@ HISTORY_S        = 3600.0  # how much delivery/contact history the display can a
 HOST_SOF          = 0xAA
 HOST_CMD_WIFI_TX  = 0x30
 PKT_TYPE_CONTROL  = 0x06
-CONTROL_PERIOD_S  = 2.0    # desired fleet state is re-broadcast this often
+CONTROL_PERIOD_S  = 2.0    # desired fleet state is re-broadcast this often (+-CONTROL_JITTER)
+CONTROL_JITTER    = 0.15   # random fraction of the period, so copies don't keep colliding with others
+CONTROL_FAST_S    = 0.5    # resend period right after a new version and while a rover in range lags
+CONTROL_BURST_S   = 2.0    # fast resends for this long after a new version
+CONTROL_GAP_S     = 0.3    # min gap between the versioned copy and the fleet copy
+LAG_IN_RANGE_S    = 5.0    # a lagging rover only speeds up resends if its beacons arrived this recently
 START_DELAY_S     = 3.0    # experiments start this long after Start, fleet-wide
 
 CONFIG_DEFAULTS = {        # same keys/meaning as the radio_daemon.py CLI options
@@ -144,8 +150,11 @@ class BSCore:
         self.lines_total = 0
         self.last_line_at = 0.0
         self.bs_rejects_control = False
-        self.control = {'version': 0, 'msg': None, 'sent_at': 0.0, 'last_tx': 0.0}
+        self.control = {'version': 0, 'msg': None, 'sent_at': 0.0, 'last_tx': 0.0, 'last_live': 0.0,
+                        'period': CONTROL_PERIOD_S}
         self.ctrl_lag: Dict[str, list] = {}   # node -> [version it has, s behind] (CONTROL_LAG_S)
+        # BS firmware send counters (@TXSTAT): last cumulative values and this session's sums
+        self.txstat: Dict[str, dict] = {'total': {}, 'session': {}}
         self.ros_cmds: Dict[str, list] = {}   # node -> ["on"|"off", cmd_id], rides on every control msg
         # node -> [cmd_id, speed, [x0, y0, ...] odom dm] (route) | [cmd_id, "stop"] | [cmd_id, "ok"]
         # (route points dropped once the rover reports it has the command, see _on_rover_status)
@@ -263,6 +272,7 @@ class BSCore:
         self.save_summary()
         with self.lock:
             self._reset_state()
+            self.txstat['session'] = {}
             self._new_session_files(tag)
 
     # serial
@@ -397,6 +407,8 @@ class BSCore:
                     self._on_location(parts, now)
                 elif tag == '@ROVER_STATUS':
                     self._on_rover_status(line, now)
+                elif tag == '@TXSTAT' and len(parts) >= 6:
+                    self._on_txstat(parts, now)
             except (ValueError, IndexError) as e:
                 self._event('warn', f"could not parse {line!r}: {e}")
 
@@ -571,6 +583,21 @@ class BSCore:
         self._csv('coverage.csv', self._coverage_header(), row)
 
     # map alignment
+    def _on_txstat(self, parts, now: float) -> None:
+        """@TXSTAT:<ctrl in>:<ctrl sent>:<ctrl err>:<unicast ok>:<unicast fail> from the BS
+        firmware, cumulative since its boot: control frames handed over, unicast copies queued,
+        esp_now_send errors, unicast frames acknowledged / not after the radio's retries."""
+        cur = dict(zip(('ctrl_in', 'ctrl_sent', 'ctrl_err', 'uni_ok', 'uni_fail'), map(int, parts[1:6])))
+        prev = self.txstat.get('total')
+        if prev and all(cur[k] >= prev[k] for k in cur):
+            d = {k: cur[k] - prev[k] for k in cur}
+            for k in d:
+                self.txstat['session'][k] = self.txstat['session'].get(k, 0) + d[k]
+            if d['ctrl_err']:
+                self._event('warn', f"BS radio could not queue {d['ctrl_err']} control frame(s) in the last 10 s")
+        self.txstat['total'] = cur
+        self.txstat['at'] = now
+
     def _check_control_lag(self, node: str, fields: dict, now: float) -> None:
         """A rover still reporting an older control version CONTROL_LAG_S after a new one went
         out isn't getting the BS's control copies (2026-10-23: lost while beacons and data still
@@ -811,28 +838,31 @@ class BSCore:
                   [_ts(now), f"{now:.3f}"] + [fields.get(k, '') for k in cols])
 
     # fleet control
-    def _send_control_now(self) -> bool:
+    def _send_control_now(self, live: bool = False) -> bool:
+        """Send the versioned control copy, or with live=True the fleet copy. Every copy carries
+        the BS time: rovers run experiment starts and radio windows on it (FleetClock in
+        radio_daemon.py), so their own clocks don't need NTP. Before any fleet state exists a
+        time-only message goes out as version 0, which rovers never adopt. The live fleet picture
+        goes in its own copy with version 0, which rovers never adopt either (they read t / fleet /
+        align from every copy before the version check), so the versioned copy stays small (see
+        CONTROL_MAX_JSON). The BS firmware sends control frames unicast to each rover it hears."""
         msg, ser = self.control['msg'], self._ser
         if ser is None:
             return False
-        # every copy carries the BS time: rovers run experiment starts and radio windows on it
-        # (FleetClock in radio_daemon.py), so their own clocks don't need NTP. Before any fleet
-        # state exists a time-only message goes out as version 0, which rovers never adopt.
-        # The live fleet picture goes in a second copy with version 0, which rovers never adopt
-        # (they read t / fleet / align from every copy before the version check), so the versioned
-        # copy stays small (see CONTROL_MAX_JSON).
         stamp = {'t': round(time.time(), 3), 'hop': 0}
-        frames = [(self.control['version'], dict(msg or {}, **stamp))]
-        live = self._live_fields()
-        if live and msg:
-            frames.append((0, dict(live, **stamp)))
+        if live:
+            fields = self._live_fields()
+            if not (fields and msg):
+                return False
+            version, m = 0, dict(fields, **stamp)
+        else:
+            version, m = self.control['version'], dict(msg or {}, **stamp)
+        air = (struct.pack('<BHI', PKT_TYPE_CONTROL, BS_NODE_ID, version & 0xFFFFFFFF)
+               + json.dumps(m, separators=(',', ':')).encode())
         try:
             with self._ser_write_lock:
-                for version, m in frames:
-                    air = (struct.pack('<BHI', PKT_TYPE_CONTROL, BS_NODE_ID, version & 0xFFFFFFFF)
-                           + json.dumps(m, separators=(',', ':')).encode())
-                    ser.write(encode_frame(HOST_CMD_WIFI_TX, air))
-            self.control['last_tx'] = time.time()
+                ser.write(encode_frame(HOST_CMD_WIFI_TX, air))
+            self.control['last_live' if live else 'last_tx'] = time.time()
             return True
         except (serial.SerialException, OSError) as e:
             with self.lock:
@@ -871,9 +901,26 @@ class BSCore:
                 out['site'] = self.site.name
         return out
 
+    def _lagging_in_range(self, now: float) -> bool:
+        """A rover the BS hears right now still reports an older control version."""
+        v = self.control['version']
+        with self.lock:
+            return any(isinstance(f.get('cv'), float) and f['cv'] < v
+                       and now - self.node_last_seen.get(n, 0) <= LAG_IN_RANGE_S
+                       for n, f in self.rover_status.items())
+
     def _maybe_send_control(self, now: float) -> None:
-        if now - self.control['last_tx'] >= CONTROL_PERIOD_S:
+        """Versioned copy every CONTROL_PERIOD_S (jittered), every CONTROL_FAST_S right after a new
+        version and while a rover in range hasn't taken it; the fleet copy every CONTROL_PERIOD_S,
+        never right after the versioned one."""
+        c = self.control
+        fast = c['msg'] and (now - c['sent_at'] < CONTROL_BURST_S or self._lagging_in_range(now))
+        if now - c['last_tx'] >= (CONTROL_FAST_S if fast else c['period']):
             self._send_control_now()
+            c['period'] = CONTROL_PERIOD_S * (1 + random.uniform(-CONTROL_JITTER, CONTROL_JITTER))
+        elif (not fast and now - c['last_live'] >= c['period'] and now - c['last_tx'] >= CONTROL_GAP_S
+              and c['period'] - (now - c['last_tx']) >= CONTROL_GAP_S):
+            self._send_control_now(live=True)
 
     def _set_control(self, msg: dict, note: str) -> None:
         """Publish a new desired fleet state. Version = epoch seconds, so it stays monotonic
@@ -1168,6 +1215,7 @@ class BSCore:
                 'relay_cfg': {n: list(c) for n, c in self.relay_cfg.items()},
                 'pose_reset': dict(self.pose_reset),
                 'ctrl_lag': {n: list(c) for n, c in self.ctrl_lag.items()},
+                'txstat': dict(self.txstat.get('session', {})),
                 'rb_off': dict(self.rb_off),
                 'deadman': dict(self.deadman),
                 'bs': dict(self._bs_position() or {}, rm_version=self.rm_version, rm_job=dict(self.rm_job)),
@@ -1268,6 +1316,12 @@ class BSCore:
                   + (f" '{msg['exp']}'" if msg.get('exp') else ""),
                   f"  cfg: {json.dumps(msg.get('cfg', {}), separators=(',', ':'))}",
                   "  (full history in controls.csv)", ""]
+        tx = self.txstat.get('session') or {}
+        if tx:
+            sent = tx.get('uni_ok', 0) + tx.get('uni_fail', 0)
+            L += [f"BS radio (@TXSTAT): {tx.get('ctrl_in', 0)} control frames, {tx.get('ctrl_sent', 0)} unicast "
+                  f"copies queued, {tx.get('ctrl_err', 0)} not queued; unicast acknowledged "
+                  f"{tx.get('uni_ok', 0)}/{sent}" + (f" ({100 * tx.get('uni_ok', 0) / sent:.1f}%)" if sent else ""), ""]
         if self.bs_rejects_control:
             L += ["WARNING: the BS firmware rejected control frames (unknown cmd 0x30) - reflash it.", ""]
         if self.tracks:
