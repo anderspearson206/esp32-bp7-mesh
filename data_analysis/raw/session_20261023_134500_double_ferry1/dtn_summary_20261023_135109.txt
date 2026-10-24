@@ -1,0 +1,45 @@
+======================================================================
+  DTN Mesh Network  -  Session Summary Report
+  Session   : session_20261023_134500_double_ferry
+  Generated : 2026-10-23 13:51:09
+  Duration  : 06m 08s
+======================================================================
+
+Totals
+  Bundles delivered (all)   : 1580
+  Data bundles delivered    : 710
+  Ferry duplicates          : 7
+  Antipacket failures       : 0
+  Data latency avg/p50/p95  : 847 / 979 / 1046 ms
+
+Per node  (data = generated sensor bundles; Data/Gen uses the rover's own counter)
+  Node       Data    Tel   AvgLat    p50    p95  RovGen  Data/Gen  FDup  APFl    RSSI
+  -----------------------------------------------------------------------------------
+  54272       355    435      894    879   1036     353    100.6%     4     0   -50.0
+  57936       355    435      799   1006   1051     353    100.6%     3     0   -69.0
+
+Contacts with the BS  (link down after 3s without a beacon)
+  Node        N   UpTime   Up%  MeanLen  DataInUp  Data/s up
+  ----------------------------------------------------------
+  54272       1     367s  100%   366.8s       357       0.97
+  57936       1     367s  100%   367.4s       353       0.96
+
+Rovers (last @ROVER_STATUS)
+  54272: active 'double_ferry' ctrl v1792788343, bw unlimited, always on, gen every 1s | queue 1 own/0 ferried | gen 353 tx 356 retx 0 ack 352 | ros on, loc fused
+  57936: active 'double_ferry' ctrl v1792788343, bw unlimited, always on, gen every 1s | queue 1 own/0 ferried | gen 353 tx 354 retx 0 ack 352 | ros on, loc fused
+
+Fleet control (last sent): v1792788630 active 'double_ferry'
+  cfg: {"interval":1.0,"bw_limit":0.0,"bw_burst":1.0,"bw_order":"oldest","comms_on":0.0,"comms_off":0.0,"comms_phase":0.0,"payload_bytes":0,"loc_interval":1.0}
+  (full history in controls.csv)
+
+Map  (fountain: 256 m square, EPSG:32610 (WGS84 / UTM 10N) NW corner E551856 N5278186, BS/tx at (+44.5, -62.5) m (moved))
+  54272: alignment offset (+45.70, -62.27) m rotation +116.4 deg | 359 samples, 0 m driven, start-end 0.0 m, end-to-alignment point 0.0 m, on drivable 0% (100% within 1 m)
+  57936: alignment offset (+45.68, -62.74) m rotation +118.2 deg | 360 samples, 107 m driven, start-end 1.1 m, end-to-alignment point 26.8 m, on drivable 92% (95% within 1 m)
+  (alignment history in alignments.csv)
+
+BS position: moved to (+44.5, -62.5) m (cell col 172, row 190); predictions use maps generated for it (bs_position.json)
+
+Markers
+  start-double_ferry 2026-10-23 13:45:00.886  (+0s)
+
+======================================================================

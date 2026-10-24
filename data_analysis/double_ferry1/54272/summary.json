@@ -1,0 +1,85 @@
+{
+ "session": "session_20261023_134500_double_ferry1",
+ "node": "54272",
+ "date": "2026-10-23",
+ "start": "13:45:00",
+ "end": "13:51:14",
+ "utc_offset": "-07:00",
+ "start_epoch": 1792788300.886,
+ "end_epoch": 1792788674.815,
+ "duration_s": 373.9,
+ "bs_cell": [
+  172,
+  190
+ ],
+ "bs_xy": [
+  44.5,
+  -62.5
+ ],
+ "bs_cell_match_frac": 1.0,
+ "cut_at_bs_move": false,
+ "driven_m": 0.0,
+ "dist_to_bs_m": {
+  "min": 1.2,
+  "max": 1.2
+ },
+ "contacts": 1,
+ "uptime_frac": 0.998,
+ "beacons_heard": 364,
+ "beacon_rate_hz": 0.97,
+ "rssi_measured": {
+  "min": -60.0,
+  "median": -50.0,
+  "max": -46.0
+ },
+ "data_delivered": 361,
+ "tel_delivered": 442,
+ "rover_gen": 358,
+ "rover_tx": 361,
+ "rover_retx": 0,
+ "data_rate_per_s": 0.965,
+ "latency_ms": {
+  "mean": 897.0,
+  "p50": 883.0,
+  "p95": 1036.0,
+  "max": 1083.0
+ },
+ "window": null,
+ "data_direct_lt2s": 361,
+ "data_delayed_ge2s": 0,
+ "data_generated_while_link_down": 0,
+ "start_to_end_m": 0.0,
+ "routes": [],
+ "fits": {
+  "nn_pmnet": {
+   "n": 364,
+   "offset_db": -13.464645385742188,
+   "raw_bias_db": -13.467392638489441,
+   "rmse_db": 2.0708600963033543,
+   "mae_db": 1.4807692307692308,
+   "r": NaN,
+   "slope": 0.6843063079677038,
+   "intercept": -25.001373626373667
+  },
+  "nn": {
+   "n": 364,
+   "offset_db": -28.26312255859375,
+   "raw_bias_db": -28.265869811341002,
+   "rmse_db": 2.0708600963033543,
+   "mae_db": 1.4807692307692308,
+   "r": NaN,
+   "slope": 1.1501823890651761,
+   "intercept": -25.001373626373667
+  },
+  "avg": {
+   "n": 364,
+   "offset_db": -20.86388397216797,
+   "raw_bias_db": -20.86663122491522,
+   "rmse_db": 2.0708600963033543,
+   "mae_db": 1.4807692307692308,
+   "r": NaN,
+   "slope": 0.8580887583812208,
+   "intercept": -25.001373626373667
+  }
+ }
+}

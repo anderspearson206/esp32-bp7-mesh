@@ -1,0 +1,102 @@
+{
+ "session": "session_20261023_134500_double_ferry1",
+ "node": "57936",
+ "date": "2026-10-23",
+ "start": "13:45:00",
+ "end": "13:51:14",
+ "utc_offset": "-07:00",
+ "start_epoch": 1792788300.886,
+ "end_epoch": 1792788674.815,
+ "duration_s": 373.9,
+ "bs_cell": [
+  172,
+  190
+ ],
+ "bs_xy": [
+  44.5,
+  -62.5
+ ],
+ "bs_cell_match_frac": 0.989,
+ "cut_at_bs_move": false,
+ "driven_m": 107.0,
+ "dist_to_bs_m": {
+  "min": 1.5,
+  "max": 37.3
+ },
+ "contacts": 1,
+ "uptime_frac": 0.999,
+ "beacons_heard": 365,
+ "beacon_rate_hz": 0.98,
+ "rssi_measured": {
+  "min": -92.0,
+  "median": -71.0,
+  "max": -41.0
+ },
+ "data_delivered": 361,
+ "tel_delivered": 442,
+ "rover_gen": 358,
+ "rover_tx": 359,
+ "rover_retx": 0,
+ "data_rate_per_s": 0.965,
+ "latency_ms": {
+  "mean": 803.0,
+  "p50": 1006.0,
+  "p95": 1051.0,
+  "max": 1864.0
+ },
+ "window": null,
+ "data_direct_lt2s": 361,
+ "data_delayed_ge2s": 0,
+ "data_generated_while_link_down": 0,
+ "start_to_end_m": 1.6,
+ "routes": [
+  {
+   "sent": "13:47:06",
+   "speed_mps": 0.55,
+   "route_m": 4.7,
+   "points": 3,
+   "first_following": null,
+   "ended": null,
+   "ended_at": null,
+   "last_state": null,
+   "progress_m": NaN,
+   "following_reports": 0,
+   "reports": 0,
+   "max_xte_m": null,
+   "stop_at": null,
+   "end_to_route_end_m": NaN
+  }
+ ],
+ "fits": {
+  "nn_pmnet": {
+   "n": 365,
+   "offset_db": -17.821075439453125,
+   "raw_bias_db": -18.32599746495077,
+   "rmse_db": 6.295049551939264,
+   "mae_db": 4.5811782627889555,
+   "r": 0.8296263671408598,
+   "slope": 1.1790452334185488,
+   "intercept": -9.285924690177998
+  },
+  "nn": {
+   "n": 365,
+   "offset_db": -27.894683837890625,
+   "raw_bias_db": -28.73843254193868,
+   "rmse_db": 5.911453279128762,
+   "mae_db": 4.713142499531785,
+   "r": 0.8521381496809264,
+   "slope": 0.8905387204299062,
+   "intercept": -33.12542234098147
+  },
+  "avg": {
+   "n": 365,
+   "offset_db": -23.292572021484375,
+   "raw_bias_db": -23.532215003444723,
+   "rmse_db": 5.7978653833362825,
+   "mae_db": 4.395396966803564,
+   "r": 0.8493837872056247,
+   "slope": 1.0312701913015565,
+   "intercept": -22.11616867626277
+  }
+ }
+}

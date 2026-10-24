@@ -21,6 +21,16 @@ RUNS = [
     ('shadow2', 'session_20261015_095910_shadow2', None, True, None),             # BS at (42.5, -58.5)
     ('double_rover1', 'session_20261021_171010_double_rover1', '17:15:45-', False,
      ['57936', '54272']),                                                         # BS at (35.5, 9.5); no data bundles
+    ('double_ferry1', 'session_20261023_134500_double_ferry1', None, False,
+     ['57936', '54272']),                                                         # BS at (44.5, -62.5); relay never ran
+    ('double_ferry3', 'session_20261023_135640_double_ferry3', None, False,
+     ['54272', '57936']),                                                         # BS at (44.5, -62.5); no data bundles
+]
+
+# relay runs: name (as in RUNS), explorer, relay -> relay_overview.py (relay.png, relay.md)
+RELAY_RUNS = [
+    ('double_ferry1', '57936', '54272'),
+    ('double_ferry3', '54272', '57936'),
 ]
 
 
@@ -42,6 +52,10 @@ def main():
                 pool.append(f'{name}/{n}' if n else name)
     pool = ','.join(pool)
     run([os.path.join(HERE, 'compare_pred_meas.py')] + specs + ['--pool', pool])
+    folders = {name: folder for name, folder, *_ in RUNS}
+    for name, explorer, relay in RELAY_RUNS:
+        run([os.path.join(HERE, 'relay_overview.py'), os.path.join(HERE, 'raw', folders[name]),
+             '--name', name, '--explorer', explorer, '--relay', relay])
 
 
 if __name__ == '__main__':

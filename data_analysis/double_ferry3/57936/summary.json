@@ -1,0 +1,97 @@
+{
+ "session": "session_20261023_135640_double_ferry3",
+ "node": "57936",
+ "date": "2026-10-23",
+ "start": "13:56:40",
+ "end": "14:07:28",
+ "utc_offset": "-07:00",
+ "start_epoch": 1792789000.615,
+ "end_epoch": 1792789648.413,
+ "duration_s": 647.8,
+ "bs_cell": [
+  172,
+  190
+ ],
+ "bs_xy": [
+  44.5,
+  -62.5
+ ],
+ "bs_cell_match_frac": 1.0,
+ "cut_at_bs_move": false,
+ "driven_m": 143.7,
+ "dist_to_bs_m": {
+  "min": 1.9,
+  "max": 33.6
+ },
+ "contacts": 1,
+ "uptime_frac": 1.0,
+ "beacons_heard": 628,
+ "beacon_rate_hz": 0.97,
+ "rssi_measured": {
+  "min": -86.0,
+  "median": -69.0,
+  "max": -41.0
+ },
+ "data_delivered": 0,
+ "tel_delivered": 762,
+ "rover_gen": 0,
+ "rover_tx": 0,
+ "rover_retx": 0,
+ "data_rate_per_s": 0.0,
+ "latency_ms": null,
+ "window": null,
+ "data_direct_lt2s": 0,
+ "data_delayed_ge2s": 0,
+ "data_generated_while_link_down": 0,
+ "start_to_end_m": 1.7,
+ "routes": [
+  {
+   "sent": "14:00:36",
+   "speed_mps": 0.65,
+   "route_m": 30.2,
+   "points": 3,
+   "first_following": null,
+   "ended": null,
+   "ended_at": null,
+   "last_state": null,
+   "progress_m": NaN,
+   "following_reports": 0,
+   "reports": 0,
+   "max_xte_m": null,
+   "stop_at": null,
+   "end_to_route_end_m": NaN
+  }
+ ],
+ "fits": {
+  "nn_pmnet": {
+   "n": 628,
+   "offset_db": -18.732223510742188,
+   "raw_bias_db": -18.439521522278998,
+   "rmse_db": 6.597525488454316,
+   "mae_db": 5.3633845383953895,
+   "r": 0.7250862661931761,
+   "slope": 0.9877050275792262,
+   "intercept": -19.050217119050725
+  },
+  "nn": {
+   "n": 628,
+   "offset_db": -29.5389404296875,
+   "raw_bias_db": -30.066614114554824,
+   "rmse_db": 6.691803581828754,
+   "mae_db": 5.373419524757725,
+   "r": 0.751287427705698,
+   "slope": 0.7700361943397928,
+   "intercept": -38.81518661821925
+  },
+  "avg": {
+   "n": 628,
+   "offset_db": -24.335723876953125,
+   "raw_bias_db": -24.253067818416913,
+   "rmse_db": 6.52032760801922,
+   "mae_db": 5.25873444186654,
+   "r": 0.740746698429833,
+   "slope": 0.8673201556682029,
+   "intercept": -30.07198185124863
+  }
+ }
+}
